@@ -1,3 +1,0 @@
-Parser integration successful!
-AST type: Program
-AST: Program(stmts=[VarDecl(name='x', type_ann=None, value=IntLit(value='10'), mutable=True, mem_mode=None)])

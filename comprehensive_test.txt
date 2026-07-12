@@ -1,9 +1,0 @@
-Comprehensive test successful!
-Parsed 7 statements
-0: VarDecl
-1: VarDecl
-2: VarDecl
-3: VarDecl
-4: VarDecl
-5: FnDecl
-6: IfStmt
