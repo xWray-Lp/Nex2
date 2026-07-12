@@ -1,2 +1,0 @@
-Step test completed
-Result: None

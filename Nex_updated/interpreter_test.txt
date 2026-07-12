@@ -1,2 +1,0 @@
-Interpreter test completed
-Result: None
