@@ -1,0 +1,60 @@
+--- nex_types.py	2026-03-12 13:17:18.000000000 +0300
++++ Nex_updated/nex_types.py	2026-03-14 05:34:06.000000000 +0300
+@@ -5,7 +5,7 @@
+ 
+ from __future__ import annotations
+ from dataclasses import dataclass, field
+-from typing import Optional
++from typing import Optional, Any
+ 
+ 
+ # ─── Temel Tip Sınıfı ────────────────────────────────────────────────────────
+@@ -54,11 +54,6 @@
+ VOID    = VoidType()
+ UNKNOWN = UnknownType()
+ 
+-PRIMITIVES: dict[str, NexType] = {
+-    "int": INT, "float": FLOAT, "str": STR,
+-    "bool": BOOL, "byte": BYTE, "void": VOID,
+-    "null": NULL,
+-}
+ 
+ # ─── Bileşik Tipler ───────────────────────────────────────────────────────────
+ 
+@@ -97,6 +92,14 @@
+         return isinstance(other, SetType) and self.element == other.element
+     def __hash__(self): return hash(("set", self.element))
+ 
++PRIMITIVES: dict[str, NexType] = {
++    "int": INT, "float": FLOAT, "str": STR,
++    "bool": BOOL, "byte": BYTE, "void": VOID,
++    "null": NULL,
++    "list": ListType(UNKNOWN), "dict": DictType(UNKNOWN, UNKNOWN),
++    "set":  SetType(UNKNOWN),
++}
++
+ @dataclass
+ class TupleType(NexType):
+     elements: list[NexType]
+@@ -144,6 +147,7 @@
+     base:       Optional[ClassType]        = None
+     interfaces: list[InterfaceType]        = field(default_factory=list)
+     type_params: list[str]                 = field(default_factory=list)
++    decl:       Any                        = field(default=None, repr=False, compare=False)
+ 
+     def __repr__(self): return self.name
+     def __eq__(self, other): return isinstance(other, ClassType) and self.name == other.name
+@@ -194,11 +198,11 @@
+ # ─── Tip Yardımcıları ─────────────────────────────────────────────────────────
+ 
+ def is_numeric(t: NexType) -> bool:
+-    return isinstance(t, (IntType, FloatType, ByteType))
++    return isinstance(t, (IntType, FloatType, ByteType, UnknownType))
+ 
+ def is_comparable(t: NexType) -> bool:
+     """Sıralama operatörleri (<, >, <=, >=) için."""
+-    return isinstance(t, (IntType, FloatType, StrType, ByteType))
++    return isinstance(t, (IntType, FloatType, StrType, ByteType, UnknownType))
+ 
+ def numeric_result(a: NexType, b: NexType) -> NexType:
+     """int op float → float, int op int → int"""

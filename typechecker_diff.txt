@@ -1,0 +1,166 @@
+--- type_checker.py	2026-03-12 13:17:18.000000000 +0300
++++ Nex_updated/type_checker.py	2026-03-14 05:34:06.000000000 +0300
+@@ -260,7 +260,7 @@
+                 pt = UNKNOWN
+             param_types.append(pt)
+ 
+-        ret = self.resolve_type_node(node.return_type) if node.return_type else VOID
++        ret = self.resolve_type_node(node.return_type) if node.return_type else UNKNOWN
+         if node.is_async and not isinstance(ret, (VoidType, UnknownType)):
+             ret = ret  # async fonksiyon aynı tipi döner (await açar)
+ 
+@@ -342,8 +342,10 @@
+             if self.current_class.base:
+                 self.current_scope.define("super", self.current_class.base)
+ 
+-        # Parametreleri ekle
++        # Parametreleri ekle — self zaten ClassType olarak tanımlı, ezme
+         for i, p in enumerate(node.params):
++            if p.name == "self" and self.current_class is not None:
++                continue  # ClassType korunuyor
+             pt = fn_type.params[i] if i < len(fn_type.params) else UNKNOWN
+             self.current_scope.define(p.name, pt, mutable=True)
+ 
+@@ -364,6 +366,7 @@
+ 
+     def visit_ClassDecl(self, node: ClassDecl) -> NexType:
+         ct: ClassType = self.type_registry.get(node.name, ClassType(node.name))
++        ct.decl = node  # param isimlerine erişim için
+ 
+         # Base sınıf
+         if node.base:
+@@ -444,7 +447,7 @@
+         if isinstance(self.fn_return_type, VoidType):
+             if node.value:
+                 self.warn("Returning value from void function", node)
+-        else:
++        elif not isinstance(self.fn_return_type, UnknownType):
+             self.check_assign(actual, self.fn_return_type, node, "return statement")
+         return VOID
+ 
+@@ -633,13 +636,12 @@
+ 
+         # Null coalescing
+         if op == "??":
+-            if not lt.is_nullable() and not isinstance(lt, (NullType, UnknownType)):
+-                self.warn(f"Left side of '??' is non-nullable type '{lt}'", node)
+             inner = lt.unwrap() if lt.is_nullable() else lt
+-            if not is_subtype(rt, inner) and not isinstance(rt, UnknownType):
+-                self.error(
+-                    f"Null coalescing default type '{rt}' incompatible with '{inner}'", node)
+-            return inner
++            rt_inner = rt.unwrap() if rt.is_nullable() else rt
++            if not isinstance(rt_inner, UnknownType) and not isinstance(inner, UnknownType):
++                if not is_subtype(rt_inner, inner) and not is_subtype(inner, rt_inner):
++                    self.warn(f"Null coalescing: left is '{lt}', right is '{rt}'", node)
++            return inner if not isinstance(inner, UnknownType) else rt_inner
+ 
+         return UNKNOWN
+ 
+@@ -727,9 +729,15 @@
+ 
+         if isinstance(callee_t, ClassType):
+             # Constructor çağrısı: MyClass(...)
++            init_decl = next(
++                (m for m in callee_t.decl.methods if m.name in ("init", "__init__")),
++                None) if hasattr(callee_t, 'decl') else None
+             init = callee_t.lookup_method("init")
+-            if init:
+-                for i, (arg, param_t) in enumerate(zip(node.args, init.params)):
++            if init and init_decl:
++                # self parametresini isimle atla
++                non_self = [(p, t) for p, t in zip(init_decl.params, init.params)
++                            if p.name != "self"]
++                for i, (arg, (_, param_t)) in enumerate(zip(node.args, non_self)):
+                     arg_t = self.visit(arg)
+                     if not isinstance(param_t, UnknownType):
+                         self.check_assign(arg_t, param_t, arg,
+@@ -743,33 +751,36 @@
+     def _builtin_method(self, obj_t: NexType, method: str, node: Node) -> Optional[NexType]:
+         """Liste, dict, str gibi builtin tiplerin metodları."""
+         if isinstance(obj_t, ListType):
++            elem = obj_t.element
+             methods = {
+-                "append":     VOID,
+-                "pop":        NullableType(obj_t.element),
+-                "removeLast": obj_t.element,
+-                "length":     INT,
++                "append":     VOID,   "push":       VOID,
++                "pop":        NullableType(elem),
++                "removeLast": elem,
++                "length":     INT,    "len":        INT,
+                 "isEmpty":    BOOL,
++                "first":      NullableType(elem),
++                "last":       NullableType(elem),
+                 "filter":     obj_t,
+                 "map":        ListType(UNKNOWN),
+                 "reduce":     UNKNOWN,
+-                "sort":       VOID,
+-                "contains":   BOOL,
++                "sort":       VOID,   "reverse":    VOID,
++                "contains":   BOOL,   "has":        BOOL,
+                 "indexOf":    NullableType(INT),
++                "join":       STR,
+             }
+             return methods.get(method)
+         if isinstance(obj_t, StrType):
+             methods = {
+-                "length":     INT,
+-                "upper":      STR,
+-                "lower":      STR,
+-                "trim":       STR,
+-                "split":      ListType(STR),
+-                "contains":   BOOL,
+-                "startsWith": BOOL,
+-                "endsWith":   BOOL,
+-                "replace":    STR,
+-                "indexOf":    NullableType(INT),
+-                "toString":   STR,
++                "length":      INT,    "len":         INT,
++                "upper":       STR,    "lower":       STR,
++                "trim":        STR,    "strip":       STR,
++                "split":       ListType(STR),
++                "contains":    BOOL,   "has":         BOOL,
++                "starts_with": BOOL,   "startswith":  BOOL,
++                "ends_with":   BOOL,   "endswith":    BOOL,
++                "replace":     STR,
++                "find":        INT,    "indexOf":     NullableType(INT),
++                "toString":    STR,
+             }
+             return methods.get(method)
+         if isinstance(obj_t, DictType):
+@@ -779,16 +790,13 @@
+                 "get":      NullableType(obj_t.value),
+                 "set":      VOID,
+                 "remove":   BOOL,
+-                "contains": BOOL,
+-                "length":   INT,
++                "contains": BOOL,   "has":     BOOL,
++                "length":   INT,    "len":     INT,
+                 "isEmpty":  BOOL,
+             }
+             return methods.get(method)
+         if isinstance(obj_t, (IntType, FloatType)):
+-            methods = {
+-                "toString": STR,
+-                "abs":      obj_t,
+-            }
++            methods = {"toString": STR, "abs": obj_t}
+             return methods.get(method)
+         return None
+ 
+@@ -901,10 +909,10 @@
+         for k, v in node.pairs[1:]:
+             kti = self.visit(k)
+             vti = self.visit(v)
+-            if kti != kt:
+-                self.error(f"Dict key type mismatch: '{kti}' vs '{kt}'", node)
+-            if vti != vt:
+-                self.error(f"Dict value type mismatch: '{vti}' vs '{vt}'", node)
++            if not isinstance(kti, UnknownType) and kti != kt:
++                kt = UNKNOWN  # heterogeneous keys → unknown
++            if not isinstance(vti, UnknownType) and vti != vt:
++                vt = UNKNOWN  # heterogeneous values → unknown (normal use case)
+         return DictType(kt, vt)
+ 
+     def visit_TupleLit(self, node: TupleLit) -> NexType:

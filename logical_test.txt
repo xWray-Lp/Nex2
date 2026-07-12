@@ -1,0 +1,2 @@
+Logical operators test: PASS
+Errors: 0

@@ -1,0 +1,22 @@
+# Test advanced features
+fn test_logical():
+    let a = true and false
+    let b = true or false  
+    let c = not false
+    println("Logical: " + str(a) + ", " + str(b) + ", " + str(c))
+
+fn test_range():
+    for i in 0..5:
+        print(str(i) + " ")
+    println("")
+
+fn test_fstring():
+    let name = "Nex"
+    let version = 1.0
+    println(f"Hello {name} v{version}!")
+
+fn main():
+    test_logical()
+    test_range()
+    test_fstring()
+main()

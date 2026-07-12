@@ -1,0 +1,5 @@
+Hello, Nex!
+10! = 3628800
+Sum 0..9 = 45
+Max = 9
+Logic: true

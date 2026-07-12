@@ -1,0 +1,84 @@
+--- lexer.py	2026-03-12 17:11:26.346576791 +0300
++++ Nex_updated/lexer.py	2026-03-14 05:34:06.000000000 +0300
+@@ -90,6 +90,9 @@
+     NOT = auto()
+     ARROW = auto()
+     NULL_COAL = auto()
++    DSLASH = auto()   # //  integer division
++    PIPE = auto()     # |>  pipe operator
++    FSTRING = auto()  # f"..." interpolated string
+     
+     # Delimiters
+     LPAREN = auto()
+@@ -171,6 +174,9 @@
+             'ass': TT.ASS,
+             'quest': TT.QUEST,
+             'sizeof': TT.SIZEOF,
++            'and': TT.AND,
++            'or': TT.OR,
++            'not': TT.NOT,
+             'true': TT.BOOL,
+             'false': TT.BOOL,
+             'null': TT.NULL,
+@@ -208,7 +214,7 @@
+         
+         while self.peek() and (self.peek().isdigit() or self.peek() == '.'):
+             if self.peek() == '.':
+-                if has_dot:
++                if has_dot or self.peek(1) == '.':
+                     break
+                 has_dot = True
+             value += self.advance()
+@@ -238,6 +244,26 @@
+         self.advance()  # closing quote
+         return Token(TT.STRING, value, start_line, start_col)
+     
++    def read_fstring(self) -> Token:
++        """Tokenize f"...{expr}..." — stores raw template string as FSTRING token."""
++        start_line, start_col = self.line, self.col
++        quote = self.advance()  # opening quote
++        value = ""
++        while self.peek() != quote and self.peek() != '\0':
++            if self.peek() == '\\':
++                self.advance()
++                esc = self.advance()
++                if esc == 'n': value += '\n'
++                elif esc == 't': value += '\t'
++                elif esc == '\\': value += '\\'
++                elif esc == '"': value += '"'
++                elif esc == "'": value += "'"
++                else: value += esc
++            else:
++                value += self.advance()
++        self.advance()  # closing quote
++        return Token(TT.FSTRING, value, start_line, start_col)
++    
+     def read_ident(self) -> Token:
+         start_line, start_col = self.line, self.col
+         value = ""
+@@ -292,6 +318,10 @@
+                 continue
+             
+             # Strings
++            if ch == 'f' and self.peek(1) in ('"', "'"):
++                self.advance()
++                self.tokens.append(self.read_fstring())
++                continue
+             if ch in '"\'':
+                 self.tokens.append(self.read_string())
+                 continue
+@@ -342,6 +372,14 @@
+                 self.advance(); self.advance()
+                 self.tokens.append(Token(TT.SLASH_EQ, '/=', start_line, start_col))
+                 continue
++            elif ch == '/' and self.peek(1) == '/':
++                self.advance(); self.advance()
++                self.tokens.append(Token(TT.DSLASH, '//', start_line, start_col))
++                continue
++            elif ch == '|' and self.peek(1) == '>':
++                self.advance(); self.advance()
++                self.tokens.append(Token(TT.PIPE, '|>', start_line, start_col))
++                continue
+             elif ch == '*' and self.peek(1) == '*':
+                 self.advance(); self.advance()
+                 self.tokens.append(Token(TT.STARSTAR, '**', start_line, start_col))

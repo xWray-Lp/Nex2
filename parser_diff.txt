@@ -1,0 +1,213 @@
+--- parser.py	2026-03-12 13:17:18.000000000 +0300
++++ Nex_updated/parser.py	2026-03-14 05:34:06.000000000 +0300
+@@ -231,7 +231,11 @@
+             if self.match(TT.IDENT):  # "mut"
+                 is_mut_ref = True
+             is_ref = True
+-        name = self.expect(TT.IDENT).value
++        # self keyword'ü param olarak kabul et
++        if self.check(TT.SELF):
++            name = self.advance().value
++        else:
++            name = self.expect(TT.IDENT).value
+         type_ann = None
+         if self.match(TT.COLON):
+             type_ann = self.parse_type()
+@@ -396,6 +400,11 @@
+     def _parse_match_arm(self) -> MatchArm:
+         tok = self.peek()
+         pattern = self._parse_pattern()
++        # optional guard: if <expr>
++        guard = None
++        if self.check(TT.IF):
++            self.advance()
++            guard = self.parse_expr()
+         self.expect(TT.ARROW)
+         if self.check(TT.INDENT):
+             body = self.parse_block()
+@@ -409,7 +418,7 @@
+             body = ContinueStmt(line=tok.line, col=tok.col)
+         else:
+             body = self.parse_expr()
+-        return MatchArm(pattern, body, line=tok.line, col=tok.col)
++        return MatchArm(pattern, body, guard=guard, line=tok.line, col=tok.col)
+ 
+     def _parse_pattern(self) -> Node:
+         tok = self.peek()
+@@ -418,7 +427,13 @@
+             return Ident("_", line=tok.line, col=tok.col)
+         if self.check(TT.INT):
+             v = self.advance().value
+-            return IntLit(v, line=tok.line, col=tok.col)
++            node = IntLit(v, line=tok.line, col=tok.col)
++            # range pattern: 1..10
++            if self.check(TT.DOTDOT):
++                self.advance()
++                end = IntLit(self.expect(TT.INT).value, line=tok.line, col=tok.col)
++                return RangeExpr(node, end, line=tok.line, col=tok.col)
++            return node
+         if self.check(TT.FLOAT):
+             v = self.advance().value
+             return FloatLit(v, line=tok.line, col=tok.col)
+@@ -431,7 +446,6 @@
+         if self.check(TT.IDENT):
+             name = self.advance().value
+             if self.match(TT.LPAREN):
+-                # Destructure: Circle(r)
+                 inner = Ident(self.expect(TT.IDENT).value, line=tok.line, col=tok.col)
+                 self.expect(TT.RPAREN)
+                 return CallExpr(Ident(name, line=tok.line, col=tok.col), [inner],
+@@ -449,9 +463,18 @@
+             self.advance()
+             exc_type, alias = None, None
+             if self.check(TT.IDENT):
+-                exc_type = self.advance().value
+-                if self.match(TT.AS):
++                first = self.advance().value
++                if self.check(TT.IDENT):
++                    # catch TypeError e: → exc_type=TypeError, alias=e
++                    exc_type = first
++                    alias = self.advance().value
++                elif self.match(TT.AS):
++                    # catch TypeError as e:
++                    exc_type = first
+                     alias = self.expect(TT.IDENT).value
++                else:
++                    # catch e: → alias=e, catch-all
++                    alias = first
+             self.expect(TT.COLON)
+             body = self.parse_block()
+             catch_arms.append(CatchArm(exc_type, alias, body, line=tok.line, col=tok.col))
+@@ -573,6 +596,12 @@
+                 left = RangeExpr(left, right, line=tok.line, col=tok.col)
+                 continue
+ 
++            # Özel: pipe  left |> fn  →  PipeExpr
++            if op_tok.type == TT.PIPE:
++                right = self.parse_expr(next_min)
++                left = PipeExpr(left, right, line=tok.line, col=tok.col)
++                continue
++
+             right = self.parse_expr(next_min)
+             op_str = self._tok_to_op(op_tok.type)
+             left = BinaryExpr(left, op_str, right, line=tok.line, col=tok.col)
+@@ -587,6 +616,7 @@
+             TT.STAR_EQ:  (1,  "right"),
+             TT.SLASH_EQ: (1,  "right"),
+             TT.NULL_COAL:(2,  "left"),
++            TT.PIPE:     (2,  "left"),   # |>  (low, left-assoc)
+             TT.OR:       (3,  "left"),
+             TT.AND:      (4,  "left"),
+             TT.EQ:       (5,  "left"),
+@@ -595,11 +625,14 @@
+             TT.GT:       (6,  "left"),
+             TT.LTE:      (6,  "left"),
+             TT.GTE:      (6,  "left"),
++            TT.LE:       (6,  "left"),
++            TT.GE:       (6,  "left"),
+             TT.DOTDOT:   (7,  "left"),
+             TT.PLUS:     (8,  "left"),
+             TT.MINUS:    (8,  "left"),
+             TT.STAR:     (9,  "left"),
+             TT.SLASH:    (9,  "left"),
++            TT.DSLASH:   (9,  "left"),   # //
+             TT.PERCENT:  (9,  "left"),
+             TT.STARSTAR: (10, "right"),
+         }
+@@ -608,9 +641,10 @@
+     def _tok_to_op(self, tt: TT) -> str:
+         return {
+             TT.PLUS:    "+",  TT.MINUS:   "-",  TT.STAR:    "*",
+-            TT.SLASH:   "/",  TT.PERCENT: "%",  TT.STARSTAR:"**",
++            TT.SLASH:   "/",  TT.DSLASH:  "//", TT.PERCENT: "%",  TT.STARSTAR:"**",
+             TT.EQ:      "==", TT.NEQ:     "!=", TT.LT:      "<",
+             TT.GT:      ">",  TT.LTE:     "<=", TT.GTE:     ">=",
++            TT.LE:      "<=", TT.GE:      ">=",
+             TT.AND:     "and",TT.OR:      "or", TT.NULL_COAL:"??",
+         }.get(tt, tt.name)
+ 
+@@ -653,6 +687,37 @@
+                 break
+         return node
+ 
++    def _parse_fstring_parts(self, raw: str, line: int, col: int) -> list:
++        """f"hello {name + 1}!" → ['hello ', <Expr>, '!']"""
++        from lexer import Lexer
++        parts = []
++        i = 0
++        buf = ""
++        while i < len(raw):
++            if raw[i] == '{':
++                if buf:
++                    parts.append(buf)
++                    buf = ""
++                i += 1
++                depth = 1
++                expr_src = ""
++                while i < len(raw) and depth > 0:
++                    if raw[i] == '{': depth += 1
++                    elif raw[i] == '}': depth -= 1
++                    if depth > 0:
++                        expr_src += raw[i]
++                    i += 1
++                # parse the inner expression
++                tokens = Lexer(expr_src).tokenize()
++                sub_parser = Parser(tokens)
++                parts.append(sub_parser.parse_expr())
++            else:
++                buf += raw[i]
++                i += 1
++        if buf:
++            parts.append(buf)
++        return parts
++
+     def parse_primary(self) -> Node:
+         tok = self.peek()
+ 
+@@ -663,6 +728,10 @@
+             return FloatLit(self.advance().value, line=tok.line, col=tok.col)
+         if self.check(TT.STRING):
+             return StrLit(self.advance().value, line=tok.line, col=tok.col)
++        if self.check(TT.FSTRING):
++            raw = self.advance().value
++            parts = self._parse_fstring_parts(raw, tok.line, tok.col)
++            return FStringExpr(parts, line=tok.line, col=tok.col)
+         if self.check(TT.BOOL):
+             return BoolLit(self.advance().value, line=tok.line, col=tok.col)
+         if self.check(TT.NULL):
+@@ -740,11 +809,30 @@
+                 self.expect(TT.RBRACE)
+                 return SetLit(elems, line=tok.line, col=tok.col)
+ 
+-        # Lambda: (x: int) -> x * 2  veya (x) -> x
+-        # Not: Zaten LPAREN dalı işledi, burada lambda kalmaz — postfix'te yönetilir.
+-        # Bağımsız lambda: (params) -> expr
+-        # Bu durum zaten LPAREN → tuple parse → ARROW ile örtüşmez.
+-        # Şimdilik lambda için shortcut yok; FnDecl ile tanımlanır.
++        # Lambda: fn(params) -> ReturnType: expr  veya  fn(params): block
++        if self.check(TT.FN):
++            self.advance()
++            self.expect(TT.LPAREN)
++            params = self._parse_params()
++            self.expect(TT.RPAREN)
++            if self.match(TT.ARROW):
++                # -> ReturnType: body_expr  veya  -> ReturnType\n  block
++                if not self.check(TT.INDENT) and not self.check(TT.COLON):
++                    _ret_type = self.parse_type()   # return type ayrıştır, şimdilik kullanılmıyor
++                if self.match(TT.COLON):
++                    if self.check(TT.INDENT):
++                        body = self.parse_block()
++                    else:
++                        body = self.parse_expr(0)
++                elif self.check(TT.INDENT):
++                    body = self.parse_block()
++                else:
++                    body = self.parse_expr(0)
++            elif self.check(TT.COLON):
++                body = self.parse_block()
++            else:
++                raise self.error("Expected ':' or '->' in lambda")
++            return LambdaExpr(params, body, line=tok.line, col=tok.col)
+ 
+         # Match expression (inline)
+         if self.check(TT.MATCH):

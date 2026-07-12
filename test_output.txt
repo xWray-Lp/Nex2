@@ -1,0 +1,72 @@
+
+[1m[93m══════════════════════════════════════════════════
+  1 · Değişken Tanımlamaları
+══════════════════════════════════════════════════[0m
+
+[96m[1m━━━ Literal inference ━━━[0m
+  [92m✓ Clean — no errors[0m
+
+[96m[1m━━━ Explicit types ━━━[0m
+  [92m✓ Clean — no errors[0m
+
+[96m[1m━━━ Nullable + null coalescing ━━━[0m
+  [92m✓ Clean — no errors[0m
+
+[96m[1m━━━ Const declaration ━━━[0m
+  [92m✓ Clean — no errors[0m
+
+[1m[93m══════════════════════════════════════════════════
+  2 · Aritmetik & İfadeler
+══════════════════════════════════════════════════[0m
+
+[96m[1m━━━ Arithmetic ops ━━━[0m
+  [92m✓ Clean — no errors[0m
+
+[96m[1m━━━ String concat ━━━[0m
+  [92m✓ Clean — no errors[0m
+
+[96m[1m━━━ Comparison ops ━━━[0m
+  [92m✓ Clean — no errors[0m
+
+[96m[1m━━━ Logical ops ━━━[0m
+  [91m✗ Expected clean, but got errors:[0m
+  Errors (3):
+  ✗ [ERROR] Line 1:14 — Undefined variable 'and'
+  ✗ [ERROR] Line 2:14 — Undefined variable 'or'
+  ✗ [ERROR] Line 3:9 — Undefined variable 'not'
+
+[96m[1m━━━ Range expression ━━━[0m
+Traceback (most recent call last):
+  File "/home/Xlper/Masaüstü/tools/Nex/test_typechecker.py", line 142, in <module>
+    run("Range expression", """
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^
+    for i in 0..10:
+    ^^^^^^^^^^^^^^^
+        let x = i
+        ^^^^^^^^^
+    """, expect_clean=True)
+    ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/Xlper/Masaüstü/tools/Nex/test_typechecker.py", line 32, in run
+    tree   = Parser(tokens).parse()
+  File "/home/Xlper/Masaüstü/tools/Nex/parser.py", line 71, in parse
+    stmts.append(self.parse_toplevel())
+                 ~~~~~~~~~~~~~~~~~~~^^
+  File "/home/Xlper/Masaüstü/tools/Nex/parser.py", line 92, in parse_toplevel
+    return self.parse_stmt()
+           ~~~~~~~~~~~~~~~^^
+  File "/home/Xlper/Masaüstü/tools/Nex/parser.py", line 274, in parse_stmt
+    return self.parse_for()
+           ~~~~~~~~~~~~~~^^
+  File "/home/Xlper/Masaüstü/tools/Nex/parser.py", line 359, in parse_for
+    iterable = self.parse_expr()
+  File "/home/Xlper/Masaüstü/tools/Nex/parser.py", line 541, in parse_expr
+    left = self.parse_unary()
+  File "/home/Xlper/Masaüstü/tools/Nex/parser.py", line 631, in parse_unary
+    return self.parse_postfix()
+           ~~~~~~~~~~~~~~~~~~^^
+  File "/home/Xlper/Masaüstü/tools/Nex/parser.py", line 650, in parse_postfix
+    member = self.expect(TT.IDENT).value
+             ~~~~~~~~~~~^^^^^^^^^^
+  File "/home/Xlper/Masaüstü/tools/Nex/parser.py", line 49, in expect
+    raise ParseError(msg or f"Expected {tt.name}", tok)
+parser.ParseError: [Parse Error] Line 1:13 — Expected IDENT (got Token(INT, '10'))

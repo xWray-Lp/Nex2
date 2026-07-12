@@ -1,0 +1,6 @@
+Tokens: 5
+0: Token(LET, 'let')
+1: Token(IDENT, 'x')
+2: Token(ASSIGN, '=')
+3: Token(INT, '10')
+4: Token(EOF, '')
