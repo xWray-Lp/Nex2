@@ -3,6 +3,7 @@ Nex Language — Type Checker Test Suite
 Her test ya temiz geçmeli, ya da beklenen hataları üretmeli.
 """
 
+import sys
 from lexer import Lexer
 from parser import Parser
 from type_checker import TypeChecker
@@ -491,3 +492,6 @@ if failed:
 else:
     print(f"  {GREEN}— All tests passed! ✓{RESET}")
 print(f"{'═'*50}{RESET}")
+
+if failed:
+    sys.exit(1)
