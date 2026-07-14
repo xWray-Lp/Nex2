@@ -1,0 +1,148 @@
+# Nex Bellek Modeli — Tasarım ve Yol Haritası
+
+> Bu doküman, "C kadar güçlü, Python kadar basit" hedefinin bellek yönetimi
+> tarafını nasıl karşılayacağımızı, hangi kararların neden alındığını ve
+> hangi adımların hangi sırayla uygulanacağını açıklar. Amaç: bir sonraki
+> oturumda (biz ya da başka bir model) "neden böyle yaptık" sorusunun
+> cevabını tekrar sıfırdan icat etmek zorunda kalmamak.
+
+## 0. Mevcut durum (kod taraması ile doğrulandı)
+
+- `ast_nodes.py` → `VarDecl.mem_mode: Optional[str]` alanı zaten var:
+  `"own" | "raw" | "stack" | None`.
+- `parser.py` (satır ~396-435) → `@own`, `@raw`, `@stack` annotation'larını
+  gerçekten parse ediyor, AST'ye yazıyor.
+- `type_checker.py` → `mem_mode` alanını **hiç okumuyor**. `alloc()` /
+  `free()` builtin fonksiyonları var (satır ~109-110) ama bunlarla
+  ownership/borrow arasında bir bağ yok.
+- `interpreter.py` → `mem_mode` alanını **hiç kullanmıyor**. Her değişken
+  aynı şekilde (Python'un kendi GC'sine bırakılarak) çalışıyor.
+
+**Sonuç:** 4 mod sözdizimi seviyesinde tanımlı ama hiçbirinin gerçek bir
+davranışı yok. Annotation yazmak şu an kozmetik — hiçbir şeyi değiştirmiyor.
+Bu, kod tabanının doğrulanmış gerçek durumu; varsayım değil.
+
+## 1. Neden 4 mod (ve neden bu isimler)
+
+| Mod | Ne zaman kullanılır | Neden var |
+|---|---|---|
+| **GC** (varsayılan, annotation yok) | Genel amaçlı, "Python gibi" kod | Dilin varsayılan deneyimi kolay olmalı — programcı hiçbir şey yazmadan güvenli çalışan kod yazabilmeli |
+| **`@own`** | Kaynak sahipliğinin net olması gereken yerler (dosya handle, bağlantı, büyük veri yapıları) | Rust'ın kanıtladığı model: deterministik temizlik (scope bitince free), GC duraklamasız |
+| **`@raw`** | Performans-kritik, düşük seviye kod (buffer, sistem çağrıları) | "C kadar güçlü" hedefi için kaçış kapısı — programcı bilerek tüm sorumluluğu alır |
+| **`@stack`** | Sabit boyutlu, kısa ömürlü veri (küçük dizi/buffer) | Heap'e hiç gitmeden en hızlı seçenek; GC ve ownership'ten tamamen bağımsız, en basit mod |
+
+`@stack` diğer üçünden farklı bir kategoridedir: heap'e dokunmadığı için
+GC/own/raw etkileşim sorunlarının **hiçbiri onu ilgilendirmez** — scope
+bitince otomatik temizlenir, borrow/ownership kuralı gerekmez. Bu yüzden
+aşağıdaki etkileşim tablosunda `@stack` satırı yok; o zaten "sorunsuz" mod.
+
+## 2. Mod geçişleri (GC ⇄ own)
+
+```
+GC nesnesini doğrudan @own ile sahiplenmek  → COMPILE ERROR
+GC nesnesini to_own(x) ile sahiplenmek      → DEEP COPY, yeni bağımsız @own nesne
+@own nesneyi to_gc(x) ile GC'ye vermek       → MOVE, x own'da artık geçersiz, GC kaydına eklenir
+```
+
+**Neden deep copy (own'a girişte) ama move (own'dan çıkışta)?**
+GC'nin elinde tuttuğu bir referans, başka yerlerden de erişiliyor olabilir
+(GC = paylaşılan sahiplik felsefesi). Onu "taşımak" (move) GC tarafındaki
+diğer referansları sessizce geçersiz kılar — bu, GC'nin paylaşılan-sahiplik
+sözleşmesini bozar. Deep copy bu belirsizliği ortadan kaldırır: pahalıdır
+ama güvenlidir. own→GC yönünde ise own zaten tekil sahipliğe sahip
+olduğundan (kimse başka referans tutamaz), move güvenlidir ve gereksiz
+kopyayı önler.
+
+## 3. `@raw` kısıtlaması
+
+```
+@raw pointer, GC/own nesnesini gösteremez  → COMPILE ERROR
+@raw pointer, başka @raw/@stack belleği gösterir → izin verilir, dangling riski programcıya ait
+```
+
+**Neden bu kısıtlama var?** GC nesneleri taşınabilir/toplanabilir; `@raw`
+bir ham adrestir ve GC bunun farkında değildir. GC bir nesneyi taşıdığı
+anda `@raw` pointer geçersiz bir adresi göstermeye devam eder (use-after-
+free/dangling). Bunu derleme zamanında engellemek ucuzdur (tip kontrolü),
+runtime'da GC'yi "pointer-farkında" yapmak ise GC tasarımını çok
+karmaşıklaştırır. Bu yüzden en ucuz ve en güvenli çözüm: `@raw`'ı
+kaynağında kısıtlamak.
+
+## 4. Borrow kuralları (`@own` için)
+
+```
+&x     → salt okunur ödünç, N tane aynı anda serbest
+&mut x → yazılabilir ödünç, aynı anda sadece 1 tane, başka hiçbir borrow yasak
+```
+
+Bu, Rust'ın kanıtlanmış modeli — kendi kuralımızı icat etmek yerine
+sektörde 10+ yıldır test edilmiş bir kuralı almak, hem daha az hata payı
+bırakır hem de ileride dökümantasyon/örnek bulmayı kolaylaştırır (Rust
+kaynakları büyük ölçüde uygulanabilir).
+
+## 5. Uygulama katmanı: neden runtime + statik ikisi birden
+
+Tam bir compile-time borrow checker (Rust tarzı lifetime analizi +
+control-flow graph) **solo bir projede aylarca sürecek bağımsız bir
+mühendislik fazıdır.** Ama borrow ihlallerinin büyük kısmı aslında basit:
+aynı fonksiyon/blok içinde art arda gelen ihlaller. Bu yüzden iki katman:
+
+### Katman 1 — Basit statik kontrol (type_checker.py içinde, kısa vadede)
+- Kapsam: **tek blok/scope içi** borrow ihlalleri.
+- `type_checker.py`'daki mevcut `Scope` sınıfı zaten AST'yi blok blok
+  geziyor (`visit_Block`, satır 274) — buraya her `@own` değişken için
+  "şu an aktif borrow'lar" listesi eklemek mevcut mimariye doğal
+  şekilde oturur. Yeni bir alt sistem kurmuyoruz, var olanı genişletiyoruz.
+- Yakalayamadığı şey: fonksiyonlar arası geçen borrow'lar, döngü/koşul
+  dallarına yayılan borrow'lar, closure'lar.
+- Tahmini iş büyüklüğü: küçük–orta (mevcut `Scope` sınıfına yeni bir alan
+  ve birkaç kontrol fonksiyonu).
+
+### Katman 2 — Runtime borrow flag (interpreter.py içinde, güvenlik ağı)
+- Her `@own` değer, çalışma zamanında bir durum taşır:
+  `Free | Borrowed(n) | MutBorrowed`.
+- Borrow alma/bırakma anında bu flag kontrol edilir; ihlalde runtime
+  hata (panic) fırlatılır.
+- Katman 1'in kaçırdığı her şeyi (çapraz fonksiyon, döngü, closure) yakalar.
+- Rust'ta bile tam karşılığı yok gibi görünse de aslında `RefCell` /
+  `Rc<RefCell<T>>` runtime borrow-checking olarak tam olarak bunu yapar —
+  yani "runtime'da borrow kontrolü" sektörde de kabul görmüş bir desen.
+
+**Neden ikisi birden ve neden bu sıra:**
+Katman 1 tek başına yetersiz (çoğu gerçek ihlal fonksiyonlar arası olur).
+Katman 2 tek başına yetersiz (hataları derleme yerine çalışma zamanında,
+geç yakalar — "C kadar güçlü" hedefiyle çelişir, güvenlik geç gelir).
+İkisi birlikte: basit hatalar erken (derleme benzeri aşamada), karmaşık
+hatalar geç ama yine de güvenli şekilde yakalanır. Katman 1, ileride
+bytecode VM'e geçilince gerçek bir CFG/lifetime analizine genişletilebilir
+— sıfırdan başlamak yerine üzerine inşa edilir.
+
+## 6. Yol haritası (uygulama sırası)
+
+1. **`nex_types.py`**: `@own` değerler için bir `OwnState` (borrow sayacı +
+   mod: none/shared/mut) kavramı tanımla.
+2. **`interpreter.py`**: Katman 2 (runtime borrow flag) — en önce bu,
+   çünkü hemen test edilebilir sonuç verir, ileri geri bildirim döngüsü
+   kısa.
+3. **`type_checker.py`**: Katman 1 (blok-içi statik kontrol) — mevcut
+   `Scope`'a borrow takibi ekle.
+4. **`to_own()` / `to_gc()`**: builtin olarak `alloc`/`free` yanına ekle,
+   GC↔own geçiş kurallarını uygula.
+5. **`@raw` kısıtlaması**: type_checker'da, bir `@raw` değişkene GC/own
+   kaynaklı bir değer atanmaya çalışıldığında hata üret.
+6. **(Bytecode VM sonrası)** Katman 1'i gerçek CFG/lifetime analizine
+   genişlet — fonksiyonlar arası, döngü/dal duyarlı borrow checker.
+
+Sıralamanın mantığı: önce en hızlı geri bildirim veren (runtime), sonra
+onu destekleyen statik katman, sonra geçiş fonksiyonları, en son (VM
+aşamasında) en pahalı/karmaşık iş.
+
+## 7. Açık kalan sorular (bilerek ertelendi)
+
+- `@stack` için boyut sınırı var mı, derleme zamanında mı belirleniyor?
+- `&mut` borrow bir fonksiyona parametre olarak geçtiğinde, fonksiyon
+  bitince borrow otomatik mi bırakılıyor, yoksa açık bir "release" mi
+  gerekiyor?
+- Closure'ların `@own` değerleri yakalaması (capture) hangi kurala tabi?
+
+Bunlar Katman 1/2 uygulanırken netleşecek; şimdiden cevap uydurmuyoruz.
