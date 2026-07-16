@@ -119,6 +119,11 @@ bytecode VM'e geçilince gerçek bir CFG/lifetime analizine genişletilebilir
 
 ## 6. Yol haritası (uygulama sırası)
 
+0. **`@stack`** — GC/ownership/raw ile hiçbir etkileşimi olmadığı için en
+   düşük riskli, en hızlı kazanılan adım (dış görüş / Qwen incelemesiyle
+   de doğrulandı). Python tarafında sabit boyutlu bir liste/array olarak
+   simüle edilebilir; scope bitince otomatik serbest bırakılır. Diğer
+   maddelerden bağımsız olarak, istenildiğinde en önce yapılabilir.
 1. **`nex_types.py`**: `@own` değerler için bir `OwnState` (borrow sayacı +
    mod: none/shared/mut) kavramı tanımla.
 2. **`interpreter.py`**: Katman 2 (runtime borrow flag) — en önce bu,
@@ -135,7 +140,9 @@ bytecode VM'e geçilince gerçek bir CFG/lifetime analizine genişletilebilir
 
 Sıralamanın mantığı: önce en hızlı geri bildirim veren (runtime), sonra
 onu destekleyen statik katman, sonra geçiş fonksiyonları, en son (VM
-aşamasında) en pahalı/karmaşık iş.
+aşamasında) en pahalı/karmaşık iş. `@stack` bu sıranın dışında çünkü
+diğerlerine bağımlı değil — ayrı bir "hızlı kazanım" olarak istenilen
+noktada araya sokulabilir.
 
 ## 7. Açık kalan sorular (bilerek ertelendi)
 
@@ -144,5 +151,18 @@ aşamasında) en pahalı/karmaşık iş.
   bitince borrow otomatik mi bırakılıyor, yoksa açık bir "release" mi
   gerekiyor?
 - Closure'ların `@own` değerleri yakalaması (capture) hangi kurala tabi?
+- **Python'un kendi GC'si ile çakışma riski** (dış görüş / Qwen
+  incelemesiyle tespit edildi): Nex şu an Python üzerinde yorumlanıyor.
+  `@own`/`@raw` nesneleri de sonuçta birer Python objesi olacak — yani
+  Python'un kendi referans sayımı + döngüsel GC'si arka planda zaten
+  çalışıyor olacak. Nex'in kendi ownership/borrow mantığı bunun **üzerine**
+  bindirilecek, yerine geçmeyecek. Bu iki katmanın çakışabileceği somut
+  senaryo: Nex tarafında "bu nesne artık kimsenin değil" dediğimiz an ile
+  Python'un o nesneyi gerçekten belleğe geri vermesi (refcount 0 olması)
+  aynı anda gerçekleşmeyebilir — yani Nex'in "deterministik temizlik"
+  vaadi, altında Python GC'si çalıştığı sürece **tam deterministik
+  olmayabilir**. Bytecode VM'e geçilene kadar (kendi bellek yönetimimizi
+  yazana kadar) bu, çözülemeyecek yapısal bir sınırlama — şimdilik
+  bilinçli olarak kabul ediliyor, "çözüldü" değil.
 
 Bunlar Katman 1/2 uygulanırken netleşecek; şimdiden cevap uydurmuyoruz.
