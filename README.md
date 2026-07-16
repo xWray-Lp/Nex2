@@ -1,5 +1,7 @@
 # Nex
 
+[![Tests](https://github.com/xWray-Lp/Nex2/actions/workflows/tests.yml/badge.svg)](https://github.com/xWray-Lp/Nex2/actions/workflows/tests.yml)
+
 > C kadar güçlü, Python kadar basit bir dil.
 
 Nex, Python'a benzer girintili bir sözdizimi ile statik tip çıkarımını
