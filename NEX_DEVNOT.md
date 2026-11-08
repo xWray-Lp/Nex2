@@ -7,6 +7,8 @@ C gibi güçlü, Python gibi kolay bir dil.
 
 ## Roadmap
 
-### Bytecode VM sonrası
-- Kullanıcı dostu hata mesajları: konum + neden + öneri içeren, sadece satır numarası
-  fırlatmak yerine (Rust tarzı "expected X, found Y, did you mean...") diagnostics sistemi.
+### Diagnostics (hata mesajları)
+- **Artık var:** konum + sebep + basit öneri (checker `dosya:satır:kolon`,
+  runtime `satır:kolon`).
+- **Kalan (VM sonrası):** tüm builtin hatalarının konumlu olması + Rust tarzı
+  "did you mean..." önerileri.

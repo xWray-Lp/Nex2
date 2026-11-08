@@ -8,6 +8,12 @@
 
 ## 0. Mevcut durum (kod taraması ile doğrulandı)
 
+> **Tarihsel not (güncellendi):** Aşağıdaki tarama anlık görüntüsü,
+> `@stack`/`@own`/borrow uygulanmadan önceki durumu yansıtır; artık
+> geçerliliğini yitirmiştir. **Güncel gerçeklik:** `@stack` ve `@own`
+> (`to_own`/`to_gc`/`free`) ile `&x`/`&mut x` borrow'ları (v1)
+> uygulanmıştır; `@raw` kısıtlaması (§3/§6 madde 5) henüz beklemededir.
+
 - `ast_nodes.py` → `VarDecl.mem_mode: Optional[str]` alanı zaten var:
   `"own" | "raw" | "stack" | None`.
 - `parser.py` (satır ~396-435) → `@own`, `@raw`, `@stack` annotation'larını
@@ -43,6 +49,11 @@ GC nesnesini doğrudan @own ile sahiplenmek  → COMPILE ERROR
 GC nesnesini to_own(x) ile sahiplenmek      → DEEP COPY, yeni bağımsız @own nesne
 @own nesneyi to_gc(x) ile GC'ye vermek       → MOVE, x own'da artık geçersiz, GC kaydına eklenir
 ```
+
+- `free(x)` → sahipliği tüketir; `x` ölür (use-after-free). `x` hâlâ borrow
+  altındayken `free`/taşıma yasaktır.
+- `@own` değişkene `to_own(...)` sonucu yeniden atanırsa sahiplik yaşam
+  döngüsü sıfırlanır (önceki moved/free durumu temizlenir).
 
 **Neden deep copy (own'a girişte) ama move (own'dan çıkışta)?**
 GC'nin elinde tuttuğu bir referans, başka yerlerden de erişiliyor olabilir
@@ -80,6 +91,11 @@ sektörde 10+ yıldır test edilmiş bir kuralı almak, hem daha az hata payı
 bırakır hem de ileride dökümantasyon/örnek bulmayı kolaylaştırır (Rust
 kaynakları büyük ölçüde uygulanabilir).
 
+- **v1 (uygulandı):** Borrow'lar blok-yereldir; `Environment.close()` ile scope
+  sonunda otomatik bırakılır (release-before-kill).
+- **v1 sınırı:** Borrow referansı fonksiyon sınırını geçemez; VM sonrası gerçek
+  kısmi geçiş (parametre olarak borrow) ertelenmiştir.
+
 ## 5. Uygulama katmanı: neden runtime + statik ikisi birden
 
 Tam bir compile-time borrow checker (Rust tarzı lifetime analizi +
@@ -104,6 +120,8 @@ aynı fonksiyon/blok içinde art arda gelen ihlaller. Bu yüzden iki katman:
 - Borrow alma/bırakma anında bu flag kontrol edilir; ihlalde runtime
   hata (panic) fırlatılır.
 - Katman 1'in kaçırdığı her şeyi (çapraz fonksiyon, döngü, closure) yakalar.
+- **Uygulama durumu adları:** `alive=False` → `Free`, `shared=n` →
+  `Borrowed(n)`, `mut_borrowed=1` → `MutBorrowed` (`OwnValue` alanları).
 - Rust'ta bile tam karşılığı yok gibi görünse de aslında `RefCell` /
   `Rc<RefCell<T>>` runtime borrow-checking olarak tam olarak bunu yapar —
   yani "runtime'da borrow kontrolü" sektörde de kabul görmüş bir desen.
@@ -148,16 +166,21 @@ bytecode VM'e geçilince gerçek bir CFG/lifetime analizine genişletilebilir
    assignment tip denetimi); (6) kaçış bahsinde statik tip `ListType`
    çıkarımı yapılır (`let xs = buf; xs.push(3)` artık meşru).
 1. **`nex_types.py`**: `@own` değerler için bir `OwnState` (borrow sayacı +
-   mod: none/shared/mut) kavramı tanımla.
+   mod: none/shared/mut) kavramı tanımla. **v1 uygulandı:**
+   `nex_types.OwnType` + `interpreter.OwnValue`
+   (`alive`/`shared`/`mut_borrowed`).
 2. **`interpreter.py`**: Katman 2 (runtime borrow flag) — en önce bu,
    çünkü hemen test edilebilir sonuç verir, ileri geri bildirim döngüsü
    kısa.
 3. **`type_checker.py`**: Katman 1 (blok-içi statik kontrol) — mevcut
-   `Scope`'a borrow takibi ekle.
+   `Scope`'a borrow takibi ekle. **Kısmen:** yalnız operand/mode/sınır
+   denetimi statik; çakışma denetimi runtime'da (Katman 2),
+   CFG/Lifetime analizi VM sonrası.
 4. **`to_own()` / `to_gc()`**: builtin olarak `alloc`/`free` yanına ekle,
    GC↔own geçiş kurallarını uygula.
 5. **`@raw` kısıtlaması**: type_checker'da, bir `@raw` değişkene GC/own
-   kaynaklı bir değer atanmaya çalışıldığında hata üret.
+   kaynaklı bir değer atanmaya çalışıldığında hata üret. **Henüz
+   uygulanmadı.**
 6. **(Bytecode VM sonrası)** Katman 1'i gerçek CFG/lifetime analizine
    genişlet — fonksiyonlar arası, döngü/dal duyarlı borrow checker.
 
@@ -173,10 +196,13 @@ noktada araya sokulabilir.
   var). Bir üst sınır konulup konulmayacağı, konulursa değerinin ne
   olacağı VM aşamasında netleşecek; boyutun kendisinin derleme
   zamanında literal olması v1'den beri zorunlu.
-- `&mut` borrow bir fonksiyona parametre olarak geçtiğinde, fonksiyon
-  bitince borrow otomatik mi bırakılıyor, yoksa açık bir "release" mi
-  gerekiyor?
-- Closure'ların `@own` değerleri yakalaması (capture) hangi kurala tabi?
+- **CEVAPLANDI — `&mut` fonksiyon parametresi (v1):** Borrow referansı
+  fonksiyon sınırını geçemez; VM sonrası gerçek kısmi geçiş (parametre
+  olarak borrow) ertelenmiştir. Blok-yerel borrow, scope sonunda
+  `Environment.close()` ile otomatik bırakılır.
+- **CEVAPLANDI — closure capture:** Yakalanan `@own` değer scope kapanışında
+  block-local kill ile ölür; closure içinden sonraki erişim panic üretir
+  (use-after-free).
 - **Python'un kendi GC'si ile çakışma riski** (dış görüş / Qwen
   incelemesiyle tespit edildi): Nex şu an Python üzerinde yorumlanıyor.
   `@own`/`@raw` nesneleri de sonuçta birer Python objesi olacak — yani

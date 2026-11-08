@@ -53,14 +53,16 @@ interpreter'da çalışıyor anlamına gelmez — aşağıdakiler gerçekten
   indeks denetimi; kaçış (GC değişkene, fonksiyona, `return`'e) heap liste
   kopyası üretir. `@` öneki opsiyoneldir (`stack let ...` de çalışır).
   Ayrıntı: [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) Bölüm 6, madde 0
+- `@own` sahipliği: `@own let p = to_own(x)` (GC'den derin kopya), `to_gc(p)`
+  (GC'ye taşıma; sonrasında `p` geçersiz), `free(p)`; `&x` / `&mut x` borrow'ları
+  blok sonunda otomatik bırakılır, çakışmalar runtime'da yakalanır.
+  Ayrıntı: [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) Bölüm 2/4/5
 
 ## Henüz gerçek davranışı olmayan (sözdizimi var, semantik yok)
 
-- **`@own` / `@raw` bellek modları** — parser bu annotation'ları
-  ayrıştırıyor ama ne `type_checker.py` ne de `interpreter.py` bunlara göre
-  bir şey yapıyor. `@stack` uygulanmıştır (yukarıya bakın); `@own`/`@raw`
-  tasarım ve uygulama planı için
-  [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) dosyasına bakabilirsin.
+- **`@raw` kısıtlaması** — parser `@raw`'ı ayrıştırıyor ama GC/own kaynağını
+  reddetme kuralı henüz uygulanmadı; `@raw` şu an GC gibi davranıyor (bkz.
+  [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) Bölüm 3/6, madde 5).
 - **`spawn` / `await`** — şu an ifadeyi olduğu gibi senkron değerlendiriyor,
   gerçek bir concurrency/scheduler yok.
 
