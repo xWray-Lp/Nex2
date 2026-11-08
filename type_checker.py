@@ -36,12 +36,17 @@ class Scope:
         self.symbols: dict[str, NexType] = {}
         self.mutability: dict[str, bool] = {}  # False = const
         self.mem_modes: dict[str, Optional[str]] = {}  # None=GC, "own"/"raw"/"stack"
+        # Taşınmış (moved) @own değişken adları. Akış-duyarsız/lineer izleme:
+        # bir move sonrası aynı blokta ad yeniden tanımlanana kadar "moved"
+        # kalır; dallar (if/loop) arası akış analizi bu adımda yok (bkz. §5).
+        self.moved: set[str] = set()
 
     def define(self, name: str, typ: NexType, mutable: bool = True,
                mem_mode: Optional[str] = None):
         self.symbols[name]    = typ
         self.mutability[name] = mutable
         self.mem_modes[name]  = mem_mode
+        self.moved.discard(name)   # yeniden tanımlama moved durumunu sıfırlar
 
     def lookup(self, name: str) -> Optional[NexType]:
         if name in self.symbols:
@@ -74,6 +79,32 @@ class Scope:
         if self.parent:
             return self.parent.lookup_mem_mode(name)
         return None
+
+    def mark_moved(self, name: str) -> None:
+        """Adı tanımlayan scope'ta moved işaretle (gölgeleme/scope çıkışı
+        dış scope'taki sahiplik durumunu bozmasın)."""
+        if name in self.symbols:
+            self.moved.add(name)
+        elif self.parent:
+            self.parent.mark_moved(name)
+
+    def is_moved(self, name: str) -> bool:
+        """Adı tanımlayan scope'a kadar bak; dış scope'ta aynı isimli
+        gölgelenmiş değişkenin moved durumu içtekini etkilemez."""
+        if name in self.symbols:
+            return name in self.moved
+        if self.parent:
+            return self.parent.is_moved(name)
+        return False
+
+    def clear_moved(self, name: str) -> None:
+        """Başarılı @own yeniden-ataması (to_own sonucu) moved durumunu
+        temizler: sahiplik yaşam döngüsü sıfırlanır (Iceman incelemesi,
+        bug B1)."""
+        if name in self.symbols:
+            self.moved.discard(name)
+        elif self.parent:
+            self.parent.clear_moved(name)
 
 
 # ─── Type Checker ─────────────────────────────────────────────────────────────
@@ -122,6 +153,10 @@ class TypeChecker:
         alloc_fn  = FnType([INT], UNKNOWN)
         free_fn   = FnType([UNKNOWN], VOID)
         sizeof_fn = FnType([UNKNOWN], INT)
+        # GC ⇄ @own geçişleri (§2): gerçek imzalar visit_CallExpr'te özel
+        # ele alınır; buradaki FnType yalnızca ismin tanımlı olması için.
+        to_own_fn = FnType([UNKNOWN], UNKNOWN)
+        to_gc_fn  = FnType([UNKNOWN], UNKNOWN)
 
         builtins = {
             "print": print_fn, "println": print_fn,
@@ -133,6 +168,7 @@ class TypeChecker:
             "str": str_fn, "int": int_fn,
             "float": float_fn, "bool": bool_fn,
             "alloc": alloc_fn, "free": free_fn, "sizeof": sizeof_fn,
+            "to_own": to_own_fn, "to_gc": to_gc_fn,
             # Logical operators - built-in olarak tanımla
             "and": FnType([BOOL, BOOL], BOOL),
             "or": FnType([BOOL, BOOL], BOOL),
@@ -237,6 +273,15 @@ class TypeChecker:
         if not is_subtype(actual, expected):
             msg = f"Type mismatch{' in ' + ctx if ctx else ''}: expected '{expected}', got '{actual}'"
             self.error(msg, node)
+
+    def _reject_own_value(self, t: NexType, node: Node, ctx: str) -> None:
+        """OwnType üreten ifade yalnızca @own bildirim/atama RHS'inde meşrudur.
+        Diğer bağlamlarda own değer GC tarafına sızar ve free edilemez; bu
+        adımda taşıma yalnızca to_gc(x) ile mümkündür (NEX_MEMORY_MODEL.md §2)."""
+        if isinstance(t, OwnType):
+            self.error(
+                f"cannot use @own value as {ctx}; move it with to_gc(x) first",
+                node)
 
     # ── Ana Ziyaretçi ─────────────────────────────────────────────
 
@@ -363,8 +408,48 @@ class TypeChecker:
             self.check_assign(
                 elem_t, declared.element, node, f"{ctx}[{i}] element")
 
+    def _own_decl_type(self, node: VarDecl, declared: Optional[NexType]) -> NexType:
+        """@own bildirim tipi: OwnType(inner). Yalnızca to_own(...) sonucu
+        (ve ileride başka @own değerinin move'u) başlatabilir; düz GC değeri
+        yasaktır (NEX_MEMORY_MODEL.md §2). @stack ile birleşemez (§1)."""
+        if isinstance(declared, StackArrayType):
+            self.error(
+                f"@own cannot be combined with @stack array type for '{node.name}'",
+                node)
+            if node.value is not None:
+                self.visit(node.value)
+            return OwnType(UNKNOWN)
+        inferred = self.visit(node.value) if node.value is not None else None
+        if inferred is None:
+            if declared is None:
+                self.error(
+                    f"@own variable '{node.name}' requires a type annotation or a "
+                    f"to_own(...) initializer", node)
+                return OwnType(UNKNOWN)
+            return OwnType(declared)
+        if not isinstance(inferred, OwnType):
+            # GC → own yalnızca to_own(x) ile (deep copy); düz atama yasak.
+            self.error(
+                f"cannot assign GC value to @own variable '{node.name}' "
+                f"(use to_own(x))", node)
+            return OwnType(declared if declared is not None else inferred)
+        if declared is not None:
+            self.check_assign(inferred.inner, declared, node,
+                              f"declaration of '{node.name}'")
+            return OwnType(declared)
+        return OwnType(inferred.inner)
+
+    def _define_var(self, node: VarDecl, var_type: NexType) -> None:
+        if self.current_scope.lookup_local(node.name):
+            self.warn(f"Variable '{node.name}' shadows outer declaration", node)
+        self.current_scope.define(node.name, var_type, mutable=node.mutable,
+                                  mem_mode=node.mem_mode)
+
     def visit_VarDecl(self, node: VarDecl) -> NexType:
         declared = self.resolve_type_node(node.type_ann) if node.type_ann else None
+        if node.mem_mode == "own":
+            self._define_var(node, self._own_decl_type(node, declared))
+            return VOID
         if node.mem_mode == "stack":
             # @stack yalnızca literal kabul eder; boyut/eleman tip/iç boyut
             # denetimi tek geçişte _check_stack_literal'da yapılır (aşağıda).
@@ -419,11 +504,12 @@ class TypeChecker:
             self.warn(f"Variable '{node.name}' has no type annotation and no initializer", node)
             var_type = UNKNOWN
 
-        if self.current_scope.lookup_local(node.name):
-            self.warn(f"Variable '{node.name}' shadows outer declaration", node)
+        # @own olmayan değişkene OwnType bağlanamaz; aksi halde own değer
+        # moved takibinden kaçar (mem_mode None). `let x = to_own(...)` yasak.
+        self._reject_own_value(
+            var_type, node, f"initializer of non-@own variable '{node.name}'")
 
-        self.current_scope.define(node.name, var_type, mutable=node.mutable,
-                                  mem_mode=node.mem_mode)
+        self._define_var(node, var_type)
         return VOID
 
     def visit_MultiVarDecl(self, node: MultiVarDecl) -> NexType:
@@ -445,6 +531,7 @@ class TypeChecker:
                 return VOID
 
         for name, vt in zip(node.names, value_types):
+            self._reject_own_value(vt, node, f"value bound to '{name}'")
             self.current_scope.define(name, vt, mutable=node.mutable)
         return VOID
 
@@ -591,6 +678,8 @@ class TypeChecker:
             return VOID
 
         actual = self.visit(node.value) if node.value else VOID
+        # @own dönüş tipi bu adımda parse edilemiyor; own değer GC'ye sızmasın.
+        self._reject_own_value(actual, node, "return value")
 
         if isinstance(self.fn_return_type, VoidType):
             if node.value:
@@ -735,6 +824,16 @@ class TypeChecker:
         if t is None:
             self.error(f"Undefined variable '{node.name}'", node)
             return UNKNOWN
+        # @own değer yalnızca to_gc(x) argümanı olarak okunabilir; borrow
+        # ifadeleri bu adımda kapsam dışı (§4). Diğer her okuma kopyalama
+        # veya sahiplik ihlalidir (§2).
+        if self.current_scope.lookup_mem_mode(node.name) == "own":
+            if self.current_scope.is_moved(node.name):
+                self.error(f"use of moved @own value '{node.name}'", node)
+            else:
+                self.error(
+                    f"cannot copy @own value '{node.name}' "
+                    f"(move it with to_gc(x))", node)
         return t
 
     def visit_BinaryExpr(self, node: BinaryExpr) -> NexType:
@@ -805,6 +904,20 @@ class TypeChecker:
             return BOOL
         return UNKNOWN
 
+    def _own_target_inner(self, node: Node) -> Optional[NexType]:
+        """Üye/indeks atama hedefinin kökü @own değişken ise inner tipini
+        döndür. Üye/indeks yazımı sahiplik aktarımı değil mutasyondur; bu
+        yüzden visit_Ident'in "own okunamaz" kuralı burada bilinçli olarak
+        atlanır (NEX_MEMORY_MODEL.md §2: move yalnızca tam değer içindir).
+        @own kök değilse None döner ve normal visit yolu kullanılır."""
+        if isinstance(node, Ident) \
+                and self.current_scope.lookup_mem_mode(node.name) == "own":
+            if self.current_scope.is_moved(node.name):
+                self.error(f"use of moved @own value '{node.name}'", node)
+            t = self.current_scope.lookup(node.name)
+            return t.inner if isinstance(t, OwnType) else UNKNOWN
+        return None
+
     def visit_AssignExpr(self, node: AssignExpr) -> NexType:
         # Sol taraf atanabilir mi?
         if isinstance(node.target, Ident):
@@ -827,6 +940,26 @@ class TypeChecker:
             else:
                 val_t = self.visit(node.value)
             op = node.op
+            if self.current_scope.lookup_mem_mode(var_name) == "own":
+                # @own değişkene yalnızca OwnType (to_own sonucu) atanabilir;
+                # düz GC değeri yasak (§2). Diğer @own değişkeni kopyalamak da
+                # yasak — move semantiği bu adımda yok, visit_Ident hata verir.
+                # Moved durumu önce raporlanır; sağlıklı yeniden atama
+                # (ASSIGN + OwnType) ise döngüyü sıfırlar.
+                if self.current_scope.is_moved(var_name) and op != "ASSIGN":
+                    self.error(
+                        f"use of moved @own value '{var_name}'", node)
+                elif op != "ASSIGN":
+                    self.error(
+                        f"compound assignment is not supported on @own variable "
+                        f"'{var_name}'", node)
+                elif not isinstance(val_t, OwnType):
+                    self.error(
+                        f"cannot assign GC value to @own variable '{var_name}' "
+                        f"(use to_own(x))", node)
+                else:
+                    self.current_scope.clear_moved(var_name)
+                return var_t
             if op == "ASSIGN" and self.current_scope.lookup_mem_mode(var_name) == "stack":
                 if (isinstance(val_t, ListType) and isinstance(node.value, ListLit)
                         and len(node.value.elements)
@@ -848,14 +981,19 @@ class TypeChecker:
                     self.check_assign(val_t.element, var_t.element, node,
                                       f"assignment to '{var_name}'")
             elif op == "ASSIGN":
+                self._reject_own_value(
+                    val_t, node, f"assignment to '{var_name}'")
                 self.check_assign(val_t, var_t, node, f"assignment to '{var_name}'")
             elif op in ("PLUS_EQ", "MINUS_EQ", "STAR_EQ", "SLASH_EQ"):
                 if not is_numeric(var_t):
                     self.error(f"Compound assignment requires numeric type, got '{var_t}'", node)
             return var_t
         elif isinstance(node.target, MemberExpr):
-            obj_t = self.visit(node.target.obj)
+            own_inner = self._own_target_inner(node.target.obj)
+            obj_t = own_inner if own_inner is not None else self.visit(node.target.obj)
             val_t = self.visit(node.value)
+            self._reject_own_value(val_t, node.value,
+                                   f"assignment to '{node.target.member}'")
             # Field tip kontrolü
             if isinstance(obj_t, ClassType):
                 field_t = obj_t.lookup_field(node.target.member)
@@ -864,9 +1002,11 @@ class TypeChecker:
                                       f"assignment to '{node.target.member}'")
             return val_t
         elif isinstance(node.target, IndexExpr):
-            obj_t = self.visit(node.target.obj)
+            own_inner = self._own_target_inner(node.target.obj)
+            obj_t = own_inner if own_inner is not None else self.visit(node.target.obj)
             self.visit(node.target.index)
             val_t = self.visit(node.value)
+            self._reject_own_value(val_t, node.value, "element assignment")
             # Sabit indeks aralık denetimi (okuma tarafı visit_IndexExpr'de
             # yapılır; atama hedefi olarak IndexExpr'i tam ziyaret etmediğimiz
             # için yazma tarafındaki denetim burada tekrar edilir)
@@ -890,7 +1030,90 @@ class TypeChecker:
             return val_t
         return UNKNOWN
 
+    def _check_to_own(self, node: CallExpr) -> NexType:
+        """to_own(x): GC değerinden bağımsız @own değer (deep copy, §2)."""
+        if len(node.args) != 1:
+            self.error("to_own requires exactly 1 argument", node)
+            return OwnType(UNKNOWN)
+        arg = node.args[0]
+        if isinstance(arg, Ident) \
+                and self.current_scope.lookup_mem_mode(arg.name) == "own":
+            self.error(
+                f"to_own requires a GC value; '{arg.name}' is already @own", arg)
+            t = self.current_scope.lookup(arg.name)
+            return t if isinstance(t, OwnType) else OwnType(UNKNOWN)
+        arg_t = self.visit(arg)
+        if isinstance(arg_t, OwnType):
+            self.error(
+                "to_own requires a GC value; argument is already @own", arg)
+            return arg_t
+        # to_own argümanı GC bağlamındadır; stack dizi kaçış kuralı gereği
+        # heap listesine kopyalanır, own tipi de onun üzerine kurulur.
+        return OwnType(self._escape_to_heap(arg_t))
+
+    def _check_to_gc(self, node: CallExpr) -> NexType:
+        """to_gc(x): @own değeri GC'ye taşır (move, §2). x moved işaretlenir."""
+        if len(node.args) != 1:
+            self.error("to_gc requires exactly 1 argument", node)
+            return UNKNOWN
+        arg = node.args[0]
+        if not isinstance(arg, Ident):
+            # Yan etkili alt ifadeleri yine denetle; ama taşınacak değişken yok.
+            self.visit(arg)
+            self.error("to_gc requires a variable reference", arg)
+            return UNKNOWN
+        name = arg.name
+        t = self.current_scope.lookup(name)
+        if t is None:
+            self.error(f"Undefined variable '{name}'", arg)
+            return UNKNOWN
+        if self.current_scope.lookup_mem_mode(name) != "own" \
+                or not isinstance(t, OwnType):
+            self.error(
+                f"to_gc requires an @own variable; '{name}' is not @own", arg)
+            return t
+        if self.current_scope.is_moved(name):
+            self.error(f"use of moved @own value '{name}'", arg)
+            return t.inner
+        self.current_scope.mark_moved(name)
+        return t.inner
+
+    def _check_free(self, node: CallExpr) -> NexType:
+        """free(x): @own değişkenin sahipliğini tüketir (§6 adım 4 civarı).
+        GC değişken üzerinde free yasaktır — free yalnızca @own içindir."""
+        if len(node.args) != 1:
+            self.error("free requires exactly 1 argument", node)
+            return VOID
+        arg = node.args[0]
+        if not isinstance(arg, Ident):
+            self.visit(arg)
+            self.error("free requires an @own variable reference", arg)
+            return VOID
+        name = arg.name
+        t = self.current_scope.lookup(name)
+        if t is None:
+            self.error(f"Undefined variable '{name}'", arg)
+            return VOID
+        if self.current_scope.lookup_mem_mode(name) != "own":
+            self.error(
+                f"free requires an @own variable; '{name}' is not @own", arg)
+            return VOID
+        if self.current_scope.is_moved(name):
+            self.error(f"use of moved @own value '{name}'", arg)
+            return VOID
+        self.current_scope.mark_moved(name)
+        return VOID
+
     def visit_CallExpr(self, node: CallExpr) -> NexType:
+        # GC ⇄ @own geçişleri ve free: gerçek imzalar argümana bağlı olduğu
+        # için FnType tablosu yerine burada özel ele alınır (§2).
+        if isinstance(node.callee, Ident):
+            if node.callee.name == "to_own":
+                return self._check_to_own(node)
+            if node.callee.name == "to_gc":
+                return self._check_to_gc(node)
+            if node.callee.name == "free":
+                return self._check_free(node)
         # Metod çağrısı: callee tipini doğrudan kullan — obj'yi tekrar ziyaret
         # etme (eski kod MemberExpr dalında çift ziyarete yol açıyordu).
         if isinstance(node.callee, MemberExpr):
@@ -926,6 +1149,7 @@ class TypeChecker:
             # Argüman tipleri
             for i, (arg, param_t) in enumerate(zip(node.args, callee_t.params)):
                 arg_t = self.visit(arg)
+                self._reject_own_value(arg_t, arg, f"argument {i+1}")
                 if not isinstance(param_t, UnknownType):
                     self.check_assign(arg_t, param_t, arg,
                                       f"argument {i+1}")
@@ -948,6 +1172,7 @@ class TypeChecker:
                             if p.name != "self"]
                 for i, (arg, (_, param_t)) in enumerate(zip(node.args, non_self)):
                     arg_t = self.visit(arg)
+                    self._reject_own_value(arg_t, arg, f"constructor argument {i+1}")
                     if not isinstance(param_t, UnknownType):
                         self.check_assign(arg_t, param_t, arg,
                                           f"constructor argument {i+1}")
@@ -1142,6 +1367,8 @@ class TypeChecker:
         if not node.elements:
             return ListType(UNKNOWN)
         types = [self.visit(e) for e in node.elements]
+        for e, t in zip(node.elements, types):
+            self._reject_own_value(t, e, "list element")
         # Tüm elemanlar aynı tipte mi?
         first = types[0]
         for i, t in enumerate(types[1:], 1):
@@ -1159,9 +1386,13 @@ class TypeChecker:
             return DictType(UNKNOWN, UNKNOWN)
         kt = self.visit(node.pairs[0][0])
         vt = self.visit(node.pairs[0][1])
+        self._reject_own_value(kt, node.pairs[0][0], "dict key")
+        self._reject_own_value(vt, node.pairs[0][1], "dict value")
         for k, v in node.pairs[1:]:
             kti = self.visit(k)
             vti = self.visit(v)
+            self._reject_own_value(kti, k, "dict key")
+            self._reject_own_value(vti, v, "dict value")
             if not isinstance(kti, UnknownType) and kti != kt:
                 kt = UNKNOWN  # heterogeneous keys → unknown
             if not isinstance(vti, UnknownType) and vti != vt:
@@ -1169,12 +1400,17 @@ class TypeChecker:
         return DictType(kt, vt)
 
     def visit_TupleLit(self, node: TupleLit) -> NexType:
-        return TupleType([self.visit(e) for e in node.elements])
+        types = [self.visit(e) for e in node.elements]
+        for e, t in zip(node.elements, types):
+            self._reject_own_value(t, e, "tuple element")
+        return TupleType(types)
 
     def visit_SetLit(self, node: SetLit) -> NexType:
         if not node.elements:
             return SetType(UNKNOWN)
         types = [self.visit(e) for e in node.elements]
+        for e, t in zip(node.elements, types):
+            self._reject_own_value(t, e, "set element")
         return SetType(types[0])
 
     def visit_MatchExpr(self, node: MatchExpr) -> NexType:

@@ -130,6 +130,15 @@ class RefType(NexType):
     def __hash__(self): return hash(("ref", self.inner, self.mutable))
 
 @dataclass
+class OwnType(NexType):
+    """@own sahipliğindeki değer: @own <inner> (NEX_MEMORY_MODEL.md §2)."""
+    inner: NexType
+    def __repr__(self): return f"@own {self.inner}"
+    def __eq__(self, other):
+        return isinstance(other, OwnType) and self.inner == other.inner
+    def __hash__(self): return hash(("own", self.inner))
+
+@dataclass
 class ResultType(NexType):
     ok: NexType
     def __repr__(self): return f"Result[{self.ok}]"
