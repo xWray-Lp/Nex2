@@ -257,11 +257,11 @@ class TypeChecker:
         if isinstance(node, TypeStackArray):
             elem = self.resolve_type_node(node.elem)
             if not isinstance(node.size, IntLit):
-                self.error("Stack array size must be an integer literal", node)
+                self.error("stack array size must be an integer literal", node)
                 return StackArrayType(elem, 0)
             n = int(node.size.value)
             if n < 1:
-                self.error("Stack array size must be at least 1", node)
+                self.error("stack array size must be at least 1", node)
                 return StackArrayType(elem, 0)
             return StackArrayType(elem, n)
 
@@ -435,7 +435,7 @@ class TypeChecker:
         """@stack literal'i boyut + eleman tipi + iç boyut tek geçişte denetler."""
         if len(lit.elements) != declared.size:
             self.error(
-                f"Stack array size mismatch for {ctx}: declared "
+                f"stack array size mismatch for {ctx}: declared "
                 f"[{declared.element}; {declared.size}], got "
                 f"{len(lit.elements)} element(s)", node)
             return
@@ -483,7 +483,7 @@ class TypeChecker:
 
     def _define_var(self, node: VarDecl, var_type: NexType) -> None:
         if self.current_scope.lookup_local(node.name):
-            self.warn(f"Variable '{node.name}' shadows outer declaration", node)
+            self.warn(f"variable '{node.name}' shadows outer declaration", node)
         self.current_scope.define(node.name, var_type, mutable=node.mutable,
                                   mem_mode=node.mem_mode)
 
@@ -557,7 +557,7 @@ class TypeChecker:
         elif inferred:
             var_type = inferred
         else:
-            self.warn(f"Variable '{node.name}' has no type annotation and no initializer", node)
+            self.warn(f"variable '{node.name}' has no type annotation and no initializer", node)
             var_type = UNKNOWN
 
         # @own olmayan değişkene OwnType bağlanamaz; aksi halde own değer
@@ -577,13 +577,13 @@ class TypeChecker:
                 tup = value_types[0]
                 if len(tup.elements) != len(node.names):
                     self.error(
-                        f"Cannot unpack {len(tup.elements)} values into {len(node.names)} variables",
+                        f"cannot unpack {len(tup.elements)} values into {len(node.names)} variables",
                         node)
                     return VOID
                 value_types = tup.elements
             else:
                 self.error(
-                    f"Expected {len(node.names)} values, got {len(value_types)}", node)
+                    f"expected {len(node.names)} values, got {len(value_types)}", node)
                 return VOID
 
         for name, vt in zip(node.names, value_types):
@@ -613,11 +613,11 @@ class TypeChecker:
             if isinstance(inner, StackArrayType):
                 if p.is_ref or isinstance(resolved, RefType):
                     self.error(
-                        f"Stack array parameter '{p.name}' in function '{node.name}' "
+                        f"stack array parameter '{p.name}' in function '{node.name}' "
                         f"cannot be passed by reference", node)
                 else:
                     self.error(
-                        f"Stack array parameter '{p.name}' in function '{node.name}': "
+                        f"stack array parameter '{p.name}' in function '{node.name}': "
                         f"@stack arrays are fixed to their declaring scope; pass a "
                         f"list instead", node)
 
@@ -669,7 +669,7 @@ class TypeChecker:
         if node.base:
             base_t = self.type_registry.get(node.base)
             if base_t is None:
-                self.error(f"Unknown base class '{node.base}'", node)
+                self.error(f"unknown base class '{node.base}'", node)
             else:
                 ct.base = base_t
 
@@ -677,7 +677,7 @@ class TypeChecker:
         for iface_name in node.interfaces:
             it = self.type_registry.get(iface_name)
             if it is None or not isinstance(it, InterfaceType):
-                self.error(f"Unknown interface '{iface_name}'", node)
+                self.error(f"unknown interface '{iface_name}'", node)
             else:
                 ct.interfaces.append(it)
 
@@ -707,7 +707,7 @@ class TypeChecker:
             for mname, msig in iface.methods.items():
                 if mname not in ct.methods:
                     self.error(
-                        f"Class '{node.name}' does not implement '{mname}' from '{iface.name}'",
+                        f"class '{node.name}' does not implement '{mname}' from '{iface.name}'",
                         node)
 
         # Method gövdelerini kontrol et
@@ -760,7 +760,7 @@ class TypeChecker:
 
         if isinstance(self.fn_return_type, VoidType):
             if node.value:
-                self.warn("Returning value from void function", node)
+                self.warn("returning value from void function", node)
         elif not isinstance(self.fn_return_type, UnknownType):
             self.check_assign(actual, self.fn_return_type, node, "return statement")
         return VOID
@@ -778,7 +778,7 @@ class TypeChecker:
     def visit_IfStmt(self, node: IfStmt) -> NexType:
         cond_t = self.visit(node.condition)
         if not isinstance(cond_t, (BoolType, UnknownType)):
-            self.error(f"If condition must be 'bool', got '{cond_t}'", node)
+            self.error(f"if condition must be 'bool', got '{cond_t}'", node)
 
         self.push_scope("if:then")
         self.visit_Block(node.then_block)
@@ -787,7 +787,7 @@ class TypeChecker:
         for ec, eb in node.elif_arms:
             et = self.visit(ec)
             if not isinstance(et, (BoolType, UnknownType)):
-                self.error(f"Elif condition must be 'bool', got '{et}'", node)
+                self.error(f"elif condition must be 'bool', got '{et}'", node)
             self.push_scope("elif")
             self.visit_Block(eb)
             self.pop_scope()
@@ -832,13 +832,13 @@ class TypeChecker:
         if isinstance(t, RangeExpr): return INT
         # RangeExpr'ı tip olarak gönderebiliriz — aşağıda özel case
         if isinstance(t, UnknownType): return UNKNOWN
-        self.warn(f"Iterating over non-iterable type '{t}'", node)
+        self.warn(f"iterating over non-iterable type '{t}'", node)
         return UNKNOWN
 
     def visit_WhileStmt(self, node: WhileStmt) -> NexType:
         ct = self.visit(node.condition)
         if not isinstance(ct, (BoolType, UnknownType)):
-            self.error(f"While condition must be 'bool', got '{ct}'", node)
+            self.error(f"while condition must be 'bool', got '{ct}'", node)
         self.push_scope("while")
         self.loop_depth += 1
         self.visit_Block(node.body)
@@ -859,7 +859,7 @@ class TypeChecker:
                 self._reject_own_value(guard_t, arm.guard, "match guard")
                 if not isinstance(guard_t, (BoolType, UnknownType)):
                     self.error(
-                        f"Match guard must be 'bool', got '{guard_t}'",
+                        f"match guard must be 'bool', got '{guard_t}'",
                         arm.guard)
             if isinstance(arm.body, Block):
                 self.visit_Block(arm.body)
@@ -876,7 +876,7 @@ class TypeChecker:
         if not isinstance(subject_t, UnknownType) and not isinstance(pat_t, UnknownType):
             if not is_subtype(pat_t, subject_t) and not is_subtype(subject_t, pat_t):
                 self.warn(
-                    f"Pattern type '{pat_t}' may not match subject type '{subject_t}'",
+                    f"pattern type '{pat_t}' may not match subject type '{subject_t}'",
                     node)
         return pat_t
 
@@ -922,7 +922,7 @@ class TypeChecker:
     def visit_Ident(self, node: Ident) -> NexType:
         t = self.current_scope.lookup(node.name)
         if t is None:
-            self.error(f"Undefined variable '{node.name}'", node)
+            self.error(f"undefined variable '{node.name}'", node)
             return UNKNOWN
         # @own değer yalnızca to_gc(x) argümanı olarak okunabilir; borrow
         # ifadeleri bu adımda kapsam dışı (§4). Diğer her okuma kopyalama
@@ -948,13 +948,13 @@ class TypeChecker:
             if op == "+" and isinstance(lt, StrType) and isinstance(rt, StrType):
                 return STR
             if op == "+" and isinstance(lt, StrType):
-                self.warn(f"String concatenation with '{rt}' — implicit conversion may be needed", node)
+                self.warn(f"string concatenation with '{rt}' — implicit conversion may be needed", node)
                 return STR
             if not is_numeric(lt):
-                self.error(f"Operator '{op}' not supported on type '{lt}'", node)
+                self.error(f"operator '{op}' not supported on type '{lt}'", node)
                 return UNKNOWN
             if not is_numeric(rt):
-                self.error(f"Operator '{op}' not supported on type '{rt}'", node)
+                self.error(f"operator '{op}' not supported on type '{rt}'", node)
                 return UNKNOWN
             if op == "/":
                 return FLOAT   # bölme her zaman float
@@ -963,22 +963,22 @@ class TypeChecker:
         # Karşılaştırma
         if op in ("==", "!="):
             if not is_subtype(lt, rt) and not is_subtype(rt, lt):
-                self.warn(f"Comparing incompatible types '{lt}' and '{rt}'", node)
+                self.warn(f"comparing incompatible types '{lt}' and '{rt}'", node)
             return BOOL
 
         if op in ("<", ">", "<=", ">="):
             if not is_comparable(lt):
-                self.error(f"Type '{lt}' is not comparable", node)
+                self.error(f"type '{lt}' is not comparable", node)
             if not is_comparable(rt):
-                self.error(f"Type '{rt}' is not comparable", node)
+                self.error(f"type '{rt}' is not comparable", node)
             return BOOL
 
         # Mantıksal
         if op in ("and", "or"):
             if not isinstance(lt, (BoolType, UnknownType)):
-                self.error(f"Left operand of '{op}' must be 'bool', got '{lt}'", node)
+                self.error(f"left operand of '{op}' must be 'bool', got '{lt}'", node)
             if not isinstance(rt, (BoolType, UnknownType)):
-                self.error(f"Right operand of '{op}' must be 'bool', got '{rt}'", node)
+                self.error(f"right operand of '{op}' must be 'bool', got '{rt}'", node)
             return BOOL
 
         # Null coalescing
@@ -987,7 +987,7 @@ class TypeChecker:
             rt_inner = rt.unwrap() if rt.is_nullable() else rt
             if not isinstance(rt_inner, UnknownType) and not isinstance(inner, UnknownType):
                 if not is_subtype(rt_inner, inner) and not is_subtype(inner, rt_inner):
-                    self.warn(f"Null coalescing: left is '{lt}', right is '{rt}'", node)
+                    self.warn(f"null coalescing: left is '{lt}', right is '{rt}'", node)
             return inner if not isinstance(inner, UnknownType) else rt_inner
 
         return UNKNOWN
@@ -996,7 +996,7 @@ class TypeChecker:
         t = self.visit(node.operand)
         if node.op == "-":
             if not is_numeric(t):
-                self.error(f"Unary '-' requires numeric type, got '{t}'", node)
+                self.error(f"unary '-' requires numeric type, got '{t}'", node)
             return t
         if node.op == "not":
             if not isinstance(t, (BoolType, UnknownType)):
@@ -1012,7 +1012,7 @@ class TypeChecker:
         name = op.name
         # visit_Ident çağrılmaz: borrow ≠ move, moved işaretlenmez.
         if self.current_scope.lookup(name) is None:
-            self.error(f"Undefined variable '{name}'", op)
+            self.error(f"undefined variable '{name}'", op)
             return UNKNOWN
         if self.current_scope.lookup_mem_mode(name) != "own":
             self.error("only @own values can be borrowed (v1)", op)
@@ -1046,10 +1046,10 @@ class TypeChecker:
             var_name = node.target.name
             var_t    = self.current_scope.lookup(var_name)
             if var_t is None:
-                self.error(f"Undefined variable '{var_name}'", node)
+                self.error(f"undefined variable '{var_name}'", node)
                 return UNKNOWN
             if not self.current_scope.is_mutable(var_name):
-                self.error(f"Cannot assign to constant '{var_name}'", node)
+                self.error(f"cannot assign to constant '{var_name}'", node)
                 return UNKNOWN
             # visit() ipucunu sıfırlar; doğrudan literal için burada aç
             if isinstance(node.value, ListLit) and isinstance(var_t, StackArrayType):
@@ -1111,17 +1111,17 @@ class TypeChecker:
                         and len(node.value.elements)
                             != getattr(var_t, 'size', len(node.value.elements))):
                     self.error(
-                        f"Stack array size mismatch: '{var_name}' has size "
+                        f"stack array size mismatch: '{var_name}' has size "
                         f"{getattr(var_t, 'size', '?')}, got "
                         f"{len(node.value.elements)} element(s)", node)
                 elif not isinstance(val_t, StackArrayType):
                     self.error(
-                        f"Cannot assign value of type '{val_t}' to stack array "
+                        f"cannot assign value of type '{val_t}' to stack array "
                         f"'{var_name}' of type '{var_t}'", node)
                 elif (not isinstance(var_t, UnknownType)
                         and val_t.size != getattr(var_t, 'size', val_t.size)):
                     self.error(
-                        f"Stack array size mismatch: '{var_name}' has size "
+                        f"stack array size mismatch: '{var_name}' has size "
                         f"{getattr(var_t, 'size', '?')}, got size {val_t.size}", node)
                 elif not isinstance(var_t, UnknownType):
                     self.check_assign(val_t.element, var_t.element, node,
@@ -1132,7 +1132,7 @@ class TypeChecker:
                 self.check_assign(val_t, var_t, node, f"assignment to '{var_name}'")
             elif op in ("PLUS_EQ", "MINUS_EQ", "STAR_EQ", "SLASH_EQ"):
                 if not is_numeric(var_t):
-                    self.error(f"Compound assignment requires numeric type, got '{var_t}'", node)
+                    self.error(f"compound assignment requires numeric type, got '{var_t}'", node)
             return var_t
         elif isinstance(node.target, MemberExpr):
             own_inner = self._own_target_inner(node.target.obj)
@@ -1166,7 +1166,7 @@ class TypeChecker:
                 const_idx = int(node.target.index.value)
                 if const_idx < 0 or const_idx >= obj_t.size:
                     self.error(
-                        f"Index {const_idx} out of bounds for stack array of "
+                        f"index {const_idx} out of bounds for stack array of "
                         f"size {obj_t.size}", node)
             # Eleman atama tip kontrolü — stack dizi elemanına (ve GC listesine)
             # yanlış tipte değer atanması, ayrıca iç stack boyut uyuşmazlığı.
@@ -1217,7 +1217,7 @@ class TypeChecker:
         name = arg.name
         t = self.current_scope.lookup(name)
         if t is None:
-            self.error(f"Undefined variable '{name}'", arg)
+            self.error(f"undefined variable '{name}'", arg)
             return UNKNOWN
         if self.current_scope.lookup_mem_mode(name) != "own" \
                 or not isinstance(t, OwnType):
@@ -1244,7 +1244,7 @@ class TypeChecker:
         name = arg.name
         t = self.current_scope.lookup(name)
         if t is None:
-            self.error(f"Undefined variable '{name}'", arg)
+            self.error(f"undefined variable '{name}'", arg)
             return VOID
         if self.current_scope.lookup_mem_mode(name) != "own":
             self.error(
@@ -1312,7 +1312,7 @@ class TypeChecker:
             n_args   = len(node.args)
             if n_params != n_args and not any(isinstance(p, UnknownType) for p in callee_t.params):
                 self.error(
-                    f"Function expects {n_params} arguments, got {n_args}", node)
+                    f"function expects {n_params} arguments, got {n_args}", node)
             # Argüman tipleri
             for i, (arg, param_t) in enumerate(zip(node.args, callee_t.params)):
                 arg_t = self.visit(arg)
@@ -1460,30 +1460,30 @@ class TypeChecker:
 
         if isinstance(obj_t, StackArrayType):
             if not isinstance(idx_t, (IntType, UnknownType)):
-                self.error(f"Stack array index must be 'int', got '{idx_t}'", node)
+                self.error(f"stack array index must be 'int', got '{idx_t}'", node)
             # Sabit indeks derleme zamanında denetlenebilir
             if isinstance(node.index, IntLit):
                 idx = int(node.index.value)
                 if idx < 0 or idx >= obj_t.size:
                     self.error(
-                        f"Index {idx} out of bounds for stack array of size "
+                        f"index {idx} out of bounds for stack array of size "
                         f"{obj_t.size}", node)
             return obj_t.element
 
         if isinstance(obj_t, ListType):
             if not isinstance(idx_t, (IntType, UnknownType)):
-                self.error(f"List index must be 'int', got '{idx_t}'", node)
+                self.error(f"list index must be 'int', got '{idx_t}'", node)
             return obj_t.element
 
         if isinstance(obj_t, DictType):
             if not is_subtype(idx_t, obj_t.key):
                 self.error(
-                    f"Dict key must be '{obj_t.key}', got '{idx_t}'", node)
+                    f"dict key must be '{obj_t.key}', got '{idx_t}'", node)
             return NullableType(obj_t.value)
 
         if isinstance(obj_t, StrType):
             if not isinstance(idx_t, (IntType, UnknownType)):
-                self.error(f"String index must be 'int', got '{idx_t}'", node)
+                self.error(f"string index must be 'int', got '{idx_t}'", node)
             return STR
 
         if isinstance(obj_t, TupleType):
@@ -1493,27 +1493,27 @@ class TypeChecker:
             return UNKNOWN
 
         if not isinstance(obj_t, UnknownType):
-            self.error(f"Type '{obj_t}' is not indexable", node)
+            self.error(f"type '{obj_t}' is not indexable", node)
         return UNKNOWN
 
     def visit_IfExpr(self, node: IfExpr) -> NexType:
         cond_t = self.visit(node.condition)
         if not isinstance(cond_t, (BoolType, UnknownType)):
-            self.error(f"If expression condition must be 'bool', got '{cond_t}'", node)
+            self.error(f"if expression condition must be 'bool', got '{cond_t}'", node)
         then_t = self.visit(node.then_val)
         else_t = self.visit(node.else_val)
         if then_t != else_t and not isinstance(then_t, UnknownType) and not isinstance(else_t, UnknownType):
             self.warn(
-                f"If expression branches have different types: '{then_t}' vs '{else_t}'", node)
+                f"if expression branches have different types: '{then_t}' vs '{else_t}'", node)
         return then_t
 
     def visit_RangeExpr(self, node: RangeExpr) -> NexType:
         start_t = self.visit(node.start)
         end_t   = self.visit(node.end)
         if not isinstance(start_t, (IntType, UnknownType)):
-            self.error(f"Range start must be 'int', got '{start_t}'", node)
+            self.error(f"range start must be 'int', got '{start_t}'", node)
         if not isinstance(end_t, (IntType, UnknownType)):
-            self.error(f"Range end must be 'int', got '{end_t}'", node)
+            self.error(f"range end must be 'int', got '{end_t}'", node)
         return ListType(INT)   # range → iterable over int
 
     def visit_AwaitExpr(self, node: AwaitExpr) -> NexType:
@@ -1555,7 +1555,7 @@ class TypeChecker:
         for i, t in enumerate(types[1:], 1):
             if t != first and not isinstance(t, UnknownType) and not isinstance(first, UnknownType):
                 self.error(
-                    f"List element {i} has type '{t}', expected '{first}'", node)
+                    f"list element {i} has type '{t}', expected '{first}'", node)
         # Stack atanma bağlamında (boyut da uyuyorsa) literal stack dizisi
         # sayılır; diğer her yerde literal heap listesidir.
         if self._expect_list_lit(node):
@@ -1607,7 +1607,7 @@ class TypeChecker:
                 self._reject_own_value(guard_t, arm.guard, "match guard")
                 if not isinstance(guard_t, (BoolType, UnknownType)):
                     self.error(
-                        f"Match guard must be 'bool', got '{guard_t}'",
+                        f"match guard must be 'bool', got '{guard_t}'",
                         arm.guard)
             bt = self.visit(arm.body)
             result_types.append(bt)
@@ -1616,7 +1616,7 @@ class TypeChecker:
             first = result_types[0]
             for rt in result_types[1:]:
                 if rt != first and not isinstance(rt, UnknownType):
-                    self.warn(f"Match arms have inconsistent types: '{rt}' vs '{first}'", node)
+                    self.warn(f"match arms have inconsistent types: '{rt}' vs '{first}'", node)
             return first
         return UNKNOWN
 
