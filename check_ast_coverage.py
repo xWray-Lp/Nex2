@@ -20,7 +20,6 @@ Kullanım: python3 check_ast_coverage.py  (exit 1 = kapsanmayan alan var)
 """
 
 import ast as pyast
-import re
 import sys
 from pathlib import Path
 

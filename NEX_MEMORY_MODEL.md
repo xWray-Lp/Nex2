@@ -208,7 +208,10 @@ noktada araya sokulabilir.
 - **CEVAPLANDI — `&mut` fonksiyon parametresi (v1):** Borrow referansı
   fonksiyon sınırını geçemez; VM sonrası gerçek kısmi geçiş (parametre
   olarak borrow) ertelenmiştir. Blok-yerel borrow, scope sonunda
-  `Environment.close()` ile otomatik bırakılır.
+  `Environment.close()` ile otomatik bırakılır. `&mut x` parametresi
+  derleme hatasıdır; paylaşımlı `&x` parametresi derlenir (değer güncel
+  parametre olarak geçer). Not: `&` sonrası `mut` anahtar kelimesidir —
+  adı tam `mut` olan parametreye `&` üzerinden referans verilemez.
 - **CEVAPLANDI — closure capture:** Yakalanan `@own` değer scope kapanışında
   block-local kill ile ölür; closure içinden sonraki erişim panic üretir
   (use-after-free).
