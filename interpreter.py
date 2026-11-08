@@ -1132,6 +1132,20 @@ class Interpreter:
         ]
 
         if isinstance(callee, BuiltinFunction):
+            # Wrapper temizliği: borrow/sahiplik proxy'leri fonksiyon
+            # sınırını (builtin dahil) geçemez (§4 v1); konumsuz
+            # 'Internal Error' yerine konumlu hata ver.
+            for i, av in enumerate(args):
+                if isinstance(av, BorrowRef):
+                    at = node.args[i] if i < len(node.args) else node
+                    self.error(
+                        "borrowed references cannot cross function boundaries yet (v1)",
+                        at)
+                if isinstance(av, OwnValue) and av.alive:
+                    at = node.args[i] if i < len(node.args) else node
+                    self.error(
+                        f"cannot pass @own value as argument {i + 1}; "
+                        f"move it with to_gc(x) first", at)
             return callee(*args)
         elif hasattr(callee, "call"):
             return callee.call(self, args)

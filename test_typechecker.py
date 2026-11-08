@@ -504,6 +504,28 @@ fn main():
     let s = f"val: {buf}"
 """, expect_errors=["cannot use @own value as f-string interpolation"])
 
+run("Match guard: undefined variable in guard", """
+fn main():
+    match 1:
+        case _ if len(no_such_var) > 0 -> print("nope")
+""", expect_errors=["Undefined variable 'no_such_var'"])
+
+run("Match guard: @own read in guard is compile error", """
+fn main():
+    @own let x = to_own([1, 2])
+    match 1:
+        case _ if len(x) > 0 -> print("nope")
+""", expect_errors=["cannot copy @own value 'x'"])
+
+run("Match guard: guard expression checked (match expr)", """
+fn main():
+    let v = match 1:
+        case _ if len(x) > 0 -> 5
+    print(str(v))
+
+let x = [1, 2]
+""", expect_errors=["Undefined variable 'x'"])
+
 # ─── Sonuç ────────────────────────────────────────────────────────
 
 total = passed + failed

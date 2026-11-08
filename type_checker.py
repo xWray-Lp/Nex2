@@ -563,6 +563,12 @@ class TypeChecker:
             if p.type_ann is None:
                 continue
             resolved = self.resolve_type_node(p.type_ann)
+            # Param default ifadesi: escape/ifadesel denetimden geçmeli (audit A-bulgu 2)
+            if p.default is not None:
+                dt = self.visit(p.default)
+                self._reject_own_value(dt, p.default, "default argument")
+                if not isinstance(resolved, UnknownType):
+                    self.check_assign(dt, resolved, p, f"default of '{p.name}'")
             inner = resolved.inner if isinstance(resolved, RefType) else resolved
             if isinstance(inner, StackArrayType):
                 if p.is_ref or isinstance(resolved, RefType):
@@ -643,6 +649,12 @@ class TypeChecker:
         # Field'ları kaydet
         for f in node.fields:
             ft = self.resolve_type_node(f.type_ann)
+            # Field default ifadesi: denetimsiz geçme (audit A-bulgu 3)
+            if f.default is not None:
+                dt = self.visit(f.default)
+                self._reject_own_value(dt, f.default, "field default")
+                if not isinstance(ft, UnknownType):
+                    self.check_assign(dt, ft, f, f"default of field '{f.name}'")
             ct.fields[f.name] = ft
 
         # Method imzalarını kaydet (önce)
@@ -799,6 +811,10 @@ class TypeChecker:
         for arm in node.arms:
             self.push_scope("match:arm")
             pat_t = self._check_pattern(arm.pattern, subject_t, arm)
+            # Guard da bir ifadedir: ayrı ziyaret edilmezse undefined var /
+            # @own sızıntısı / tip hataları checker'dan sessizce geçer.
+            if arm.guard is not None:
+                self.visit(arm.guard)
             if isinstance(arm.body, Block):
                 self.visit_Block(arm.body)
             else:
@@ -1525,6 +1541,9 @@ class TypeChecker:
         for arm in node.arms:
             self.push_scope("match:arm")
             self._check_pattern(arm.pattern, subject_t, arm)
+            # Guard da bir ifadedir (visit_MatchStmt'teki delikle aynı sınıf).
+            if arm.guard is not None:
+                self.visit(arm.guard)
             bt = self.visit(arm.body)
             result_types.append(bt)
             self.pop_scope()
