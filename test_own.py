@@ -13,9 +13,12 @@ Bu adımda runtime yoktur: yalnızca type_checker denetlenir.
 """
 
 import sys
+import io
+import contextlib
 from lexer import Lexer
 from parser import Parser
 from type_checker import TypeChecker
+from interpreter import Interpreter
 
 GREEN  = "\033[92m"
 RED    = "\033[91m"
@@ -86,6 +89,52 @@ def run(name: str, source: str,
 
 def section(title):
     print(f"\n{BOLD}{YELLOW}{'═'*50}\n  {title}\n{'═'*50}{RESET}")
+
+
+# ─── Runtime helpers (test_stack.py tarzı) ─────────────────────────
+
+def _check_source(source: str):
+    tokens = Lexer(source.strip() + "\n").tokenize()
+    tree = Parser(tokens).parse()
+    tc = TypeChecker()
+    ok = tc.check(tree)
+    return ok, [d.message for d in tc.errors], tree
+
+
+def _run_source(source: str):
+    """Çalıştırır; (output_lines, runtime_error_line|None) döndürür."""
+    _ok, _errs, tree = _check_source(source)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        Interpreter().interpret(tree)
+    out = buf.getvalue()
+    rt = [ln for ln in out.splitlines() if "Runtime Error" in ln]
+    lines = [ln for ln in out.splitlines() if "Runtime Error" not in ln]
+    return lines, (rt[0] if rt else None)
+
+
+def expect_runtime_output(name, source, expected_lines):
+    global passed, failed
+    print(f"\n{CYAN}{BOLD}━━━ {name} ━━━{RESET}")
+    lines, err = _run_source(source)
+    if err is None and lines == expected_lines:
+        print(f"  {GREEN}✓ Output {lines}{RESET}")
+        passed += 1
+    else:
+        print(f"  {RED}✗ Expected {expected_lines}, got lines={lines} err={err}{RESET}")
+        failed += 1
+
+
+def expect_runtime_error(name, source, needle):
+    global passed, failed
+    print(f"\n{CYAN}{BOLD}━━━ {name} ━━━{RESET}")
+    lines, err = _run_source(source)
+    if err is not None and needle.lower() in err.lower():
+        print(f"  {GREEN}✓ Caught expected runtime error: {err}{RESET}")
+        passed += 1
+    else:
+        print(f"  {RED}✗ Expected runtime error containing '{needle}', got err={err} lines={lines}{RESET}")
+        failed += 1
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -405,6 +454,95 @@ fn main():
     let g = to_gc(n)
     n = 7
 """, expect_errors=["cannot assign GC value to @own variable 'n'"])
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  BÖLÜM 8 — RUNTIME (Step 2)
+# ═══════════════════════════════════════════════════════════════════
+
+section("8 · Runtime: move (to_gc) ve use-after-move")
+
+expect_runtime_output("to_gc move returns heap value", """
+fn main():
+    @own let p = to_own([1, 2, 3])
+    let g = to_gc(p)
+    print(str(g[0]))
+    print(str(g[2]))
+main()
+""", ["1", "3"])
+
+expect_runtime_error("read after move panics (use-after-free)", """
+fn main():
+    @own let p = to_own([1, 2, 3])
+    let g = to_gc(p)
+    print(str(p))
+main()
+""", "use-after-free")
+
+expect_runtime_output("to_gc result is independent heap data", """
+fn main():
+    @own let p = to_own([1, 2, 3])
+    let g = to_gc(p)
+    g[0] = 9
+    print(str(g[0]))
+    print(str(len(g)))
+main()
+""", ["9", "3"])
+
+section("9 · Runtime: free ve use-after-free")
+
+expect_runtime_error("read after free panics", """
+fn main():
+    @own let p = to_own([5, 6])
+    free(p)
+    print(str(p))
+main()
+""", "use-after-free")
+
+expect_runtime_error("to_gc after free panics", """
+fn main():
+    @own let p = to_own([1])
+    free(p)
+    let g = to_gc(p)
+main()
+""", "use-after-free")
+
+section("10 · Runtime: to_own deep independence ve scope kill")
+
+expect_runtime_output("to_own deep-copies source (independent)", """
+fn main():
+    let src = [1, 2, 3]
+    @own let p = to_own(src)
+    src[0] = 99
+    let g = to_gc(p)
+    print(str(g[0]))
+    print(str(src[0]))
+main()
+""", ["1", "99"])
+
+expect_runtime_error("scope-end kill: dead closure capture panics", """
+fn probe():
+    @own let p = to_own([7, 8])
+    return fn() -> int:
+        let g = to_gc(p)
+        return g[0]
+
+fn main():
+    let f = probe()
+    print(str(f()))
+main()
+""", "use-after-free")
+
+expect_runtime_output("reassign with to_own resets lifecycle", """
+fn main():
+    @own let p = to_own([1])
+    let g1 = to_gc(p)
+    p = to_own([2, 3])
+    let g2 = to_gc(p)
+    print(str(g1[0]))
+    print(str(g2[1]))
+main()
+""", ["1", "3"])
 
 
 # ─── Sonuç ────────────────────────────────────────────────────────

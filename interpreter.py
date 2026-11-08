@@ -6,6 +6,7 @@ Visitor pattern + environment stack.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Callable, Dict, List, Optional
 
 from ast_nodes import *
@@ -84,6 +85,35 @@ class StackArray:
         return f"[{', '.join(repr(x) for x in self._items)}]"
 
 
+class OwnValue:
+    """@own sahiplik wrapper'ı. Değer tek sahibindir; free/scope sonrası ölüdür.
+
+    Normal bağlamlarda opak tutulur (checker sıradan okumayı reddeder);
+    yalnızca to_gc/free builtin'leri wrapper'a erişir.
+    """
+
+    __slots__ = ("_value", "name", "alive")
+
+    def __init__(self, value, name: str = "<own>"):
+        self._value = value
+        self.name = name
+        self.alive = True
+
+    def kill(self):
+        self.alive = False
+        self._value = None  # Python GC içeriği geri alabilsin
+
+    def _check(self):
+        if not self.alive:
+            raise OwnPanic(
+                f"@own value '{self.name}' used after free/scope end (use-after-free)")
+
+    def __repr__(self):
+        if not self.alive:
+            return f"<freed own '{self.name}'>"
+        return f"<own '{self.name}'>"
+
+
 class Environment:
     """Değişken değerlerini saklayan ortam. Scope yönetimi yapar."""
 
@@ -94,6 +124,7 @@ class Environment:
         self.constants: set[str] = set()  # const değişkenler
         self.functions: Dict[str, FnDecl] = {}  # fonksiyon tanımları
         self.stack_vars: set[str] = set()  # @stack ile tanımlanan değişkenler
+        self.own_vars: set[str] = set()  # @own ile tanımlanan değişkenler
 
     def define(self, name: str, value: Any, is_const: bool = False) -> None:
         """Yeni değişken tanımla."""
@@ -106,7 +137,9 @@ class Environment:
         self.functions[name] = func_node
 
     def get(self, name: str) -> Any:
-        """Değişken değeri al. Scope hierarchy'de arama yap."""
+        """Değişken değeri al. Scope hierarchy'de arama yap.
+        StackArray ölü ise panic (mevcut davranış). OwnValue wrapper olarak
+        döner; canlılık denetimi eval_Ident / to_gc / free tarafından yapılır."""
         if name in self.values:
             v = self.values[name]
             if isinstance(v, StackArray) and not v.alive:
@@ -175,8 +208,12 @@ class Environment:
         return False
 
     def close(self) -> None:
-        """Scope kapanışı: bu scope'ta tutulan ve hâlâ burada yaşayan
-        StackArray'leri öldür (sahiplik başka scope'a geçmediyse)."""
+        """Scope kapanışı: bu scope'ta tutulan own ve stack değerleri öldür.
+        own_vars önce öldürülür (deterministik sıra)."""
+        for name in list(self.own_vars):
+            v = self.values.get(name)
+            if isinstance(v, OwnValue) and v.alive:
+                v.kill()
         for name in list(self.stack_vars):
             v = self.values.get(name)
             if isinstance(v, StackArray) and v.alive:
@@ -355,6 +392,11 @@ class NexRuntimeError(Exception):
 
 class StackPanic(NexRuntimeError):
     """@stack kural ihlali (boyut, scope-dışı kullanım, mutasyon ihlali)."""
+    pass
+
+
+class OwnPanic(NexRuntimeError):
+    """@own sahiplik ihlali (use-after-free / scope sonrası kullanım)."""
     pass
 
 
@@ -582,6 +624,39 @@ class Interpreter:
             return {self._conv(k): self._conv(v) for k, v in value.items()}
         return value
 
+    def _nex_deepcopy(self, value: Any, node: Optional[Node] = None) -> Any:
+        """to_own için wrapper-bilinçli derin kopya (bağımsız @own nesne)."""
+        # Referans/sahiplik wrapper'ları kopyalanamaz
+        if isinstance(value, OwnValue):
+            raise OwnPanic("cannot deepcopy an @own value", node)
+        # BorrowRef/RawRef ileride gelebilir — wrapper ise reddet
+        tname = type(value).__name__
+        if tname in ("BorrowRef", "RawRef"):
+            raise OwnPanic(f"cannot deepcopy a {tname}", node)
+        if isinstance(value, StackArray):
+            # stack dizisi @own içine kaçarken düz heap verisine dönüşür
+            return [self._nex_deepcopy(x, node) for x in value.to_list()]
+        if isinstance(value, list):
+            return [self._nex_deepcopy(x, node) for x in value]
+        if isinstance(value, tuple):
+            return tuple(self._nex_deepcopy(x, node) for x in value)
+        if isinstance(value, set):
+            return {self._nex_deepcopy(x, node) for x in value}
+        if isinstance(value, dict):
+            return {self._nex_deepcopy(k, node): self._nex_deepcopy(v, node)
+                    for k, v in value.items()}
+        if isinstance(value, NexInstance):
+            inst = NexInstance(value.klass)
+            inst.methods = value.methods  # metodlar paylaşımlı (sınıfa ait)
+            inst.fields = {k: self._nex_deepcopy(v, node)
+                           for k, v in value.fields.items()}
+            return inst
+        # Primitifler ve diğer Python nesneleri
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+
     def eval_MatchExpr(self, node: MatchExpr) -> Any:
         subject = self.evaluate(node.subject)
         if isinstance(subject, StackArray):
@@ -676,26 +751,34 @@ class Interpreter:
     # ── İfadeler ────────────────────────────────────────────────────────────────
 
     def _env_get(self, name: str, node: Node) -> Any:
-        """env.get + node'suz StackPanic'e konum ekle (satır 0:0 olmasın)."""
+        """env.get + node'suz StackPanic/OwnPanic'e konum ekle."""
         try:
             return self.current_env.get(name)
-        except StackPanic as e:
+        except (StackPanic, OwnPanic) as e:
             if e.node is None:
-                raise StackPanic(str(e), node) from e
+                raise type(e)(str(e), node) from e
             raise
+
+    def _env_get_raw(self, name: str, node: Node) -> Any:
+        """@own/to_gc/free için ham wrapper döndürür (_env_get ile aynı)."""
+        return self._env_get(name, node)
 
     def _env_set(self, name: str, value: Any, node: Node) -> None:
         try:
             self.current_env.set(name, value)
-        except StackPanic as e:
+        except (StackPanic, OwnPanic) as e:
             if e.node is None:
-                raise StackPanic(str(e), node) from e
+                raise type(e)(str(e), node) from e
             raise
 
     def eval_Ident(self, node: Ident) -> Any:
         v = self._env_get(node.name, node)
         if isinstance(v, StackArray):
             v._check()
+            return v
+        if isinstance(v, OwnValue):
+            v._check()
+            return v._value  # opak: normal bağlamlar checker tarafından engellenir
         return v
 
     def eval_BinaryExpr(self, node: BinaryExpr) -> Any:
@@ -761,6 +844,20 @@ class Interpreter:
         return self.evaluate(node.expr)
 
     def eval_VarDecl(self, node: VarDecl) -> Any:
+        if node.mem_mode == "own":
+            if node.value is None:
+                self.error(
+                    f"@own declaration '{node.name}' must be initialized from "
+                    f"to_own(...)", node)
+            value = self.evaluate(node.value)
+            if not isinstance(value, OwnValue):
+                self.error(
+                    f"@own declaration '{node.name}' must be initialized from "
+                    f"to_own(...)", node)
+            self.current_env.define(node.name, value, is_const=not node.mutable)
+            self.current_env.own_vars.add(node.name)
+            return value
+
         if node.mem_mode == "stack":
             size, _elem = self._stack_expected(node)
             if size is None:
@@ -889,6 +986,36 @@ class Interpreter:
         return result
 
     def eval_CallExpr(self, node: CallExpr) -> Any:
+        # @own sahiplik builtin'leri (checker şekil/kuralları doğrular)
+        if isinstance(node.callee, Ident) and node.callee.name in ("to_own", "to_gc", "free"):
+            name = node.callee.name
+            if not node.args:
+                self.error(f"{name} requires exactly 1 argument", node)
+            arg = node.args[0]
+            if name == "to_own":
+                # Arg herhangi bir ifade olabilir (to_own([1,2]), to_own(f(x))).
+                val = self.evaluate(arg)
+                # @own kaynak zaten sızmamalı (checker engeller); güvenlik ağı
+                if isinstance(val, OwnValue):
+                    self.error("to_own requires a GC/non-own value", node)
+                copied = self._nex_deepcopy(val, node)
+                oname = arg.name if isinstance(arg, Ident) else "<own>"
+                return OwnValue(copied, name=oname)
+            # to_gc / free: değişken referansı zorunlu (move)
+            if not isinstance(arg, Ident):
+                self.error(f"{name} requires a variable reference", node)
+            wrapper = self._env_get_raw(arg.name, node)
+            if not isinstance(wrapper, OwnValue):
+                self.error(f"{name} requires an @own variable", node)
+            wrapper._check()
+            if name == "to_gc":
+                val = wrapper._value
+                wrapper.kill()
+                return val
+            # free
+            wrapper.kill()
+            return None
+
         # super(args) — base class init cagirisi
         if isinstance(node.callee, Ident) and node.callee.name == "super":
             try:
@@ -986,6 +1113,18 @@ class Interpreter:
                     cur = self._env_get(name, node)
                 except (NameError, RuntimeError):
                     cur = None
+                if isinstance(cur, OwnValue):
+                    if isinstance(value, OwnValue):
+                        # to_own ile yeniden atama: yaşam döngüsü sıfırlanır
+                        # (eski wrapper ölü/moved olsa bile geçerli — checker onaylı)
+                        if cur.alive:
+                            cur.kill()
+                        self._env_set(name, value, node)
+                        return value
+                    cur._check()
+                    raise OwnPanic(
+                        f"@own variable '{name}' can only hold to_own(...) results",
+                        node)
                 if isinstance(cur, StackArray):
                     cur._check()
                     if isinstance(value, StackArray):
@@ -1013,6 +1152,11 @@ class Interpreter:
                 self._env_set(name, value, node)
             else:
                 current = self._env_get(name, node)
+                if isinstance(current, OwnValue):
+                    current._check()
+                    raise OwnPanic(
+                        f"compound assignment is not supported on @own variable '{name}'",
+                        node)
                 if op == "PLUS_EQ":
                     value = current + value
                 elif op == "MINUS_EQ":
