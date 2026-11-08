@@ -36,7 +36,7 @@ def run_source(source: str, filename: str = "<stdin>", check_only: bool = False)
         print(f"{RED}Parse Error:{RESET} {e}", file=sys.stderr)
         return False
 
-    tc = TypeChecker()
+    tc = TypeChecker(filename=filename)
     ok = tc.check(tree)
     if not ok:
         print(f"{YELLOW}Type Errors in {filename}:{RESET}", file=sys.stderr)
@@ -49,6 +49,9 @@ def run_source(source: str, filename: str = "<stdin>", check_only: bool = False)
         if ok:
             print(f"{GREEN}✓ {filename}: no type errors{RESET}")
         return ok
+
+    if not ok:
+        return False
 
     interp = Interpreter()
     interp.interpret(tree)
@@ -130,6 +133,11 @@ def repl() -> None:
         try:
             tokens = Lexer(source).tokenize()
             tree = Parser(tokens).parse()
+            tc = TypeChecker(filename="<repl>")
+            if not tc.check(tree):
+                for diag in tc.errors:
+                    print(f"  {diag}")
+                continue
             interp.interpret(tree)
         except ParseError as e:
             print(f"{RED}Parse Error:{RESET} {e}")

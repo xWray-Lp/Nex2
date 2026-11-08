@@ -106,6 +106,8 @@ class TT(Enum):
     DOT = auto()
     COLON = auto()
     QUESTION = auto()
+    AT = auto()       # @  mem-mode prefix (@own/@raw/@stack)
+    SEMI = auto()     # ;  stack boyut ayırıcı ([int; 4])
     
     # Special
     NEWLINE = auto()
@@ -396,6 +398,7 @@ class Lexer:
                 ')': TT.RPAREN, '[': TT.LBRACKET, ']': TT.RBRACKET,
                 '{': TT.LBRACE, '}': TT.RBRACE, ',': TT.COMMA,
                 '.': TT.DOT, ':': TT.COLON, '?': TT.QUESTION,
+                '@': TT.AT, ';': TT.SEMI,
                 '|': TT.OR,
                 '&': TT.AMP,
                 '!': TT.BANG,

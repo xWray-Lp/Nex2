@@ -14,6 +14,76 @@ from nex_types import *
 # ─── Environment (Değişken Ortamı) ─────────────────────────────────────────────────────
 
 
+class StackArray:
+    """@stack sabit boyutlu dizi. Scope kapanınca canlıyken değeri ölür.
+
+    Python katmanında sabit boyutlu bir liste olarak yaşar; sahiplik veya
+    GC etkileşimi yoktur. Ölen bir StackArray'e erişim StackUseAfterScope
+    fırlatır (ileride suspend/resume gelirse capture kaçışını yakalamak için).
+    """
+
+    def __init__(self, items: list, declared_size: int, elem_type=None):
+        if len(items) != declared_size:
+            raise ValueError(
+                f"Stack array size mismatch: declared size {declared_size}, "
+                f"got {len(items)} element(s)")
+        self._items = list(items)
+        self.size = declared_size
+        self.elem_type = elem_type
+        self.alive = True
+
+    def _check(self):
+        if not self.alive:
+            raise StackPanic(
+                "Stack value used after its scope ended (stack-use-after-scope)")
+
+    def kill(self):
+        self.alive = False
+        self._items = []
+
+    def __getitem__(self, idx):
+        self._check()
+        return self._items[idx]
+
+    def __setitem__(self, idx, value):
+        self._check()
+        self._items[idx] = value
+
+    def __len__(self):
+        self._check()
+        return len(self._items)
+
+    def __iter__(self):
+        self._check()
+        return iter(list(self._items))
+
+    def to_list(self):
+        """Kaçış kuralı: scope dışına çıkan stack değeri bağımsız heap kopyasıdır.
+
+        Sadece üst düzey kopya yetmez — iç içe stack/list değerleri de
+        kopyalanmalı; aksi halde inner aliasing oluşur (kopya, ölmüş stack
+        dizisinin iç elemanlarını paylaşır)."""
+        self._check()
+        return self._deep_heap_copy(self._items)
+
+    @staticmethod
+    def _deep_heap_copy(items) -> list:
+        out = []
+        for x in items:
+            if isinstance(x, StackArray):
+                out.append(x.to_list())
+            elif isinstance(x, list):
+                out.append(StackArray._deep_heap_copy(x))
+            else:
+                out.append(x)
+        return out
+
+    def __repr__(self):
+        if not self.alive:
+            return "<dead stack array>"
+        return f"[{', '.join(repr(x) for x in self._items)}]"
+
+
 class Environment:
     """Değişken değerlerini saklayan ortam. Scope yönetimi yapar."""
 
@@ -23,6 +93,7 @@ class Environment:
         self.values: Dict[str, Any] = {}
         self.constants: set[str] = set()  # const değişkenler
         self.functions: Dict[str, FnDecl] = {}  # fonksiyon tanımları
+        self.stack_vars: set[str] = set()  # @stack ile tanımlanan değişkenler
 
     def define(self, name: str, value: Any, is_const: bool = False) -> None:
         """Yeni değişken tanımla."""
@@ -37,7 +108,12 @@ class Environment:
     def get(self, name: str) -> Any:
         """Değişken değeri al. Scope hierarchy'de arama yap."""
         if name in self.values:
-            return self.values[name]
+            v = self.values[name]
+            if isinstance(v, StackArray) and not v.alive:
+                raise StackPanic(
+                    f"Stack variable '{name}' used after its scope ended "
+                    f"(stack-use-after-scope)")
+            return v
         if self.parent:
             return self.parent.get(name)
         raise NameError(f"Undefined variable: {name}")
@@ -54,6 +130,24 @@ class Environment:
         """Değişken değerini güncelle."""
         if name in self.constants:
             raise TypeError(f"Cannot assign to constant: {name}")
+        # @stack değişken ölen scope'un değeriyle değiştirilemez / kaçırılamaz
+        if name in self.stack_vars and name in self.values:
+            old = self.values[name]
+            if isinstance(old, StackArray) and not old.alive:
+                raise StackPanic(
+                    f"Stack variable '{name}' used after its scope ended "
+                    f"(stack-use-after-scope)")
+            if isinstance(value, StackArray) and not value.alive:
+                raise StackPanic(
+                    "Dead stack value assigned (stack-use-after-scope)")
+            if isinstance(old, StackArray) and not isinstance(value, StackArray):
+                raise TypeError(
+                    f"Cannot assign non-stack value to stack array '{name}'")
+            if (isinstance(old, StackArray) and isinstance(value, StackArray)
+                    and old.size != value.size):
+                raise TypeError(
+                    f"Stack array size mismatch for '{name}': size {old.size}, "
+                    f"got size {value.size}")
 
         # Mevcut scope'da ara
         if name in self.values:
@@ -79,6 +173,14 @@ class Environment:
         if self.parent:
             return self.parent.exists(name)
         return False
+
+    def close(self) -> None:
+        """Scope kapanışı: bu scope'ta tutulan ve hâlâ burada yaşayan
+        StackArray'leri öldür (sahiplik başka scope'a geçmediyse)."""
+        for name in list(self.stack_vars):
+            v = self.values.get(name)
+            if isinstance(v, StackArray) and v.alive:
+                v.kill()
 
 
 # ─── Built-in Fonksiyonlar ───────────────────────────────────────────────────────
@@ -112,6 +214,8 @@ def builtin_print(*args):
 
 def builtin_len(obj):
     """len built-in fonksiyonu."""
+    if isinstance(obj, StackArray):
+        return len(obj)
     if isinstance(obj, (list, str)):
         return len(obj)
     raise TypeError(f"len() expects a list or string, got {type(obj).__name__}")
@@ -129,6 +233,8 @@ def builtin_type(obj):
         return "str"
     elif obj is None:
         return "null"
+    elif isinstance(obj, StackArray):
+        return "stack_array"
     elif isinstance(obj, list):
         return "list"
     elif isinstance(obj, dict):
@@ -160,6 +266,9 @@ def builtin_str(obj):
         return "null"
     if isinstance(obj, bool):
         return "true" if obj else "false"
+    if isinstance(obj, StackArray):
+        obj._check()
+        return "[" + ", ".join(builtin_str(x) for x in obj._items) + "]"
     return str(obj)
 
 
@@ -237,11 +346,16 @@ def builtin_values(d):
 class NexRuntimeError(Exception):
     """Interpreter çalışma zamanı hatası."""
 
-    def __init__(self, message: str, node: Node):
+    def __init__(self, message: str, node: Optional[Node] = None):
         super().__init__(message)
         self.node = node
-        self.line = node.line
-        self.col = node.col
+        self.line = getattr(node, "line", 0) if node is not None else 0
+        self.col = getattr(node, "col", 0) if node is not None else 0
+
+
+class StackPanic(NexRuntimeError):
+    """@stack kural ihlali (boyut, scope-dışı kullanım, mutasyon ihlali)."""
+    pass
 
 
 class ReturnException(Exception):
@@ -283,7 +397,10 @@ class Function:
             if i < len(args):
                 func_env.define(param.name, args[i])
             elif param.default is not None:
-                func_env.define(param.name, interpreter.evaluate(param.default))
+                dval = interpreter.evaluate(param.default)
+                # Default değer de kaçış bağlamıdır: stack dizisi referanssız kopyalanır
+                dval = interpreter._conv(dval)
+                func_env.define(param.name, dval)
             else:
                 raise TypeError(f"Missing argument for parameter '{param.name}'")
 
@@ -294,8 +411,11 @@ class Function:
                 interpreter.evaluate(self.decl.body)
             return None
         except ReturnException as ret:
+            if isinstance(ret.value, StackArray):
+                return ret.value.to_list()  # heap kopyası
             return ret.value
         finally:
+            func_env.close()
             interpreter.current_env = old_env
 
     def __repr__(self):
@@ -423,13 +543,61 @@ class Interpreter:
         return env
 
     def pop_env(self) -> None:
-        """Mevcut scope'dan çık."""
-        if self.current_env.parent:
-            self.current_env = self.current_env.parent
+        """Mevcut scope'dan çık. @stack değerleri scope ile birlikte ölür."""
+        env = self.current_env
+        if env.parent:
+            self.current_env = env.parent
+        env.close()
 
     def error(self, message: str, node: Node) -> None:
         """Runtime hatası fırlat."""
         raise NexRuntimeError(message, node)
+
+    def _conv(self, value: Any) -> Any:
+        """Heap bağlamında depolanacak değer: StackArray -> bağımsız heap kopyası.
+
+        Kaçış kuralı stack dizilere sınırlı DEĞİLDİR — stack dizinin sızdığı
+        her kapalı kap (list/dict/set/tuple literal'i, sınıf alanı, dict
+        anahtarı, pipe argümanı, fonksiyon default'u, match konusu) aynı
+        kurala tabi; aksi halde aliasing + stack-use-after-scope olur."""
+        if isinstance(value, StackArray):
+            return value.to_list()
+        if isinstance(value, list):
+            return [self._conv(x) for x in value]
+        if isinstance(value, tuple):
+            return tuple(self._conv(x) for x in value)
+        if isinstance(value, dict):
+            return {self._conv(k): self._conv(v) for k, v in value.items()}
+        return value
+
+    def eval_MatchExpr(self, node: MatchExpr) -> Any:
+        subject = self.evaluate(node.subject)
+        if isinstance(subject, StackArray):
+            subject = subject.to_list()
+        for arm in node.arms:
+            if self._match_pattern(arm.pattern, subject):
+                if arm.guard is not None:
+                    if not self.is_truthy(self.evaluate(arm.guard)):
+                        continue
+                return self.evaluate(arm.body)
+        return None
+
+    # ── @stack yardımcıları ──────────────────────────────────────
+
+    def _stack_elem_default(self, type_node) -> Any:
+        """[T; N] tipindeki T için varsayılan eleman değeri."""
+        if isinstance(type_node, TypeName):
+            return {"int": 0, "float": 0.0, "bool": False,
+                    "str": "", "byte": 0}.get(type_node.name)
+        return None
+
+    def _stack_expected(self, node: VarDecl):
+        """@stack bildirimi için (boyut, eleman tipi adı) döndür; yoksa (None, None)."""
+        ta = node.type_ann
+        if isinstance(ta, TypeStackArray) and isinstance(ta.size, IntLit):
+            elem = ta.elem.name if isinstance(ta.elem, TypeName) else None
+            return int(ta.size.value), elem
+        return None, None
 
     def evaluate(self, node: Node) -> Any:
         """AST düğümünü değerlendir (Visitor pattern)."""
@@ -496,11 +664,18 @@ class Interpreter:
     # ── İfadeler ────────────────────────────────────────────────────────────────
 
     def eval_Ident(self, node: Ident) -> Any:
-        return self.current_env.get(node.name)
+        v = self.current_env.get(node.name)
+        if isinstance(v, StackArray):
+            v._check()
+        return v
 
     def eval_BinaryExpr(self, node: BinaryExpr) -> Any:
         left = self.evaluate(node.left)
         right = self.evaluate(node.right)
+        if isinstance(left, StackArray):
+            left = left.to_list()
+        if isinstance(right, StackArray):
+            right = right.to_list()
 
         if node.op == "+":
             if isinstance(left, str) or isinstance(right, str):
@@ -557,9 +732,39 @@ class Interpreter:
         return self.evaluate(node.expr)
 
     def eval_VarDecl(self, node: VarDecl) -> Any:
+        if node.mem_mode == "stack":
+            size, _elem = self._stack_expected(node)
+            if size is None:
+                self.error(
+                    f"@stack declaration '{node.name}' requires a fixed-size "
+                    f"array type such as [int; 4]", node)
+            raw = None
+            if node.value is not None:
+                raw = self.evaluate(node.value)
+                if isinstance(raw, StackArray):
+                    raw = raw._items  # canlı listenin kopyası aşağıda alınır
+                if not isinstance(raw, list):
+                    self.error(
+                        f"@stack declaration '{node.name}' requires an array "
+                        f"literal of {size} element(s)", node)
+                if len(raw) != size:
+                    raise StackPanic(
+                        f"Stack array size mismatch for '{node.name}': declared "
+                        f"size {size}, got {len(raw)} element(s)", node)
+                items = list(raw)
+            else:
+                default = self._stack_elem_default(node.type_ann.elem)
+                items = [default] * size
+            arr = StackArray(items, size)
+            self.current_env.define(node.name, arr, is_const=not node.mutable)
+            self.current_env.stack_vars.add(node.name)
+            return arr
+
         value = None
         if node.value:
             value = self.evaluate(node.value)
+            if isinstance(value, StackArray):
+                value = value.to_list()  # heap kopyası; stack ömrü devretmez
 
         self.current_env.define(node.name, value, is_const=not node.mutable)
         return value
@@ -580,6 +785,8 @@ class Interpreter:
         value = None
         if node.value:
             value = self.evaluate(node.value)
+        if isinstance(value, StackArray):
+            value = value.to_list()  # heap kopyası; stack ömrü devretmez
         raise ReturnException(value)
 
     def eval_IfStmt(self, node: IfStmt) -> Any:
@@ -615,7 +822,9 @@ class Interpreter:
         iterable = self.evaluate(node.iterable)
         result = None
 
-        if isinstance(iterable, NexRange):
+        if isinstance(iterable, StackArray):
+            sequence = iterable.to_list()
+        elif isinstance(iterable, NexRange):
             sequence = iterable
         elif isinstance(iterable, (list, range)):
             sequence = iterable
@@ -681,7 +890,10 @@ class Interpreter:
             return None
 
         callee = self.evaluate(node.callee)
-        args = [self.evaluate(arg) for arg in node.args]
+        args = [
+            a.to_list() if isinstance(a, StackArray) else a
+            for a in (self.evaluate(arg) for arg in node.args)
+        ]
 
         if isinstance(callee, BuiltinFunction):
             return callee(*args)
@@ -693,21 +905,21 @@ class Interpreter:
             self.error(f"'{callee}' is not callable", node)
 
     def eval_ListLit(self, node: ListLit) -> List[Any]:
-        return [self.evaluate(elem) for elem in node.elements]
+        return [self._conv(self.evaluate(elem)) for elem in node.elements]
 
     def eval_DictLit(self, node: DictLit) -> Dict[Any, Any]:
         result = {}
         for key_node, value_node in node.pairs:
-            key = self.evaluate(key_node)
-            value = self.evaluate(value_node)
+            key = self._conv(self.evaluate(key_node))
+            value = self._conv(self.evaluate(value_node))
             result[key] = value
         return result
 
     def eval_TupleLit(self, node: TupleLit) -> list:
-        return [self.evaluate(e) for e in node.elements]
+        return [self._conv(self.evaluate(e)) for e in node.elements]
 
     def eval_SetLit(self, node: SetLit) -> list:
-        return list({self.evaluate(e) for e in node.elements})
+        return list({self._conv(self.evaluate(e)) for e in node.elements})
 
     def eval_RangeExpr(self, node: RangeExpr) -> NexRange:
         start = self.evaluate(node.start)
@@ -732,6 +944,35 @@ class Interpreter:
         if isinstance(node.target, Ident):
             name = node.target.name
             if op == "ASSIGN":
+                cur = None
+                try:
+                    cur = self.current_env.get(name)
+                except (NameError, RuntimeError):
+                    cur = None
+                if isinstance(cur, StackArray):
+                    cur._check()
+                    if isinstance(value, StackArray):
+                        value._check()
+                        if value.size != cur.size:
+                            raise StackPanic(
+                                f"Stack array size mismatch for '{name}': size "
+                                f"{cur.size}, got size {value.size}", node)
+                        cur._items = list(value._items)
+                    elif isinstance(value, list):
+                        if len(value) != cur.size:
+                            raise StackPanic(
+                                f"Stack array size mismatch for '{name}': size "
+                                f"{cur.size}, got {len(value)} element(s)", node)
+                        cur._items = list(value)
+                    else:
+                        raise StackPanic(
+                            f"Cannot assign value of type "
+                            f"'{type(value).__name__}' to stack array '{name}'",
+                            node)
+                    return cur
+                if isinstance(value, StackArray):
+                    # GC bağlamına kaçış heap kopyasıdır; stack ömrü devretmez.
+                    value = value.to_list()
                 self.current_env.set(name, value)
             else:
                 current = self.current_env.get(name)
@@ -748,6 +989,29 @@ class Interpreter:
         elif isinstance(node.target, IndexExpr):
             obj = self.evaluate(node.target.obj)
             idx = self.evaluate(node.target.index)
+            if isinstance(obj, StackArray):
+                obj._check()
+                if not isinstance(idx, int) or isinstance(idx, bool):
+                    raise StackPanic(
+                        f"Stack array index must be 'int', got "
+                        f"'{type(idx).__name__}'", node)
+                if idx < 0 or idx >= obj.size:
+                    raise StackPanic(
+                        f"Index {idx} out of bounds for stack array of size "
+                        f"{obj.size}", node)
+                if op == "ASSIGN":
+                    obj[idx] = value
+                else:
+                    current = obj[idx]
+                    if op == "PLUS_EQ":
+                        obj[idx] = current + value
+                    elif op == "MINUS_EQ":
+                        obj[idx] = current - value
+                    elif op == "STAR_EQ":
+                        obj[idx] = current * value
+                    elif op == "SLASH_EQ":
+                        obj[idx] = current / value
+                return value
             if op == "ASSIGN":
                 obj[idx] = value
             else:
@@ -764,6 +1028,9 @@ class Interpreter:
         elif isinstance(node.target, MemberExpr):
             obj = self.evaluate(node.target.obj)
             attr = node.target.member
+            # Kaçış kuralı: stack dizisi sınıf alanına/dict'e atanırken bağımsız
+            # heap kopyasına dönüşür; referans sızması aliasing üretir.
+            value = self._conv(value)
             if isinstance(obj, NexInstance):
                 if op == "ASSIGN":
                     obj.set_attr(attr, value)
@@ -797,6 +1064,17 @@ class Interpreter:
     def eval_IndexExpr(self, node: IndexExpr) -> Any:
         obj = self.evaluate(node.obj)
         idx = self.evaluate(node.index)
+        if isinstance(obj, StackArray):
+            obj._check()
+            if not isinstance(idx, int) or isinstance(idx, bool):
+                raise StackPanic(
+                    f"Stack array index must be 'int', got "
+                    f"'{type(idx).__name__}'", node)
+            if idx < 0 or idx >= obj.size:
+                raise StackPanic(
+                    f"Index {idx} out of bounds for stack array of size "
+                    f"{obj.size}", node)
+            return obj[idx]
         try:
             return obj[idx]
         except (IndexError, KeyError) as e:
@@ -808,7 +1086,10 @@ class Interpreter:
 
         if isinstance(obj, NexInstance):
             if attr in obj.fields:
-                return obj.fields[attr]
+                fv = obj.fields[attr]
+                if isinstance(fv, StackArray):
+                    fv._check()
+                return fv
             if attr in obj.methods:
                 return BoundMethod(obj, obj.methods[attr])
             # Inheritance: base class metodlarini ara
@@ -833,6 +1114,37 @@ class Interpreter:
             if attr in obj:
                 return obj[attr]
             self.error(f"Key '{{attr}}' not found in dict", node)
+
+        if isinstance(obj, StackArray):
+            obj._check()
+            _arr = obj
+            if attr in ("length", "len"):
+                return len(obj)
+            if attr == "first":
+                return obj._items[0] if obj._items else None
+            if attr == "last":
+                return obj._items[-1] if obj._items else None
+            if attr in ("contains", "has"):
+                def _contains(v, o=_arr):
+                    o._check()
+                    return v in o._items
+                return BuiltinFunction("contains", _contains, 1)
+            if attr == "join":
+                def _join(sep, o=_arr):
+                    o._check()
+                    return sep.join(str(x) for x in o._items)
+                return BuiltinFunction("join", _join, 1)
+            if attr in ("isEmpty", "is_empty"):
+                return len(obj) == 0
+            if attr == "indexOf":
+                def _indexOf(v, o=_arr):
+                    o._check()
+                    for i, item in enumerate(o._items):
+                        if item == v:
+                            return i
+                    return None
+                return BuiltinFunction("indexOf", _indexOf, 1)
+            self.error(f"Stack array has no attribute '{attr}'", node)
 
         if isinstance(obj, list):
             _obj = obj
@@ -911,7 +1223,7 @@ class Interpreter:
         return result
 
     def eval_PipeExpr(self, node) -> Any:
-        val = self.evaluate(node.left)
+        val = self._conv(self.evaluate(node.left))
         fn = self.evaluate(node.right)
         if isinstance(fn, BuiltinFunction):
             return fn(val)
@@ -967,7 +1279,7 @@ class Interpreter:
         except NexRuntimeError as e:
             caught = False
             for arm in node.catch_arms:
-                if arm.exc_type is None or True:
+                if arm.exc_type is None or arm.exc_type in ("NexRuntimeError", "Error"):
                     self.push_env("<catch>")
                     if arm.alias:
                         self.current_env.define(arm.alias, str(e))
@@ -983,7 +1295,7 @@ class Interpreter:
         return result
 
     def eval_MatchStmt(self, node: MatchStmt) -> Any:
-        subject = self.evaluate(node.subject)
+        subject = self._conv(self.evaluate(node.subject))
         for arm in node.arms:
             if self._match_pattern(arm.pattern, subject):
                 return self.evaluate(arm.body)
@@ -1009,16 +1321,6 @@ class Interpreter:
         return None
 
     def eval_ModuleStmt(self, node: ModuleStmt) -> None:
-        return None
-
-    def eval_MatchExpr(self, node: MatchExpr) -> Any:
-        subject = self.evaluate(node.subject)
-        for arm in node.arms:
-            if self._match_pattern(arm.pattern, subject):
-                if arm.guard is not None:
-                    if not self.is_truthy(self.evaluate(arm.guard)):
-                        continue
-                return self.evaluate(arm.body)
         return None
 
     def eval_MultiVarDecl(self, node: MultiVarDecl) -> None:

@@ -83,6 +83,7 @@ class Parser:
         sync_tokens = {
             TT.LET,
             TT.CONST,
+            TT.AT,
             TT.OWN,
             TT.RAW,
             TT.STACK,
@@ -364,7 +365,7 @@ class Parser:
 
         if self.check(TT.LET) or self.check(TT.CONST):
             return self.parse_var_decl()
-        if self.check(TT.OWN) or self.check(TT.RAW) or self.check(TT.STACK):
+        if self.check(TT.AT) or self.check(TT.OWN) or self.check(TT.RAW) or self.check(TT.STACK):
             return self.parse_var_decl()
         if self.check(TT.FN) or self.check(TT.ASYNC):
             return self.parse_fn_decl()
@@ -394,6 +395,17 @@ class Parser:
     def parse_var_decl(self) -> Node:
         tok = self.peek()
         mem_mode = None
+        # '@' opsiyonel: '@own let x' ve 'own let x' aynı anlamda.
+        if self.check(TT.AT):
+            self.advance()
+            # '@own' / '@raw' / '@stack' dışında bilinmeyen annotation sessizce
+            # yutulmasın — GC gibi davranan görünmez moda izin vermeyelim.
+            if not (self.check(TT.OWN) or self.check(TT.RAW) or self.check(TT.STACK)):
+                nxt = self.peek()
+                nxt_txt = getattr(nxt, "value", None) or getattr(nxt, "type", "?")
+                raise self.error(
+                    f"Unknown memory annotation at '@': expected '@own', '@raw', "
+                    f"or '@stack', got '@{nxt_txt}'")
         if self.check(TT.OWN):
             mem_mode = "own"
             self.advance()
@@ -641,9 +653,16 @@ class Parser:
                 return TypeNullable(node, line=tok.line, col=tok.col)
             return node
 
-        # Liste: [int]
+        # Liste: [int]  veya  @stack dizi: [int; 4]
         if self.match(TT.LBRACKET):
             inner = self.parse_type()
+            if self.match(TT.SEMI):
+                size = self.parse_expr()
+                self.expect(TT.RBRACKET)
+                node = TypeStackArray(inner, size, line=tok.line, col=tok.col)
+                if self.match(TT.QUESTION):
+                    return TypeNullable(node, line=tok.line, col=tok.col)
+                return node
             self.expect(TT.RBRACKET)
             node = TypeGeneric("List", [inner], line=tok.line, col=tok.col)
             if self.match(TT.QUESTION):
@@ -1150,5 +1169,7 @@ def pretty_print(node: Node, indent: int = 0) -> str:
     if isinstance(node, TypeRef):
         mut = "mut " if node.mutable else ""
         return f"&{mut}{pretty_print(node.inner, 0)}"
+    if isinstance(node, TypeStackArray):
+        return f"[{pretty_print(node.elem, 0)}; {pretty_print(node.size, 0)}]"
 
     return f"{pad}{name}(...)"

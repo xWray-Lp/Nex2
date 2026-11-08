@@ -19,10 +19,12 @@ class TypeDiag:
     message: str
     line:    int
     col:     int
+    file:    str = ""
 
     def __str__(self):
         icon = {"error": "✗", "warning": "⚠", "info": "ℹ"}[self.kind]
-        return f"  {icon} [{self.kind.upper()}] Line {self.line}:{self.col} — {self.message}"
+        loc = f"{self.file}:" if self.file else ""
+        return f"  {icon} [{self.kind.upper()}] {loc}{self.line}:{self.col} — {self.message}"
 
 
 # ─── Sembol Tablosu ───────────────────────────────────────────────────────────
@@ -33,10 +35,13 @@ class Scope:
         self.name    = name
         self.symbols: dict[str, NexType] = {}
         self.mutability: dict[str, bool] = {}  # False = const
+        self.mem_modes: dict[str, Optional[str]] = {}  # None=GC, "own"/"raw"/"stack"
 
-    def define(self, name: str, typ: NexType, mutable: bool = True):
+    def define(self, name: str, typ: NexType, mutable: bool = True,
+               mem_mode: Optional[str] = None):
         self.symbols[name]    = typ
         self.mutability[name] = mutable
+        self.mem_modes[name]  = mem_mode
 
     def lookup(self, name: str) -> Optional[NexType]:
         if name in self.symbols:
@@ -63,12 +68,20 @@ class Scope:
             return self.parent.update(name, typ)
         return False
 
+    def lookup_mem_mode(self, name: str) -> Optional[str]:
+        if name in self.mem_modes:
+            return self.mem_modes[name]
+        if self.parent:
+            return self.parent.lookup_mem_mode(name)
+        return None
+
 
 # ─── Type Checker ─────────────────────────────────────────────────────────────
 
 class TypeChecker:
 
-    def __init__(self):
+    def __init__(self, filename: str = ""):
+        self.filename = filename
         self.diagnostics: list[TypeDiag] = []
         self.global_scope = Scope(name="<global>")
         self.current_scope = self.global_scope
@@ -140,13 +153,13 @@ class TypeChecker:
     # ── Hata / Uyarı ─────────────────────────────────────────────
 
     def error(self, msg: str, node: Node):
-        self.diagnostics.append(TypeDiag("error", msg, node.line, node.col))
+        self.diagnostics.append(TypeDiag("error", msg, node.line, node.col, self.filename))
 
     def warn(self, msg: str, node: Node):
-        self.diagnostics.append(TypeDiag("warning", msg, node.line, node.col))
+        self.diagnostics.append(TypeDiag("warning", msg, node.line, node.col, self.filename))
 
     def info(self, msg: str, node: Node):
-        self.diagnostics.append(TypeDiag("info", msg, node.line, node.col))
+        self.diagnostics.append(TypeDiag("info", msg, node.line, node.col, self.filename))
 
     @property
     def errors(self) -> list[TypeDiag]:
@@ -173,7 +186,7 @@ class TypeChecker:
             if node.name in self.type_env:
                 return self.type_env[node.name]
             self.diagnostics.append(TypeDiag("error", f"Unknown type '{node.name}'",
-                                              node.line, node.col))
+                                              node.line, node.col, self.filename))
             return UNKNOWN
 
         if isinstance(node, TypeNullable):
@@ -205,6 +218,17 @@ class TypeChecker:
         if isinstance(node, TypeRef):
             return RefType(self.resolve_type_node(node.inner), node.mutable)
 
+        if isinstance(node, TypeStackArray):
+            elem = self.resolve_type_node(node.elem)
+            if not isinstance(node.size, IntLit):
+                self.error("Stack array size must be an integer literal", node)
+                return StackArrayType(elem, 0)
+            n = int(node.size.value)
+            if n < 1:
+                self.error("Stack array size must be at least 1", node)
+                return StackArrayType(elem, 0)
+            return StackArrayType(elem, n)
+
         return UNKNOWN
 
     # ── Tip uyumluluğu ────────────────────────────────────────────
@@ -219,11 +243,16 @@ class TypeChecker:
     def visit(self, node: Node) -> NexType:
         if node is None:
             return VOID
-        method = f"visit_{type(node).__name__}"
-        if hasattr(self, method):
-            return getattr(self, method)(node)
-        # Bilinmeyen node'u sessizce geç
-        return UNKNOWN
+        prev_hint = getattr(self, "_list_hint", None)
+        self._list_hint = None
+        try:
+            method = f"visit_{type(node).__name__}"
+            if hasattr(self, method):
+                return getattr(self, method)(node)
+            # Bilinmeyen node'u sessizce geç
+            return UNKNOWN
+        finally:
+            self._list_hint = prev_hint
 
     # ── Program & Block ───────────────────────────────────────────
 
@@ -272,18 +301,102 @@ class TypeChecker:
         return FnType(param_types, ret)
 
     def visit_Block(self, node: Block) -> NexType:
-        last = VOID
-        for stmt in node.stmts:
-            last = self.visit(stmt)
-        return last
+        # Interpreter her Block için yeni Environment açıyor; buradaki scope da
+        # onu aynalasın, yoksa if/for gövdesinde tanımlanan değişken dışarı sızar.
+        self.push_scope("block")
+        try:
+            last = VOID
+            for stmt in node.stmts:
+                last = self.visit(stmt)
+            return last
+        finally:
+            self.pop_scope()
 
     # ── Declarations ──────────────────────────────────────────────
 
+    def _escape_to_heap(self, t: Optional[NexType]) -> Optional[NexType]:
+        """Kaçış kuralı statik yansıması: StackArray değeri bir GC bağlamına
+        taşındığında çalışma zamanında heap listesidir; statik tip de bu
+        yüzden StackArrayType yerine ListType olmalı. İç içe yapılarda da
+        iç stack boyutları ortadan kalkar (heap kopyası serbesttir)."""
+        if t is None:
+            return None
+        if isinstance(t, StackArrayType):
+            return ListType(self._escape_to_heap(t.element))
+        if isinstance(t, ListType):
+            return ListType(self._escape_to_heap(t.element))
+        if isinstance(t, TupleType):
+            return TupleType([self._escape_to_heap(e) for e in t.elements])
+        if isinstance(t, SetType):
+            return SetType(self._escape_to_heap(t.element))
+        return t
+
+    def _check_stack_literal(self, lit: ListLit, declared: StackArrayType,
+                             node: Node, ctx: str) -> None:
+        """@stack literal'i boyut + eleman tipi + iç boyut tek geçişte denetler."""
+        if len(lit.elements) != declared.size:
+            self.error(
+                f"Stack array size mismatch for {ctx}: declared "
+                f"[{declared.element}; {declared.size}], got "
+                f"{len(lit.elements)} element(s)", node)
+            return
+        for i, elem in enumerate(lit.elements):
+            if isinstance(declared.element, StackArrayType) \
+                    and isinstance(elem, ListLit):
+                # İç içe stack dizisi: iç satır da kendi boyutuyla denetlenir
+                self._check_stack_literal(
+                    elem, declared.element, node, f"{ctx}[{i}]")
+                continue
+            elem_t = self.visit(elem)
+            self.check_assign(
+                elem_t, declared.element, node, f"{ctx}[{i}] element")
+
     def visit_VarDecl(self, node: VarDecl) -> NexType:
         declared = self.resolve_type_node(node.type_ann) if node.type_ann else None
-        inferred = self.visit(node.value) if node.value else None
+        if node.mem_mode == "stack":
+            # @stack yalnızca literal kabul eder; boyut/eleman tip/iç boyut
+            # denetimi tek geçişte _check_stack_literal'da yapılır (aşağıda).
+            # Literal zaten visit edilmeden burada denetlenir; çift hata mesajı
+            # olmasın diye inferred ön hesaplanmaz.
+            inferred = None
+            if node.value is not None and not isinstance(node.value, ListLit):
+                inferred = self.visit(node.value)
+        else:
+            # visit() ipucunu sıfırlar; doğrudan literal için burada aç
+            if isinstance(node.value, ListLit) and isinstance(declared, StackArrayType):
+                prev_hint = getattr(self, "_list_hint", None)
+                self._list_hint = declared
+                try:
+                    inferred = self.visit_ListLit(node.value)
+                finally:
+                    self._list_hint = prev_hint
+            else:
+                inferred = self.visit(node.value) if node.value else None
+            # Kaçış kuralı: non-stack bağlamda StackArray heap listesine
+            # kopyalanır; değişkenin statik tipi de o yüzden ListType olmalı.
+            # Aksi halde `let xs = buf; xs.push(3)` checker'ın doğru çalışırdı.
+            # (declared zaten [T; N] ise eski davranış korunur.)
+            if not isinstance(declared, StackArrayType):
+                inferred = self._escape_to_heap(inferred)
 
-        if declared and inferred:
+        if node.mem_mode == "stack":
+            if declared is None or not isinstance(declared, StackArrayType):
+                self.error(
+                    f"@stack declaration '{node.name}' requires a fixed-size array "
+                    f"type such as [int; 4]", node)
+                var_type = declared if declared is not None else UNKNOWN
+            elif isinstance(node.value, ListLit):
+                # Boyut + eleman tipi + iç boyutlar, tek geçişte:
+                self._check_stack_literal(node.value, declared, node, f"'{node.name}'")
+                var_type = declared
+            elif inferred is not None:
+                self.error(
+                    f"@stack declaration '{node.name}' requires an array literal of "
+                    f"{declared.size} element(s)", node)
+                var_type = declared
+            else:
+                var_type = declared
+        elif declared and inferred:
             self.check_assign(inferred, declared, node, f"declaration of '{node.name}'")
             var_type = declared
         elif declared:
@@ -297,7 +410,8 @@ class TypeChecker:
         if self.current_scope.lookup_local(node.name):
             self.warn(f"Variable '{node.name}' shadows outer declaration", node)
 
-        self.current_scope.define(node.name, var_type, mutable=node.mutable)
+        self.current_scope.define(node.name, var_type, mutable=node.mutable,
+                                  mem_mode=node.mem_mode)
         return VOID
 
     def visit_MultiVarDecl(self, node: MultiVarDecl) -> NexType:
@@ -328,6 +442,23 @@ class TypeChecker:
         fn_type = self._fn_signature(node)
         if not self.current_scope.lookup_local(node.name):
             self.current_scope.define(node.name, fn_type)
+        # @stack değer fonksiyona ne değer ne referansla geçemez: kapsamı stack'te kalır.
+        # resolve_type_node('&[int; 2]') zaten RefType üretir; o yüzden iç tip RefType da olabilir.
+        for p in node.params:
+            if p.type_ann is None:
+                continue
+            resolved = self.resolve_type_node(p.type_ann)
+            inner = resolved.inner if isinstance(resolved, RefType) else resolved
+            if isinstance(inner, StackArrayType):
+                if p.is_ref or isinstance(resolved, RefType):
+                    self.error(
+                        f"Stack array parameter '{p.name}' in function '{node.name}' "
+                        f"cannot be passed by reference", node)
+                else:
+                    self.error(
+                        f"Stack array parameter '{p.name}' in function '{node.name}': "
+                        f"@stack arrays are fixed to their declaring scope; pass a "
+                        f"list instead", node)
 
         if node.body is None:
             return VOID   # interface method
@@ -359,8 +490,9 @@ class TypeChecker:
         self.fn_return_type = fn_type.ret
         self.fn_is_async = node.is_async
 
-        # Gövdeyi kontrol et
-        self.visit_Block(node.body)
+        # Gövdeyi kontrol et — param'lar zaten bu scope'da; fazladan Block scope'u açma
+        for _stmt in node.body.stmts:
+            self.visit(_stmt)
 
         self.fn_return_type = saved_ret
         self.fn_is_async    = saved_async
@@ -672,9 +804,38 @@ class TypeChecker:
             if not self.current_scope.is_mutable(var_name):
                 self.error(f"Cannot assign to constant '{var_name}'", node)
                 return UNKNOWN
-            val_t = self.visit(node.value)
+            # visit() ipucunu sıfırlar; doğrudan literal için burada aç
+            if isinstance(node.value, ListLit) and isinstance(var_t, StackArrayType):
+                prev_hint = getattr(self, "_list_hint", None)
+                self._list_hint = var_t
+                try:
+                    val_t = self.visit_ListLit(node.value)
+                finally:
+                    self._list_hint = prev_hint
+            else:
+                val_t = self.visit(node.value)
             op = node.op
-            if op == "ASSIGN":
+            if op == "ASSIGN" and self.current_scope.lookup_mem_mode(var_name) == "stack":
+                if (isinstance(val_t, ListType) and isinstance(node.value, ListLit)
+                        and len(node.value.elements)
+                            != getattr(var_t, 'size', len(node.value.elements))):
+                    self.error(
+                        f"Stack array size mismatch: '{var_name}' has size "
+                        f"{getattr(var_t, 'size', '?')}, got "
+                        f"{len(node.value.elements)} element(s)", node)
+                elif not isinstance(val_t, StackArrayType):
+                    self.error(
+                        f"Cannot assign value of type '{val_t}' to stack array "
+                        f"'{var_name}' of type '{var_t}'", node)
+                elif (not isinstance(var_t, UnknownType)
+                        and val_t.size != getattr(var_t, 'size', val_t.size)):
+                    self.error(
+                        f"Stack array size mismatch: '{var_name}' has size "
+                        f"{getattr(var_t, 'size', '?')}, got size {val_t.size}", node)
+                elif not isinstance(var_t, UnknownType):
+                    self.check_assign(val_t.element, var_t.element, node,
+                                      f"assignment to '{var_name}'")
+            elif op == "ASSIGN":
                 self.check_assign(val_t, var_t, node, f"assignment to '{var_name}'")
             elif op in ("PLUS_EQ", "MINUS_EQ", "STAR_EQ", "SLASH_EQ"):
                 if not is_numeric(var_t):
@@ -691,15 +852,35 @@ class TypeChecker:
                                       f"assignment to '{node.target.member}'")
             return val_t
         elif isinstance(node.target, IndexExpr):
-            self.visit(node.target)
-            self.visit(node.value)
-            return UNKNOWN
+            obj_t = self.visit(node.target.obj)
+            self.visit(node.target.index)
+            val_t = self.visit(node.value)
+            # Sabit indeks aralık denetimi (okuma tarafı visit_IndexExpr'de
+            # yapılır; atama hedefi olarak IndexExpr'i tam ziyaret etmediğimiz
+            # için yazma tarafındaki denetim burada tekrar edilir)
+            if isinstance(obj_t, StackArrayType) and isinstance(node.target.index, IntLit):
+                const_idx = int(node.target.index.value)
+                if const_idx < 0 or const_idx >= obj_t.size:
+                    self.error(
+                        f"Index {const_idx} out of bounds for stack array of "
+                        f"size {obj_t.size}", node)
+            # Eleman atama tip kontrolü — stack dizi elemanına (ve GC listesine)
+            # yanlış tipte değer atanması, ayrıca iç stack boyut uyuşmazlığı.
+            if isinstance(obj_t, (StackArrayType, ListType)):
+                elem_t = obj_t.element
+                if isinstance(elem_t, StackArrayType) and isinstance(node.value, ListLit):
+                    self._check_stack_literal(
+                        node.value, elem_t, node, "target element")
+                else:
+                    self.check_assign(val_t, elem_t, node, "element assignment")
+            elif isinstance(obj_t, DictType):
+                self.check_assign(val_t, obj_t.value, node, "dict value assignment")
+            return val_t
         return UNKNOWN
 
     def visit_CallExpr(self, node: CallExpr) -> NexType:
-        callee_t = self.visit(node.callee)
-
-        # Metod çağrısı: obj.method(...)
+        # Metod çağrısı: callee tipini doğrudan kullan — obj'yi tekrar ziyaret
+        # etme (eski kod MemberExpr dalında çift ziyarete yol açıyordu).
         if isinstance(node.callee, MemberExpr):
             obj_t = self.visit(node.callee.obj)
             method_name = node.callee.member
@@ -715,6 +896,13 @@ class TypeChecker:
                     self.error(f"'{obj_t}' has no method '{method_name}'", node)
                     return UNKNOWN
                 callee_t = m
+            elif isinstance(obj_t, UnknownType):
+                callee_t = UNKNOWN
+            else:
+                self.error(f"'{obj_t}' has no method '{method_name}'", node)
+                return UNKNOWN
+        else:
+            callee_t = self.visit(node.callee)
 
         if isinstance(callee_t, FnType):
             # Argüman sayısı
@@ -733,9 +921,14 @@ class TypeChecker:
 
         if isinstance(callee_t, ClassType):
             # Constructor çağrısı: MyClass(...)
-            init_decl = next(
-                (m for m in callee_t.decl.methods if m.name in ("init", "__init__")),
-                None) if hasattr(callee_t, 'decl') else None
+            # DEĞİŞİKLİK NOTU: 'hasattr' guard'ı etkisizdi — ClassType.decl
+            # var ama None olabilir (class, main'den sonra tanımlandığında).
+            # AttributeError yerine None kontrolü yapılır.
+            init_decl = None
+            if callee_t.decl is not None:
+                init_decl = next(
+                    (m for m in callee_t.decl.methods
+                     if m.name in ("init", "__init__")), None)
             init = callee_t.lookup_method("init")
             if init and init_decl:
                 # self parametresini isimle atla
@@ -754,6 +947,18 @@ class TypeChecker:
 
     def _builtin_method(self, obj_t: NexType, method: str, node: Node) -> Optional[NexType]:
         """Liste, dict, str gibi builtin tiplerin metodları."""
+        if isinstance(obj_t, StackArrayType):
+            elem = obj_t.element
+            methods = {
+                "length":     INT,    "len":        INT,
+                "isEmpty":    BOOL,
+                "first":      NullableType(elem),
+                "last":       NullableType(elem),
+                "contains":   BOOL,   "has":        BOOL,
+                "indexOf":    NullableType(INT),
+                "join":       STR,
+            }
+            return methods.get(method)
         if isinstance(obj_t, ListType):
             elem = obj_t.element
             methods = {
@@ -805,6 +1010,11 @@ class TypeChecker:
         return None
 
     def visit_MemberExpr(self, node: MemberExpr) -> NexType:
+        if isinstance(node.obj, Ident) and node.obj.name in (
+                "alloc", "free", "sizeof", "to_own", "to_gc"):
+            self.error(
+                f"'{node.obj.name}' is a builtin function, not a value", node.obj)
+            return UNKNOWN
         obj_t = self.visit(node.obj)
 
         if isinstance(obj_t, ClassType):
@@ -829,6 +1039,18 @@ class TypeChecker:
     def visit_IndexExpr(self, node: IndexExpr) -> NexType:
         obj_t   = self.visit(node.obj)
         idx_t   = self.visit(node.index)
+
+        if isinstance(obj_t, StackArrayType):
+            if not isinstance(idx_t, (IntType, UnknownType)):
+                self.error(f"Stack array index must be 'int', got '{idx_t}'", node)
+            # Sabit indeks derleme zamanında denetlenebilir
+            if isinstance(node.index, IntLit):
+                idx = int(node.index.value)
+                if idx < 0 or idx >= obj_t.size:
+                    self.error(
+                        f"Index {idx} out of bounds for stack array of size "
+                        f"{obj_t.size}", node)
+            return obj_t.element
 
         if isinstance(obj_t, ListType):
             if not isinstance(idx_t, (IntType, UnknownType)):
@@ -893,6 +1115,17 @@ class TypeChecker:
         inner = lt.unwrap() if lt.is_nullable() else lt
         return inner
 
+    def _expect_list_lit(self, node: ListLit) -> bool:
+        """Literal'in [T; N] stack bağlamında mı beklendiğini söyler.
+
+        Sadece üst düğümün (VarDecl/AssignExpr/Argüman/Return...) analizi
+        sırasında ayarlanan ipucu ile çalışır; global durum yoktur.
+        """
+        hint = getattr(self, "_list_hint", None)
+        if isinstance(hint, StackArrayType) and len(node.elements) == hint.size:
+            return True
+        return False
+
     def visit_ListLit(self, node: ListLit) -> NexType:
         if not node.elements:
             return ListType(UNKNOWN)
@@ -903,6 +1136,10 @@ class TypeChecker:
             if t != first and not isinstance(t, UnknownType) and not isinstance(first, UnknownType):
                 self.error(
                     f"List element {i} has type '{t}', expected '{first}'", node)
+        # Stack atanma bağlamında (boyut da uyuyorsa) literal stack dizisi
+        # sayılır; diğer her yerde literal heap listesidir.
+        if self._expect_list_lit(node):
+            return StackArrayType(first, len(node.elements))
         return ListType(first)
 
     def visit_DictLit(self, node: DictLit) -> NexType:

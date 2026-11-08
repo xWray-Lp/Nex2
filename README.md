@@ -48,12 +48,18 @@ interpreter'da çalışıyor anlamına gelmez — aşağıdakiler gerçekten
 - `try`/`catch`
 - Liste, dict, tuple, set literal'leri, `range` (`0..10`)
 - REPL (`main.py` üzerinden, `:check` komutuyla sadece tip kontrolü de yapılabilir)
+- `@stack` sabit boyutlu diziler: `@stack let buf: [int; 4] = [0, 0, 0, 0]` —
+  derleme zamanında boyut ve sabit indeks denetimi, çalışma zamanında değişken
+  indeks denetimi; kaçış (GC değişkene, fonksiyona, `return`'e) heap liste
+  kopyası üretir. `@` öneki opsiyoneldir (`stack let ...` de çalışır).
+  Ayrıntı: [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) Bölüm 6, madde 0
 
 ## Henüz gerçek davranışı olmayan (sözdizimi var, semantik yok)
 
-- **`@own` / `@raw` / `@stack` bellek modları** — parser bu annotation'ları
+- **`@own` / `@raw` bellek modları** — parser bu annotation'ları
   ayrıştırıyor ama ne `type_checker.py` ne de `interpreter.py` bunlara göre
-  bir şey yapıyor. Tasarım ve uygulama planı için
+  bir şey yapıyor. `@stack` uygulanmıştır (yukarıya bakın); `@own`/`@raw`
+  tasarım ve uygulama planı için
   [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) dosyasına bakabilirsin.
 - **`spawn` / `await`** — şu an ifadeyi olduğu gibi senkron değerlendiriyor,
   gerçek bir concurrency/scheduler yok.

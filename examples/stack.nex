@@ -1,0 +1,14 @@
+fn main():
+    @stack let buf: [int; 4] = [0, 0, 0, 0]
+    buf[0] = 10
+    buf[1] = 20
+    buf[2] = 30
+    buf[3] = 40
+    print(str(buf[0] + buf[3]))
+    print(str(len(buf)))
+    let total = 0
+    for v in buf:
+        total = total + v
+    print("Sum = " + str(total))
+
+main()

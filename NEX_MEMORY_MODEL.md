@@ -124,6 +124,29 @@ bytecode VM'e geçilince gerçek bir CFG/lifetime analizine genişletilebilir
    de doğrulandı). Python tarafında sabit boyutlu bir liste/array olarak
    simüle edilebilir; scope bitince otomatik serbest bırakılır. Diğer
    maddelerden bağımsız olarak, istenildiğinde en önce yapılabilir.
+   **v1 uygulandı:** `[T; N]` tip sözdizimi + `StackArrayType` (tip
+   sistemi) + `StackArray` (interpreter); boyut ve sabit indeks
+   denetimleri derleme zamanında, değişken indeks denetimi çalışma
+   zamanında. Kaçış kuralı: stack dizi değer olarak kapsamdan çıkarsa
+   heap liste kopyasına dönüşür. Testler `test_stack.py` içinde,
+   örnek `examples/stack.nex` içinde. Boyut üst sınırı v1'de yok
+   (yalnızca `N >= 1`); üst sınır ertelenmiş karar olarak Bölüm 7'de
+   duruyor.
+
+   **v2 düzeltmeleri (bağımsız denetim turu sonrası):** v1'in kaçış
+   kuralı tüm kaçış noktalarında tutarlı değildi. Yapılan düzeltmeler:
+   (1) `to_list()` yüzeysel kopyadan derin kopyaya çevrildi — iç içe
+   stack/list değerleri artık bağımsız; (2) kaçış noktaları tam
+   yönetildi: liste/dict/set/tuple literal'leri, sınıf alanı ve dict
+   atamaları, `|>` operatörü, fonksiyon default parametreleri, match
+   konusu; (3) `StackPanic` fırlatılmayan dead-scope hataları artık
+   `NexRuntimeError` alt sınıfı — `catch` yakalar, "Internal Error"
+   yerine konumlu hata basılır; (4) checker/runtime metot drift'i
+   giderildi (`isEmpty`/`indexOf` implement edildi, `contains`/`join`
+   closure'ları dead-scope denetimli); (5) checker'ın eleman tipi ve
+   iç boyut denetimleri eklendi (`_check_stack_literal`, element
+   assignment tip denetimi); (6) kaçış bahsinde statik tip `ListType`
+   çıkarımı yapılır (`let xs = buf; xs.push(3)` artık meşru).
 1. **`nex_types.py`**: `@own` değerler için bir `OwnState` (borrow sayacı +
    mod: none/shared/mut) kavramı tanımla.
 2. **`interpreter.py`**: Katman 2 (runtime borrow flag) — en önce bu,
@@ -146,7 +169,10 @@ noktada araya sokulabilir.
 
 ## 7. Açık kalan sorular (bilerek ertelendi)
 
-- `@stack` için boyut sınırı var mı, derleme zamanında mı belirleniyor?
+- `@stack` için boyut üst sınırı: v1'de yok (yalnızca `N >= 1` denetimi
+  var). Bir üst sınır konulup konulmayacağı, konulursa değerinin ne
+  olacağı VM aşamasında netleşecek; boyutun kendisinin derleme
+  zamanında literal olması v1'den beri zorunlu.
 - `&mut` borrow bir fonksiyona parametre olarak geçtiğinde, fonksiyon
   bitince borrow otomatik mi bırakılıyor, yoksa açık bir "release" mi
   gerekiyor?

@@ -56,6 +56,12 @@ class TypeTuple(Node):
     """Tuple tipi: (int, str, bool)"""
     elements: list[Node]
 
+@dataclass
+class TypeStackArray(Node):
+    """@stack sabit boyutlu dizi tipi: [int; 4]"""
+    elem: Node
+    size: Node
+
 
 # ─── Literal Expressionlar ───────────────────────────────────────────────────
 

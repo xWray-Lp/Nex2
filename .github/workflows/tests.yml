@@ -25,3 +25,13 @@ jobs:
 
       - name: Run type checker tests
         run: python test_typechecker.py
+
+      - name: Run @stack tests
+        run: python test_stack.py
+
+      - name: Run examples
+        run: |
+          python main.py examples/hello.nex
+          python main.py examples/fizzbuzz.nex
+          python main.py examples/stack.nex
+          python main.py test_features.nex

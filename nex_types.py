@@ -137,6 +137,16 @@ class ResultType(NexType):
         return isinstance(other, ResultType) and self.ok == other.ok
     def __hash__(self): return hash(("result", self.ok))
 
+@dataclass
+class StackArrayType(NexType):
+    """@stack sabit boyutlu dizi: [int; 4]"""
+    element: NexType
+    size: int
+    def __repr__(self): return f"[{self.element}; {self.size}]"
+    def __eq__(self, other):
+        return isinstance(other, StackArrayType) and self.element == other.element and self.size == other.size
+    def __hash__(self): return hash(("stack_array", self.element, self.size))
+
 # ─── Class / Interface Tipler ─────────────────────────────────────────────────
 
 @dataclass
@@ -257,6 +267,10 @@ def is_subtype(actual: NexType, expected: NexType) -> bool:
 
     # List kovaryans (sadece okuma varsa, basit model)
     if isinstance(actual, ListType) and isinstance(expected, ListType):
+        return is_subtype(actual.element, expected.element)
+
+    # @stack dizi GC listesine okuma amaçlı geçebilir (elemanlar paylaşılır, kopya yok)
+    if isinstance(actual, StackArrayType) and isinstance(expected, ListType):
         return is_subtype(actual.element, expected.element)
 
     return False
