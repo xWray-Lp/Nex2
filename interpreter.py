@@ -672,21 +672,32 @@ class Interpreter:
         """Runtime hatası fırlat."""
         raise NexRuntimeError(message, node)
 
-    def _conv(self, value: Any) -> Any:
+    def _conv(self, value: Any, node: Optional[Node] = None) -> Any:
         """Heap bağlamında depolanacak değer: StackArray -> bağımsız heap kopyası.
 
         Kaçış kuralı stack dizilere sınırlı DEĞİLDİR — stack dizinin sızdığı
         her kapalı kap (list/dict/set/tuple literal'i, sınıf alanı, dict
         anahtarı, pipe argümanı, fonksiyon default'u, match konusu) aynı
         kurala tabi; aksi halde aliasing + stack-use-after-scope olur."""
+        # Wrapper'lar kapların içine sızmamalı: sahiplik proxy'si kopyalanamaz
+        # (audit B — güvenlik ağı; checker bu yolları zaten reddeder).
+        if isinstance(value, OwnValue):
+            raise OwnPanic(
+                "cannot copy an @own value into a GC context "
+                "(move it with to_gc(x) first)", node)
+        if isinstance(value, BorrowRef):
+            raise OwnPanic(
+                "borrowed references cannot cross context boundaries yet (v1)",
+                node)
         if isinstance(value, StackArray):
             return value.to_list()
         if isinstance(value, list):
-            return [self._conv(x) for x in value]
+            return [self._conv(x, node) for x in value]
         if isinstance(value, tuple):
-            return tuple(self._conv(x) for x in value)
+            return tuple(self._conv(x, node) for x in value)
         if isinstance(value, dict):
-            return {self._conv(k): self._conv(v) for k, v in value.items()}
+            return {self._conv(k, node): self._conv(v, node)
+                    for k, v in value.items()}
         return value
 
     def _nex_deepcopy(self, value: Any, node: Optional[Node] = None) -> Any:
@@ -988,8 +999,19 @@ class Interpreter:
         value = None
         if node.value:
             value = self.evaluate(node.value)
-        if isinstance(value, StackArray):
-            value = value.to_list()  # heap kopyası; stack ömrü devretmez
+            # Sahiplik wrapper'ı fonksiyon sınırını geçemez (§4 v1) —
+            # checker reddediyor; burada konumlu güvenlik ağı.
+            if isinstance(value, OwnValue):
+                raise OwnPanic(
+                    "cannot return an @own value from a function "
+                    "(move it with to_gc(x) first)", node)
+            if isinstance(value, BorrowRef):
+                raise OwnPanic(
+                    "borrowed references cannot cross function boundaries "
+                    "yet (v1)", node)
+            # Derin kaçış kuralı: return değeri stack dizisi içerebilir
+            # ([stackBuf] gibi) — kopyasız dönmesin (audit B).
+            value = self._conv(value, node)
         raise ReturnException(value)
 
     def eval_IfStmt(self, node: IfStmt) -> Any:
@@ -1160,16 +1182,33 @@ class Interpreter:
     def eval_DictLit(self, node: DictLit) -> Dict[Any, Any]:
         result = {}
         for key_node, value_node in node.pairs:
-            key = self._conv(self.evaluate(key_node))
-            value = self._conv(self.evaluate(value_node))
-            result[key] = value
+            key = self._conv(self.evaluate(key_node), node)
+            value = self._conv(self.evaluate(value_node), node)
+            try:
+                result[key] = value
+            except TypeError:
+                # Konumlu hata: audit B — 'Internal Error: unhashable' yerine
+                self.error(
+                    f"Dictionary key must be hashable, got unhashable "
+                    f"'{type(key).__name__}' (list/dict/set cannot be "
+                    f"dict keys)", node)
         return result
 
     def eval_TupleLit(self, node: TupleLit) -> list:
-        return [self._conv(self.evaluate(e)) for e in node.elements]
+        return [self._conv(self.evaluate(e), node) for e in node.elements]
 
     def eval_SetLit(self, node: SetLit) -> list:
-        return list({self._conv(self.evaluate(e)) for e in node.elements})
+        result = set()
+        for e in node.elements:
+            v = self._conv(self.evaluate(e), node)
+            try:
+                result.add(v)
+            except TypeError:
+                self.error(
+                    f"Set element must be hashable, got unhashable "
+                    f"'{type(v).__name__}' (list/dict/set cannot be "
+                    f"set elements)", node)
+        return list(result)
 
     def eval_RangeExpr(self, node: RangeExpr) -> NexRange:
         start = self.evaluate(node.start)
@@ -1274,6 +1313,10 @@ class Interpreter:
                     raise OwnPanic(
                         f"cannot write through shared borrow '{obj.name}'", node)
                 obj = obj.own._value
+            # Depolama noktası da kaçış bağlamıdır: stack dizisi/dict anahtarı
+            # buraya sızarken bağımsız kopya olmalı (audit B — a[0] = buf UAF).
+            value = self._conv(value, node)
+            idx = self._conv(idx, node)
             if isinstance(obj, StackArray):
                 obj._check()
                 if not isinstance(idx, int) or isinstance(idx, bool):
@@ -1296,6 +1339,30 @@ class Interpreter:
                         obj[idx] = current * value
                     elif op == "SLASH_EQ":
                         obj[idx] = current / value
+                return value
+            if not (isinstance(obj, dict) or isinstance(obj, list)):
+                self.error(
+                    f"Cannot index-assign into '{type(obj).__name__}'", node)
+            if isinstance(obj, dict):
+                try:
+                    if op == "ASSIGN":
+                        obj[idx] = value
+                        return value
+                    current = obj[idx]
+                except TypeError:
+                    # Konumlu hata: 'Internal Error: unhashable' yerine (audit B)
+                    self.error(
+                        f"Dictionary key must be hashable, got unhashable "
+                        f"'{type(idx).__name__}' (list/dict/set cannot be "
+                        f"dict keys)", node)
+                if op == "PLUS_EQ":
+                    obj[idx] = current + value
+                elif op == "MINUS_EQ":
+                    obj[idx] = current - value
+                elif op == "STAR_EQ":
+                    obj[idx] = current * value
+                elif op == "SLASH_EQ":
+                    obj[idx] = current / value
                 return value
             if op == "ASSIGN":
                 obj[idx] = value
@@ -1563,6 +1630,9 @@ class Interpreter:
                     return ret.value
                 finally:
                     interp.current_env = old
+                    # Lambda gövdesindeki declare edilen stack/own/borrow
+                    # kaynakları için scope kapanışı (audit B — leak).
+                    fn_env.close()
 
             def __repr__(self):
                 return "<lambda>"

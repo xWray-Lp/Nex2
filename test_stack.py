@@ -465,6 +465,47 @@ main()
 """, ["Woof!"])
 
 
+# ─── Runtime konumlu hata + escape (audit B) ─────────────────────
+
+expect_output("Dict key: stack array becomes heap copy", """
+fn main():
+    let d = {}
+    d[2] = "v"
+    print(str(d[2]))
+main()
+""", ["v"])
+
+expect_runtime_error("Dict literal unhashable key: positioned error", """
+fn main():
+    let d = {[[1]]: "x"}
+main()
+""", "Dictionary key must be hashable, got unhashable 'list'")
+
+expect_runtime_error("Dict index-assign unhashable key: positioned error", """
+fn main():
+    let d = {}
+    d[[1, 2]] = 5
+main()
+""", "Dictionary key must be hashable, got unhashable 'list'")
+
+expect_runtime_error("Set literal unhashable element: positioned error", """
+fn main():
+    let s = {1, [2, 3]}
+main()
+""", "Set element must be hashable, got unhashable 'list'")
+
+expect_output("Return escapes nested containers (deep conv)", """
+fn wrap() -> list:
+    let outer = [[1, 2], [3, 4]]
+    return outer
+
+fn main():
+    let xs = wrap()
+    print(str(xs[1][0]))
+main()
+""", ["3"])
+
+
 # ─── Sonuç ────────────────────────────────────────────────────────
 
 total = passed + failed
