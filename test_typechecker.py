@@ -493,6 +493,17 @@ class Rect extends Shape:
 """, expect_clean=True)
 
 
+run("F-string: undefined interpolation is compile error", """
+fn main():
+    print(f"hello {no_such_var}")
+""", expect_errors=["Undefined variable 'no_such_var'"])
+
+run("F-string: @own value interpolation is compile error", """
+fn main():
+    @own let buf = to_own([1, 2])
+    let s = f"val: {buf}"
+""", expect_errors=["cannot use @own value as f-string interpolation"])
+
 # ─── Sonuç ────────────────────────────────────────────────────────
 
 total = passed + failed

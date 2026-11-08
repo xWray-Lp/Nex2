@@ -841,6 +841,19 @@ class TypeChecker:
     def visit_IntLit(self, node: IntLit)     -> NexType: return INT
     def visit_FloatLit(self, node: FloatLit) -> NexType: return FLOAT
     def visit_StrLit(self, node: StrLit)     -> NexType: return STR
+
+    def visit_FStringExpr(self, node: FStringExpr) -> NexType:
+        """f"... {expr} ..." — interpolasyon parçaları, PipeExpr'deki gibi
+        generic visit() fallback'ine düşüp denetimsiz geçmesin: her Node
+        parçası normal bir ifade gibi ziyaret edilir, Ident/undefined vb.
+        yakalanır ve @own/borrow sızıntısı (_reject_own_value) engellenir."""
+        for part in node.parts:
+            if isinstance(part, str):
+                continue
+            t = self.visit(part)
+            self._reject_own_value(t, part, "f-string interpolation")
+        return STR
+
     def visit_BoolLit(self, node: BoolLit)   -> NexType: return BOOL
     def visit_NullLit(self, node: NullLit)   -> NexType: return NULL
 
