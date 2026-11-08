@@ -427,6 +427,12 @@ class Parser:
         # Çoklu atama: let a, b = 1, 2
         name = self.expect(TT.IDENT).value
         if self.match(TT.COMMA):
+            # Bellek annotation'ı çoklu bildirimde ASSİK düşürülür — sessizce
+            # GC'ye döndürmek yerine açık hata (audit: @stack let a,b=...).
+            if mem_mode is not None:
+                raise self.error(
+                    f"Memory annotation '@{mem_mode}' is not supported on "
+                    f"multi-variable declarations yet")
             names = [name]
             names.append(self.expect(TT.IDENT).value)
             while self.match(TT.COMMA):

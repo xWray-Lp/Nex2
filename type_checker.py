@@ -281,9 +281,19 @@ class TypeChecker:
         İzinli: ilkel tipler (int/float/byte/bool/null/void) ve @stack dizisi
         (StackArrayType) — dokümandaki 'başka @raw/@stack belleği' şartı;
         başka bir @raw değişken zaten transitif olarak bunlardan birini tutar.
-        Unknown (çıkarılamadı) gevşek bırakılır — false positive olmasın."""
-        if isinstance(t, (UnknownType, IntType, FloatType, ByteType, BoolType,
+        Unknown (çıkarılamadı) da reddedilir — tipi bilinmeyen bir değer
+        gerçekte GC kaynağı olabilir; @raw'a ancak tipi kanıtlanmış ilkel
+        veya stack kaynağı akabilir."""
+        if t is None:
+            return
+        if isinstance(t, (IntType, FloatType, ByteType, BoolType,
                           NullType, VoidType, StackArrayType)):
+            return
+        if isinstance(t, UnknownType):
+            self.error(
+                f"cannot verify the type of a value assigned to @raw "
+                f"variable '{target_name}' (@raw source must have a known "
+                f"primitive or stack type)", node)
             return
         self.error(
             f"cannot assign GC/own-derived value of type '{t}' to @raw "
@@ -481,12 +491,17 @@ class TypeChecker:
         declared = self.resolve_type_node(node.type_ann) if node.type_ann else None
         if node.mem_mode == "raw":
             # §3: @raw GC/own nesnesini gösteremez — kısıt derleme zamanında
-            # uygulanır (kaynakta kısmak). Stack kaynağı heap'e kaçırılmaz:
-            # statik tip StackArrayType kalır (raw, stack bellek gösterebilir).
-            inferred = self.visit(node.value) if node.value else None
-            if inferred is not None:
-                self._check_raw_source(inferred, node.value, node.name)
-            self._define_var(node, declared or inferred or UNKNOWN)
+            # uygulanır (kaynakta kısmak). Statik tip atanan kaynağın tipidir;
+            # atama noktasında da güncellenir (raw tipi = son izinli değerin
+            # tipi; runtime'ın düz-değer temsiliyle uyumlu).
+            if node.value is None:
+                self.error(
+                    f"@raw variable '{node.name}' requires an initializer", node)
+                self._define_var(node, declared or UNKNOWN)
+                return VOID
+            inferred = self.visit(node.value)
+            self._check_raw_source(inferred, node, node.name)
+            self._define_var(node, declared or inferred)
             return VOID
         if node.mem_mode == "own":
             self._define_var(node, self._own_decl_type(node, declared))
@@ -1068,9 +1083,17 @@ class TypeChecker:
                     self.current_scope.clear_moved(var_name)
                 return var_t
             if self.current_scope.lookup_mem_mode(var_name) == "raw":
-                # §3: GC/own kaynaklı değer @raw değişkene sızamaz (build error).
+                # §3: GC/own kaynaklı değer @raw değişken sızamaz (build error).
                 # Compound numeric atamalar serbest (ilkel RHS zaten izinli).
+                # Raw değişken tipi son atanan izinli değerin tipini alır
+                # (runtime da düz değer tuttuğu için statik/runtime uyumlu):
+                # p = buf(stack) sonrası p[0] meşru, p = 5 sonrası p[0] hata.
                 self._check_raw_source(val_t, node.value, var_name)
+                if op == "ASSIGN" and not isinstance(var_t, UnknownType):
+                    self.current_scope.define(
+                        var_name, val_t,
+                        mutable=self.current_scope.is_mutable(var_name),
+                        mem_mode="raw")
                 return var_t
             # Borrow değişken yeniden ataması (v1): yalnızca RefType, runtime release eder.
             if isinstance(var_t, RefType):

@@ -30,7 +30,20 @@ def run(name: str, source: str,
     print(f"\n{CYAN}{BOLD}━━━ {name} ━━━{RESET}")
 
     tokens = Lexer(source.strip() + "\n").tokenize()
-    tree   = Parser(tokens).parse()
+    try:
+        tree = Parser(tokens).parse()
+    except Exception as pe:
+        # Parser hataları da doğrulanabilir olmalı: expect_errors'a uyan
+        # mesaj beklenmişse bu bir pozitif test sayılır.
+        perr = str(getattr(pe, "message", "") or pe)
+        if expect_errors and all(pat.lower() in perr.lower() for pat in expect_errors):
+            passed += 1
+            print(f"  {GREEN}✓ Parse error as expected{RESET}")
+            return
+        print(f"  {RED}✗ Unexpected parse error:{RESET}")
+        print(f"    {perr}")
+        failed += 1
+        return
     tc     = TypeChecker()
     ok     = tc.check(tree)
 
@@ -576,6 +589,38 @@ fn main():
     @raw let xs = 1
     xs = [3, 4]
 """, expect_errors=["cannot assign GC/own-derived value of type '[int]'"])
+
+run("@raw: untyped function source is compile error (Unknown reject)", """
+fn mystery():
+    return [1, 2]
+
+fn main():
+    @raw let x = mystery()
+""", expect_errors=["cannot verify the type of a value assigned to @raw variable 'x'"])
+
+run("@raw: missing initializer is compile error", """
+fn main():
+    @raw let x
+""", expect_errors=["@raw variable 'x' requires an initializer"])
+
+run("@raw: stack-derived raw retrypes on assignment (p[0] after int assign errors)", """
+fn main():
+    @stack let buf: [int; 2] = [1, 2]
+    @raw let p = buf
+    let v = p[0]
+    p = 5
+    let y = p[0]
+""", expect_errors=["Type 'int' is not indexable"])
+
+run("@raw: memory annotation on multi-decl is parse error", """
+fn main():
+    @raw let a, b = 1, 2
+""", expect_errors=["not supported on multi-variable declarations"])
+
+run("@stack: memory annotation on multi-decl is parse error", """
+fn main():
+    @stack let a, b = [1], [2]
+""", expect_errors=["not supported on multi-variable declarations"])
 
 # ─── Sonuç ────────────────────────────────────────────────────────
 
