@@ -92,12 +92,14 @@ class OwnValue:
     yalnızca to_gc/free builtin'leri wrapper'a erişir.
     """
 
-    __slots__ = ("_value", "name", "alive")
+    __slots__ = ("_value", "name", "alive", "shared", "mut_borrowed")
 
     def __init__(self, value, name: str = "<own>"):
         self._value = value
         self.name = name
         self.alive = True
+        self.shared = 0        # aktif & paylaşımlı borrow sayısı
+        self.mut_borrowed = 0  # aktif &mut borrow sayısı (0 veya 1)
 
     def kill(self):
         self.alive = False
@@ -108,10 +110,69 @@ class OwnValue:
             raise OwnPanic(
                 f"@own value '{self.name}' used after free/scope end (use-after-free)")
 
+    def acquire_shared(self, node=None):
+        if self.mut_borrowed > 0:
+            raise OwnPanic(
+                f"borrow conflict: shared borrow of '{self.name}' while mutably borrowed",
+                node)
+        self.shared += 1
+
+    def acquire_mut(self, node=None):
+        if self.shared > 0 or self.mut_borrowed > 0:
+            raise OwnPanic(
+                f"borrow conflict: exclusive &mut borrow of '{self.name}' while borrowed",
+                node)
+        self.mut_borrowed = 1
+
+    def release_shared(self):
+        if self.shared > 0:
+            self.shared -= 1
+
+    def release_mut(self):
+        if self.mut_borrowed > 0:
+            self.mut_borrowed -= 1
+
     def __repr__(self):
         if not self.alive:
             return f"<freed own '{self.name}'>"
         return f"<own '{self.name}'>"
+
+
+class BorrowRef:
+    """&x / &mut x çalışma zamanı referansı (v1: yerel, scope ile serbest)."""
+
+    __slots__ = ("own", "mutable", "name", "released")
+
+    def __init__(self, own: OwnValue, mutable: bool, name: str, node=None):
+        self.own = own
+        self.mutable = mutable
+        self.name = name
+        self.released = False
+        if mutable:
+            own.acquire_mut(node)
+        else:
+            own.acquire_shared(node)
+
+    def _check(self, node=None):
+        if self.released:
+            raise OwnPanic(f"use of released borrow '{self.name}'", node)
+        if not self.own.alive:
+            raise OwnPanic(
+                f"@own value '{self.name}' used after free/scope end (use-after-free)",
+                node)
+
+    def release(self):
+        if self.released:
+            return
+        self.released = True
+        if self.mutable:
+            self.own.release_mut()
+        else:
+            self.own.release_shared()
+
+    def __repr__(self):
+        kind = "&mut" if self.mutable else "&"
+        return f"<borrow {kind} '{self.name}'>"
 
 
 class Environment:
@@ -125,6 +186,7 @@ class Environment:
         self.functions: Dict[str, FnDecl] = {}  # fonksiyon tanımları
         self.stack_vars: set[str] = set()  # @stack ile tanımlanan değişkenler
         self.own_vars: set[str] = set()  # @own ile tanımlanan değişkenler
+        self.borrows: list = []  # bu scope'ta üretilen BorrowRef'ler (v1, §4)
 
     def define(self, name: str, value: Any, is_const: bool = False) -> None:
         """Yeni değişken tanımla."""
@@ -208,8 +270,11 @@ class Environment:
         return False
 
     def close(self) -> None:
-        """Scope kapanışı: bu scope'ta tutulan own ve stack değerleri öldür.
-        own_vars önce öldürülür (deterministik sıra)."""
+        """Scope kapanışı: borrow → own → stack sırası (release-before-kill, v1)."""
+        for b in self.borrows:
+            if isinstance(b, BorrowRef):
+                b.release()
+        self.borrows.clear()
         for name in list(self.own_vars):
             v = self.values.get(name)
             if isinstance(v, OwnValue) and v.alive:
@@ -838,6 +903,18 @@ class Interpreter:
         else:
             self.error(f"Unknown unary operator: {node.op}", node)
 
+    def eval_BorrowExpr(self, node: BorrowExpr) -> Any:
+        name = node.operand.name  # parser v1: yalnızca Ident
+        wrapper = self._env_get_raw(name, node)
+        if not isinstance(wrapper, OwnValue):
+            self.error("only @own values can be borrowed (v1)", node)
+            ref = BorrowRef(wrapper, node.mutable, name, node)
+            self.current_env.borrows.append(ref)
+            return ref
+        ref = BorrowRef(wrapper, node.mutable, name, node)
+        self.current_env.borrows.append(ref)
+        return ref
+
     # ── Statements ───────────────────────────────────────────────────────────────
 
     def eval_ExprStmt(self, node: ExprStmt) -> Any:
@@ -1008,6 +1085,9 @@ class Interpreter:
             if not isinstance(wrapper, OwnValue):
                 self.error(f"{name} requires an @own variable", node)
             wrapper._check()
+            if wrapper.shared > 0 or wrapper.mut_borrowed > 0:
+                raise OwnPanic(
+                    f"cannot move/free '{arg.name}' while borrowed", node)
             if name == "to_gc":
                 val = wrapper._value
                 wrapper.kill()
@@ -1113,6 +1193,9 @@ class Interpreter:
                     cur = self._env_get(name, node)
                 except (NameError, RuntimeError):
                     cur = None
+                # Borrow değişken yeniden ataması: eski borrow otomatik serbest (v1).
+                if isinstance(cur, BorrowRef):
+                    cur.release()
                 if isinstance(cur, OwnValue):
                     if isinstance(value, OwnValue):
                         # to_own ile yeniden atama: yaşam döngüsü sıfırlanır
@@ -1170,6 +1253,13 @@ class Interpreter:
         elif isinstance(node.target, IndexExpr):
             obj = self.evaluate(node.target.obj)
             idx = self.evaluate(node.target.index)
+            # BorrowRef üzerinden yazma: mutability + per-access denetim.
+            if isinstance(obj, BorrowRef):
+                obj._check(node)
+                if not obj.mutable:
+                    raise OwnPanic(
+                        f"cannot write through shared borrow '{obj.name}'", node)
+                obj = obj.own._value
             if isinstance(obj, StackArray):
                 obj._check()
                 if not isinstance(idx, int) or isinstance(idx, bool):
@@ -1208,6 +1298,12 @@ class Interpreter:
             return value
         elif isinstance(node.target, MemberExpr):
             obj = self.evaluate(node.target.obj)
+            if isinstance(obj, BorrowRef):
+                obj._check(node)
+                if not obj.mutable:
+                    raise OwnPanic(
+                        f"cannot write through shared borrow '{obj.name}'", node)
+                obj = obj.own._value
             attr = node.target.member
             # Kaçış kuralı: stack dizisi sınıf alanına/dict'e atanırken bağımsız
             # heap kopyasına dönüşür; referans sızması aliasing üretir.
@@ -1245,6 +1341,9 @@ class Interpreter:
     def eval_IndexExpr(self, node: IndexExpr) -> Any:
         obj = self.evaluate(node.obj)
         idx = self.evaluate(node.index)
+        if isinstance(obj, BorrowRef):
+            obj._check(node)
+            obj = obj.own._value  # per-access çözümleme (snapshot yok)
         if isinstance(obj, StackArray):
             obj._check()
             if not isinstance(idx, int) or isinstance(idx, bool):
@@ -1263,6 +1362,9 @@ class Interpreter:
 
     def eval_MemberExpr(self, node: MemberExpr) -> Any:
         obj = self.evaluate(node.obj)
+        if isinstance(obj, BorrowRef):
+            obj._check(node)
+            obj = obj.own._value
         attr = node.member
 
         if isinstance(obj, NexInstance):

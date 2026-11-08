@@ -545,6 +545,100 @@ main()
 """, ["1", "3"])
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  BÖLÜM 11 — BORROW (v1, &x / &mut x, NEX_MEMORY_MODEL.md §4/§5)
+# ═══════════════════════════════════════════════════════════════════
+
+section("11 · Borrow derleme hataları")
+
+run("borrow non-own variable", """
+fn main():
+    let x = [1, 2]
+    let r = &x
+""", expect_errors=["only @own values can be borrowed"])
+
+run("borrow as function argument (borrow expr)", """
+fn take(xs: [int]):
+    let n = len(xs)
+
+fn main():
+    @own let p = to_own([1, 2])
+    take(&p)
+""", expect_errors=["borrowed references cannot cross function boundaries"])
+
+run("return borrow expr", """
+fn leak() -> [int]:
+    @own let p = to_own([1, 2])
+    return &p
+""", expect_errors=["borrowed references cannot cross function boundaries"])
+
+section("12 · Borrow runtime")
+
+expect_runtime_output("mut borrow read/write through ref", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &mut xs
+    r[0] = 42
+    print(str(r[0]))
+main()
+""", ["42"])
+
+expect_runtime_output("two shared borrows fine", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let a = &xs
+    let b = &xs
+    print(str(a[0]))
+    print(str(b[0]))
+main()
+""", ["1", "1"])
+
+expect_runtime_error("mut borrow after shared conflicts", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let a = &xs
+    let b = &mut xs
+    print(str(b[0]))
+main()
+""", "borrow conflict")
+
+expect_runtime_error("write through shared borrow", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    r[0] = 9
+main()
+""", "cannot write through shared borrow")
+
+expect_runtime_output("scope auto-release allows to_gc after block", """
+fn main():
+    @own let xs = to_own([7, 8])
+    if true:
+        let r = &xs
+        print(str(r[0]))
+    let g = to_gc(xs)
+    print(str(g[1]))
+main()
+""", ["7", "8"])
+
+expect_runtime_error("free while borrowed", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    free(xs)
+    print(str(r[0]))
+main()
+""", "cannot move/free")
+
+expect_runtime_error("to_gc while borrowed", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    let g = to_gc(xs)
+main()
+""", "cannot move/free")
+
+
 # ─── Sonuç ────────────────────────────────────────────────────────
 
 total = passed + failed

@@ -831,6 +831,16 @@ class Parser:
 
     def parse_unary(self) -> Node:
         tok = self.peek()
+        if self.match(TT.AMP):
+            mutable = False
+            # Contextual 'mut': "mut" lexer'da anahtar kelime değil, IDENT gelir.
+            if self.check(TT.IDENT) and self.peek().value == "mut":
+                self.advance()
+                mutable = True
+            operand = self.parse_unary()
+            if not isinstance(operand, Ident):
+                raise self.error("borrow operand must be a variable (v1)")
+            return BorrowExpr(operand, mutable, line=tok.line, col=tok.col)
         if self.match(TT.MINUS):
             operand = self.parse_unary()
             return UnaryExpr("-", operand, line=tok.line, col=tok.col)

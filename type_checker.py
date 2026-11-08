@@ -677,9 +677,18 @@ class TypeChecker:
             self.error("'return' outside function", node)
             return VOID
 
+        # Borrow ref'ler fonksiyon sınırını geçemez (v1, §4).
+        if isinstance(node.value, BorrowExpr):
+            self.error(
+                "borrowed references cannot cross function boundaries yet (v1)",
+                node.value)
         actual = self.visit(node.value) if node.value else VOID
         # @own dönüş tipi bu adımda parse edilemiyor; own değer GC'ye sızmasın.
         self._reject_own_value(actual, node, "return value")
+        if isinstance(actual, RefType):
+            self.error(
+                "borrowed references cannot cross function boundaries yet (v1)",
+                node)
 
         if isinstance(self.fn_return_type, VoidType):
             if node.value:
@@ -904,6 +913,28 @@ class TypeChecker:
             return BOOL
         return UNKNOWN
 
+    def visit_BorrowExpr(self, node: BorrowExpr) -> NexType:
+        op = node.operand
+        if not isinstance(op, Ident):
+            self.error("borrow operand must be a variable (v1)", node)
+            return UNKNOWN
+        name = op.name
+        # visit_Ident çağrılmaz: borrow ≠ move, moved işaretlenmez.
+        if self.current_scope.lookup(name) is None:
+            self.error(f"Undefined variable '{name}'", op)
+            return UNKNOWN
+        if self.current_scope.lookup_mem_mode(name) != "own":
+            self.error("only @own values can be borrowed (v1)", op)
+            return UNKNOWN
+        if self.current_scope.is_moved(name):
+            self.error(f"use of moved @own value '{name}'", op)
+            return UNKNOWN
+        t = self.current_scope.lookup(name)
+        if not isinstance(t, OwnType):
+            self.error("only @own values can be borrowed (v1)", op)
+            return UNKNOWN
+        return RefType(t.inner, node.mutable)
+
     def _own_target_inner(self, node: Node) -> Optional[NexType]:
         """Üye/indeks atama hedefinin kökü @own değişken ise inner tipini
         döndür. Üye/indeks yazımı sahiplik aktarımı değil mutasyondur; bu
@@ -960,6 +991,17 @@ class TypeChecker:
                 else:
                     self.current_scope.clear_moved(var_name)
                 return var_t
+            # Borrow değişken yeniden ataması (v1): yalnızca RefType, runtime release eder.
+            if isinstance(var_t, RefType):
+                if op != "ASSIGN":
+                    self.error(
+                        f"compound assignment is not supported on borrow variable "
+                        f"'{var_name}'", node)
+                elif not isinstance(val_t, RefType):
+                    self.error(
+                        f"cannot assign non-reference value to borrow variable "
+                        f"'{var_name}' (v1)", node)
+                return var_t
             if op == "ASSIGN" and self.current_scope.lookup_mem_mode(var_name) == "stack":
                 if (isinstance(val_t, ListType) and isinstance(node.value, ListLit)
                         and len(node.value.elements)
@@ -991,6 +1033,9 @@ class TypeChecker:
         elif isinstance(node.target, MemberExpr):
             own_inner = self._own_target_inner(node.target.obj)
             obj_t = own_inner if own_inner is not None else self.visit(node.target.obj)
+            # Auto-deref: borrow ref üzerinden üye yazımı.
+            if isinstance(obj_t, RefType):
+                obj_t = obj_t.inner
             val_t = self.visit(node.value)
             self._reject_own_value(val_t, node.value,
                                    f"assignment to '{node.target.member}'")
@@ -1004,6 +1049,9 @@ class TypeChecker:
         elif isinstance(node.target, IndexExpr):
             own_inner = self._own_target_inner(node.target.obj)
             obj_t = own_inner if own_inner is not None else self.visit(node.target.obj)
+            # Auto-deref: borrow ref üzerinden yazma (mutability runtime'da denetlenir).
+            if isinstance(obj_t, RefType):
+                obj_t = obj_t.inner
             self.visit(node.target.index)
             val_t = self.visit(node.value)
             self._reject_own_value(val_t, node.value, "element assignment")
@@ -1114,15 +1162,30 @@ class TypeChecker:
                 return self._check_to_gc(node)
             if node.callee.name == "free":
                 return self._check_free(node)
+        # Borrow ifadeleri fonksiyon sınırını geçemez (v1, §4).
+        for i, arg in enumerate(node.args):
+            if isinstance(arg, BorrowExpr):
+                self.error(
+                    "borrowed references cannot cross function boundaries yet (v1)",
+                    arg)
         # Metod çağrısı: callee tipini doğrudan kullan — obj'yi tekrar ziyaret
         # etme (eski kod MemberExpr dalında çift ziyarete yol açıyordu).
         if isinstance(node.callee, MemberExpr):
             obj_t = self.visit(node.callee.obj)
+            if isinstance(obj_t, RefType):
+                obj_t = obj_t.inner
             method_name = node.callee.member
 
             # Builtin metodlar
             bt = self._builtin_method(obj_t, method_name, node)
             if bt is not None:
+                # Builtin metod argümanları da borrow taşıyamaz (sınır korunsun).
+                for arg in node.args:
+                    at = self.visit(arg)
+                    if isinstance(at, RefType):
+                        self.error(
+                            "borrowed references cannot cross function boundaries yet (v1)",
+                            arg)
                 return bt
 
             if isinstance(obj_t, ClassType):
@@ -1150,6 +1213,10 @@ class TypeChecker:
             for i, (arg, param_t) in enumerate(zip(node.args, callee_t.params)):
                 arg_t = self.visit(arg)
                 self._reject_own_value(arg_t, arg, f"argument {i+1}")
+                if isinstance(arg_t, RefType):
+                    self.error(
+                        "borrowed references cannot cross function boundaries yet (v1)",
+                        arg)
                 if not isinstance(param_t, UnknownType):
                     self.check_assign(arg_t, param_t, arg,
                                       f"argument {i+1}")
@@ -1173,6 +1240,10 @@ class TypeChecker:
                 for i, (arg, (_, param_t)) in enumerate(zip(node.args, non_self)):
                     arg_t = self.visit(arg)
                     self._reject_own_value(arg_t, arg, f"constructor argument {i+1}")
+                    if isinstance(arg_t, RefType):
+                        self.error(
+                            "borrowed references cannot cross function boundaries yet (v1)",
+                            arg)
                     if not isinstance(param_t, UnknownType):
                         self.check_assign(arg_t, param_t, arg,
                                           f"constructor argument {i+1}")
@@ -1253,6 +1324,9 @@ class TypeChecker:
                 f"'{node.obj.name}' is a builtin function, not a value", node.obj)
             return UNKNOWN
         obj_t = self.visit(node.obj)
+        # Auto-deref: borrow ref üzerinden üye/metot erişimi (v1, §4)
+        if isinstance(obj_t, RefType):
+            obj_t = obj_t.inner
 
         if isinstance(obj_t, ClassType):
             # Field?
@@ -1276,6 +1350,9 @@ class TypeChecker:
     def visit_IndexExpr(self, node: IndexExpr) -> NexType:
         obj_t   = self.visit(node.obj)
         idx_t   = self.visit(node.index)
+        # Auto-deref: borrow ref üzerinden erişim (v1, §4)
+        if isinstance(obj_t, RefType):
+            obj_t = obj_t.inner
 
         if isinstance(obj_t, StackArrayType):
             if not isinstance(idx_t, (IntType, UnknownType)):

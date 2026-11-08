@@ -123,6 +123,12 @@ class UnaryExpr(Node):
     operand: Node
 
 @dataclass
+class BorrowExpr(Node):
+    """&x veya &mut x — @own değerin ödüncü (v1: operand yalnızca Ident)."""
+    operand: Node
+    mutable: bool = False
+
+@dataclass
 class CallExpr(Node):
     """foo(a, b, c)"""
     callee:    Node

@@ -450,7 +450,19 @@ fn main():
     let nums = [1, 2, 3, 4, 5]
     let evens = nums.filter(isEven)
     let doubled = evens.map(double)
+
+fn isEven(n: int) -> bool:
+    return n % 2 == 0
+
+fn double(n: int) -> int:
+    return n * 2
 """, expect_clean=True)
+
+run("Pipeline: filter with undefined fn is compile error", """
+fn main():
+    let nums = [1, 2, 3]
+    let evens = nums.filter(missingFn)
+""", expect_errors=["Undefined variable 'missingFn'"])
 
 run("Multi-class hierarchy", """
 class Shape:
