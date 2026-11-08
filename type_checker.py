@@ -299,6 +299,22 @@ class TypeChecker:
         finally:
             self._list_hint = prev_hint
 
+    def visit_PipeExpr(self, node: PipeExpr) -> NexType:
+        """buf |> f — sol taraf (@own/borrow) fonksiyona sessizce sızmamalı.
+
+        Pipe, sol işleneni doğrudan argüman gibi geçirdiği için fonksiyon
+        sınırı kuralları (v1) burada da uygulanır:
+        - @own değer taşınmadan geçemez (to_gc ile açıkça taşınmalı)
+        - borrow referansı sınırı geçemez (§4/§5 v1 kapsamı)"""
+        left_t = self.visit(node.left)
+        self._reject_own_value(left_t, node.left, "pipe operand")
+        if isinstance(node.left, BorrowExpr):
+            self.error(
+                "borrowed references cannot cross function boundaries yet (v1)",
+                node.left)
+        self.visit(node.right)
+        return UNKNOWN
+
     # ── Program & Block ───────────────────────────────────────────
 
     def visit_Program(self, node: Program) -> NexType:
