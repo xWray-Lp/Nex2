@@ -326,7 +326,11 @@ class Parser:
         is_ref = False
         is_mut_ref = False
         if self.match(TT.AMP):
-            if self.match(TT.IDENT):  # "mut"
+            # Bağlamsal keyword: yalnız 'mut' değeri mut-ref demektir;
+            # 'match(TT.IDENT)' şekli &x'in x'ini yutup grameri bozuyordu.
+            nxt = self.peek()
+            if nxt.type == TT.IDENT and nxt.value == "mut":
+                self.advance()
                 is_mut_ref = True
             is_ref = True
         # self keyword'ü param olarak kabul et

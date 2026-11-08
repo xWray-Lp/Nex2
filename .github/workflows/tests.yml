@@ -23,6 +23,9 @@ jobs:
       - name: Run lexer tests (pytest)
         run: python -m pytest test_lexer.py -v
 
+      - name: AST field coverage gate
+        run: python check_ast_coverage.py
+
       - name: Run type checker tests
         run: python test_typechecker.py
 

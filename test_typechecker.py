@@ -622,6 +622,22 @@ fn main():
     @stack let a, b = [1], [2]
 """, expect_errors=["not supported on multi-variable declarations"])
 
+run("borrow 'mut' fn parameter is compile error (v1)", """
+fn f(&mut x: int) -> int:
+    return x
+
+fn main():
+    print("ok")
+""", expect_errors=["borrow 'mut' function parameters are not supported"])
+
+run("shared '&x' fn parameter passes value", """
+fn f(&x: int) -> int:
+    return x + 1
+
+fn main():
+    print(str(f(41)))
+""", expect_clean=True)
+
 # ─── Sonuç ────────────────────────────────────────────────────────
 
 total = passed + failed

@@ -133,6 +133,10 @@ class TypeChecker:
         # Tip kayıtları (class / interface tanımları)
         self.type_registry: dict[str, NexType] = {}
 
+        # &mut param hata tekilleştirme: aynı node pre-declare + visit'te
+        # iki kez raporlanmasın.
+        self._mut_ref_reported: set[int] = set()
+
         self._setup_builtins()
 
     # ── Builtins ──────────────────────────────────────────────────
@@ -378,8 +382,20 @@ class TypeChecker:
                 self.type_registry[stmt.name] = it
                 self.current_scope.define(stmt.name, it)
 
+    def _check_mut_ref_params(self, node: FnDecl, pos: Node) -> None:
+        """&mut fonksiyon parametresi v1'de yok (borrow sınırı fonksiyonu
+        geçemez) — hem pre-declare hem visit aynı node'u raporlamasın."""
+        if any(p.is_mut_ref for p in node.params) \
+                and id(node) not in self._mut_ref_reported:
+            self._mut_ref_reported.add(id(node))
+            names = ", ".join(p.name for p in node.params if p.is_mut_ref)
+            self.error(
+                f"borrow 'mut' function parameters are not supported "
+                f"yet (v1) (parameter '{names}')", pos)
+
     def _fn_signature(self, node: FnDecl) -> FnType:
         """Fonksiyon imzasını gövde kontrol etmeden çıkar."""
+        self._check_mut_ref_params(node, node)
         saved_env = dict(self.type_env)
         for tp in node.type_params:
             self.type_env[tp] = TypeVar(tp)
@@ -599,6 +615,7 @@ class TypeChecker:
             self.current_scope.define(node.name, fn_type)
         # @stack değer fonksiyona ne değer ne referansla geçemez: kapsamı stack'te kalır.
         # resolve_type_node('&[int; 2]') zaten RefType üretir; o yüzden iç tip RefType da olabilir.
+        self._check_mut_ref_params(node, node)
         for p in node.params:
             if p.type_ann is None:
                 continue
@@ -1257,6 +1274,12 @@ class TypeChecker:
         return VOID
 
     def visit_CallExpr(self, node: CallExpr) -> NexType:
+        if node.type_args:
+            # call-site generic argümanlar parse edilir ama semantics v1'de
+            # yok — sessiz yutma yok (カバー olmayan AST alanı denetimi).
+            self.error(
+                "explicit type arguments in function calls are not "
+                "supported yet (v1)", node)
         # GC ⇄ @own geçişleri ve free: gerçek imzalar argümana bağlı olduğu
         # için FnType tablosu yerine burada özel ele alınır (§2).
         if isinstance(node.callee, Ident):
