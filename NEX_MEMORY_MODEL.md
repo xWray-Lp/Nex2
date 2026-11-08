@@ -11,8 +11,8 @@
 > **Tarihsel not (güncellendi):** Aşağıdaki tarama anlık görüntüsü,
 > `@stack`/`@own`/borrow uygulanmadan önceki durumu yansıtır; artık
 > geçerliliğini yitirmiştir. **Güncel gerçeklik:** `@stack` ve `@own`
-> (`to_own`/`to_gc`/`free`) ile `&x`/`&mut x` borrow'ları (v1)
-> uygulanmıştır; `@raw` kısıtlaması (§3/§6 madde 5) henüz beklemededir.
+> (`to_own`/`to_gc`/`free`), `&x`/`&mut x` borrow'ları (v1) ve `@raw`
+> statik kısıtı (§6 madde 5) uygulanmıştır.
 
 - `ast_nodes.py` → `VarDecl.mem_mode: Optional[str]` alanı zaten var:
   `"own" | "raw" | "stack" | None`.
@@ -78,6 +78,12 @@ free/dangling). Bunu derleme zamanında engellemek ucuzdur (tip kontrolü),
 runtime'da GC'yi "pointer-farkında" yapmak ise GC tasarımını çok
 karmaşıklaştırır. Bu yüzden en ucuz ve en güvenli çözüm: `@raw`'ı
 kaynağında kısıtlamak.
+
+> **v1 uygulama notu:** Kısıt statiktir — `@raw` bildirim ve atama
+> noktalarında kaynak tipi denetlenir (ilkel + `@stack` dizisi serbest;
+> `str` dahil tüm GC nesneleri red — string de heap nesnesidir). Runtime
+> v1'de `@raw` değişken düz değer tutar (stack kaynağı heap kopyasına
+> çevrilir); gerçek ham adres/aliasing semantiği VM dönemi işidir.
 
 ## 4. Borrow kuralları (`@own` için)
 
@@ -179,8 +185,11 @@ bytecode VM'e geçilince gerçek bir CFG/lifetime analizine genişletilebilir
 4. **`to_own()` / `to_gc()`**: builtin olarak `alloc`/`free` yanına ekle,
    GC↔own geçiş kurallarını uygula.
 5. **`@raw` kısıtlaması**: type_checker'da, bir `@raw` değişkene GC/own
-   kaynaklı bir değer atanmaya çalışıldığında hata üret. **Henüz
-   uygulanmadı.**
+   kaynaklı bir değer atanmaya çalışıldığında hata üret. **Uygulandı (v1):**
+   `TypeChecker._check_raw_source` — bildirim ve atamada kaynak denetimi;
+   ilkel + stack dizisi serbest, `str` dahil tüm GC nesneleri derleme
+   hatası (runtime v1'de raw değişken hâlâ düz değer tutar; gerçek ham
+   adres/aliasing VM dönemi işi).
 6. **(Bytecode VM sonrası)** Katman 1'i gerçek CFG/lifetime analizine
    genişlet — fonksiyonlar arası, döngü/dal duyarlı borrow checker.
 

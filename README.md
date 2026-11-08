@@ -60,9 +60,10 @@ interpreter'da çalışıyor anlamına gelmez — aşağıdakiler gerçekten
 
 ## Henüz gerçek davranışı olmayan (sözdizimi var, semantik yok)
 
-- **`@raw` kısıtlaması** — parser `@raw`'ı ayrıştırıyor ama GC/own kaynağını
-  reddetme kuralı henüz uygulanmadı; `@raw` şu an GC gibi davranıyor (bkz.
-  [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) Bölüm 3/6, madde 5).
+- **`@raw` kısıtlaması** — uygulanmıştır: `@raw` değişkene GC/own kaynaklı
+  değer (liste/dict/set/tuple/sınıf/string) atanması derleme hatasıdır;
+  ilkel tipler ve `@stack` dizileri serbesttir. Runtime'da `@raw` değişken
+  v1'de düz değer tutar (gerçek ham adres/aliasing VM dönemi işi).
 - **`spawn` / `await`** — şu an ifadeyi olduğu gibi senkron değerlendiriyor,
   gerçek bir concurrency/scheduler yok.
 

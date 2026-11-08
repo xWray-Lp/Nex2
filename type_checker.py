@@ -274,6 +274,22 @@ class TypeChecker:
             msg = f"Type mismatch{' in ' + ctx if ctx else ''}: expected '{expected}', got '{actual}'"
             self.error(msg, node)
 
+    def _check_raw_source(self, t: NexType, node: Node, target_name: str) -> None:
+        """§3: @raw değişken GC/own nesnesini gösteremez — kaynakta kısmak
+        en ucuz ve en güvenli çözüm (GC taşımasında dangling engellenir).
+
+        İzinli: ilkel tipler (int/float/byte/bool/null/void) ve @stack dizisi
+        (StackArrayType) — dokümandaki 'başka @raw/@stack belleği' şartı;
+        başka bir @raw değişken zaten transitif olarak bunlardan birini tutar.
+        Unknown (çıkarılamadı) gevşek bırakılır — false positive olmasın."""
+        if isinstance(t, (UnknownType, IntType, FloatType, ByteType, BoolType,
+                          NullType, VoidType, StackArrayType)):
+            return
+        self.error(
+            f"cannot assign GC/own-derived value of type '{t}' to @raw "
+            f"variable '{target_name}' (raw holds primitives and "
+            f"stack memory only)", node)
+
     def _reject_own_value(self, t: NexType, node: Node, ctx: str) -> None:
         """OwnType üreten ifade yalnızca @own bildirim/atama RHS'inde meşrudur.
         Diğer bağlamlarda own değer GC tarafına sızar ve free edilemez; bu
@@ -463,6 +479,15 @@ class TypeChecker:
 
     def visit_VarDecl(self, node: VarDecl) -> NexType:
         declared = self.resolve_type_node(node.type_ann) if node.type_ann else None
+        if node.mem_mode == "raw":
+            # §3: @raw GC/own nesnesini gösteremez — kısıt derleme zamanında
+            # uygulanır (kaynakta kısmak). Stack kaynağı heap'e kaçırılmaz:
+            # statik tip StackArrayType kalır (raw, stack bellek gösterebilir).
+            inferred = self.visit(node.value) if node.value else None
+            if inferred is not None:
+                self._check_raw_source(inferred, node.value, node.name)
+            self._define_var(node, declared or inferred or UNKNOWN)
+            return VOID
         if node.mem_mode == "own":
             self._define_var(node, self._own_decl_type(node, declared))
             return VOID
@@ -1041,6 +1066,11 @@ class TypeChecker:
                         f"(use to_own(x))", node)
                 else:
                     self.current_scope.clear_moved(var_name)
+                return var_t
+            if self.current_scope.lookup_mem_mode(var_name) == "raw":
+                # §3: GC/own kaynaklı değer @raw değişkene sızamaz (build error).
+                # Compound numeric atamalar serbest (ilkel RHS zaten izinli).
+                self._check_raw_source(val_t, node.value, var_name)
                 return var_t
             # Borrow değişken yeniden ataması (v1): yalnızca RefType, runtime release eder.
             if isinstance(var_t, RefType):

@@ -532,6 +532,51 @@ fn main():
 let x = [1, 2]
 """, expect_errors=["Undefined variable 'x'"])
 
+# ─── @raw statik kısıtı (§3) ─────────────────────────────────────
+run("@raw: primitives allowed", """
+fn main():
+    @raw let p = 42
+    @raw let f = 3.14
+    p = 99
+""", expect_clean=True)
+
+run("@raw: stack array source allowed", """
+fn main():
+    @stack let buf: [int; 2] = [1, 2]
+    @raw let p = buf
+""", expect_clean=True)
+
+run("@raw: list literal is compile error", """
+fn main():
+    @raw let xs = [1, 2, 3]
+""", expect_errors=["cannot assign GC/own-derived value of type '[int]'"])
+
+run("@raw: string is compile error (GC object)", """
+fn main():
+    @raw let s = "hello"
+""", expect_errors=["cannot assign GC/own-derived value of type 'str'"])
+
+run("@raw: class instance is compile error", """
+class P:
+    x: int
+
+fn main():
+    let i = P()
+    @raw let p = i
+""", expect_errors=["cannot assign GC/own-derived value of type 'P'"])
+
+run("@raw: to_gc result is compile error", """
+fn main():
+    @own let q = to_own([1, 2])
+    @raw let p = to_gc(q)
+""", expect_errors=["cannot assign GC/own-derived value of type"])
+
+run("@raw: list assignment to raw var is compile error", """
+fn main():
+    @raw let xs = 1
+    xs = [3, 4]
+""", expect_errors=["cannot assign GC/own-derived value of type '[int]'"])
+
 # ─── Sonuç ────────────────────────────────────────────────────────
 
 total = passed + failed
