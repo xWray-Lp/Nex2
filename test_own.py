@@ -1,13 +1,14 @@
 """
-Nex Language — @own Test Suite (Step 1: yalnızca derleme/type-check tarafı)
+Nex Language — @own Test Suite (checker + runtime v1)
 Sahiplik kuralları: NEX_MEMORY_MODEL.md §1 (mod tablosu), §2 (GC ⇄ own
-geçişleri), §5 (statik katman kapsamı), §6 (yol haritası, adım 1/3/4).
+geçişleri), §4 (borrow), §5 (uygulama katmanları), §6 (yol haritası 1/3/4).
 
-Bu adımda runtime yoktur: yalnızca type_checker denetlenir.
+Kapsam: type_checker denetimleri + @own runtime (OwnValue, to_own/to_gc/
+free, & / &mut borrow'ları, blok-lokal ömür, çakışma paniçleri).
 - @own bildirimi sembol tipini OwnType(inner) yapar.
 - GC → own yalnızca to_own(x) (deep copy) ile; düz atama yasak.
 - own → GC yalnızca to_gc(x) (move) ile; sonraki kullanım use-after-move.
-- @own değer başka hiçbir ifade bağlamında okunamaz (borrow bu adımda yok).
+- @own değer, borrow/transfer noktaları dışında okunamaz.
 - free yalnızca @own değişken üzerinde çağrılabilir.
 - @own + @stack dizi tipi birleşemez (§1: modlar ayrık kategoriler).
 """
