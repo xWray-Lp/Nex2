@@ -1,0 +1,71 @@
+# ═══════════════════════════════════════════════════════════════
+# Veri-işleme dogfood: @own sahipliği + GC sınır geçişi
+#
+# Senaryo: gelen sensör batch'i GC'nin elinden alınıp @own'a konur
+# (to_own — deep copy), borçlar ile yerinden okunur/yazılır, bittiğinde
+# to_gc ile sahiplik GC'ye geri devredilir ve sınır-dışı iş (fonksiyon
+# çağrıları) normal GC verisiyle devam eder.
+#
+# Kural anımsatıcı (NEX_MEMORY_MODEL.md §2/§4):
+#   @own değere doğrudan okuma/yazma YASAK — &x / &mut x borçla yapılır
+#   @own değer fonksiyon sınırı geçemez — to_gc(x) ile açık taşınır
+#
+# v1 sürtünmesi (bilinçli): borç blok-kapsamlıdır — aynı blokta
+# to_gc yapacaksan borcu alt komşuluğa (if-notu) sıkıştırmak gerekmez;
+# borç, bulunduğu blok kapanana kadar yaşıyor (bu örnek ona göre
+# bloklanarak oluşmuştur, devap götürmek için automáticamente yapıldı).
+# ═══════════════════════════════════════════════════════════════
+
+# ── GC tarafı: sıradan fonksiyonlar (sahiplik bilgisi istemez) ──
+fn sum(xs: list) -> int:
+    let s = 0
+    for x in xs:
+        s = s + x
+    return s
+
+fn normalize(xs: list) -> list:
+    let mx = 0
+    for x in xs:
+        if x > mx:
+            mx = x
+    let out = []
+    for x in xs:
+        out.push(x * 2)
+    return out
+
+fn main():
+    let sensors = [12, 3, 45, 7, 30]
+
+    # 1. Sahiplik devral: GC'den deep copy, batch artık @own
+    @own let batch = to_own(sensors)
+
+    # 2. Yerinde oku — borçları ALT BLOKTA tutuyoruz: main bloğu
+    #    kapanmadan to_gc yapacağımız için borç main sonuna kadar
+    #    taşmaması gerekir.
+    let first = 0
+    if true:
+        let view1 = &batch         # paylaşımlı borç (N tane olabilir)
+        let view2 = view1          # aynı borrow proxy'si
+        first = view2[0]
+
+    # 3. Yerinde yaz — &mut yine alt blokta (çakışma çıkmasın)
+    @own let scrub = to_own([1, 2, 3])
+    if true:
+        let w = &mut scrub         # exclusive &mut — bir tane
+        w[0] = 10
+        w[1] = 20
+
+    # 4. Sınırı geç: @own fonksiyona giremez → to_gc ile açık taşı
+    let scrub_vals = to_gc(scrub)  # scrub bu noktadan sonra moved
+    let scrub_sum = sum(scrub_vals)
+
+    let dataset = to_gc(batch)     # batch bu noktadan sonra moved
+    let total = sum(dataset)
+    let doubled = normalize(dataset)
+
+    print(str(first))              # 12
+    print(str(scrub_sum))          # 33
+    print(str(total))              # 97
+    print(str(doubled[2]))         # 90
+
+main()

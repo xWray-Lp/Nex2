@@ -37,4 +37,7 @@ jobs:
           python main.py examples/hello.nex
           python main.py examples/fizzbuzz.nex
           python main.py examples/stack.nex
+          python main.py examples/data_pipeline.nex
+          python main.py examples/tree_own.nex
+          python main.py examples/buffer_econ.nex
           python main.py test_features.nex

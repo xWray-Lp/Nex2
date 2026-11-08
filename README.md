@@ -31,7 +31,13 @@ fn main():
 main()
 ```
 
-Daha fazla örnek için `examples/` klasörüne bakabilirsin.
+Daha fazla örnek için `examples/` klasörüne bakabilirsin:
+
+- `hello.nex`, `fizzbuzz.nex` — temel dil akışı
+- `stack.nex` — `@stack` sabit diziler
+- `data_pipeline.nex` — `@own` + `to_own`/`to_gc` + borçlarla veri-işleme
+- `tree_own.nex` — sınıflar, özyineleme, snapshot sahipliği (borç okuma/yazma)
+- `buffer_econ.nex` — `@stack` döngüsel tampon + `@raw` imleçler (heap'siz ekonomi)
 
 ## Şu an gerçekten çalışan özellikler
 

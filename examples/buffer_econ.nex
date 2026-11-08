@@ -1,0 +1,49 @@
+# ═══════════════════════════════════════════════════════════════
+# Buffer ekonomisi dogfood: @stack sabit dizi + @raw ilkel imleçler
+#
+# Senaryo: döngüsel tampon, HEAP SİZİN işlenir — @stack dizi
+# (sabit boyut, sınır/yaşam derleme zamanı) ve @raw değişkenlerde
+# (yalnız ilkel/statik kaynak) head/tail/total imleçleri taşınır.
+# GC hiç şahit olmaz: barrel (dizi) tampon main'in scope'unda
+# doğar ve ölür.
+#
+# v1 sınırları (bilinçli): @raw ham pointer değil — runtime'da düz
+# değer tutar; kaynağı kısıtdır (GC/own nesnesi + string red).
+# ═══════════════════════════════════════════════════════════════
+
+fn main():
+    # 1. Sabit tampon: 8 makas, heap'i hiç bozmuyor
+    @stack let ring: [int; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+
+    # 2. İmleçler: @raw (yalnız ilkel/statik kaynak kabul ediliyor)
+    @raw let head = 0
+    @raw let count = 0
+
+    # 3. Üretici: 8 değeri doldur
+    let produced = [5, 9, 3, 11, 2, 8, 6, 1]
+    for x in produced:
+        ring[head] = x
+        head = head + 1
+        count = count + 1
+
+    # 4. Tüketici: toplam — yine @raw ile indexeleme
+    @raw let tail = 0
+    @raw let total = 0
+    while tail < count:
+        total = total + ring[tail]
+        tail = tail + 1
+    print(str(total))                                # 45
+
+    # 5. Doğrulama: dizi sırası korunmuş mu?
+    @raw let k = 0
+    @raw let first_half = 0
+    while k < 4:
+        first_half = first_half + ring[k]
+        k = k + 1
+    print(str(first_half))                           # 28 (5+9+3+11)
+
+    # 6. Kaçış kuralı: stack dizini main'den alt fn'e geçemez —
+    #    kaçarsa heap kopyası: güvenli ama @stack ekonomisi kaybolur.
+    #    (Bu örnek hiç kaçmıyor: ring main'in scope'unda kapatışır.)
+
+main()

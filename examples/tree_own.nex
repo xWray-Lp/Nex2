@@ -1,0 +1,73 @@
+# ═══════════════════════════════════════════════════════════════
+# Ağaç yapısı dogfood: paylaşımlı okuma, snapshot sahipliği,
+# borrow-through yazma
+#
+# Senaryo: canlı ağaç (GC yoluyla referans paylaşımı) serbest büyür;
+# sahiplik, molekül değer-snapshot'ında (@own) devreye girer:
+# snapshot'a hiçbir paylaşımlı referans tutan yoktur, borçlanarak
+# okunur/yazılır, iş bitince to_gc ile GC'ye bırakılır.
+#
+# v1 sınırları (bilinçli): sahiplik fonksiyon sınırından geçemez;
+# borç üzerinden BUILTIN çağrısı da yapılamaz (len(&x) yasak) —
+# uzunluk, devir sonrası GC tarafında ölçülür.
+# ═══════════════════════════════════════════════════════════════
+
+class TreeNode:
+    value: int
+    label: str
+    children: list
+
+    fn init(v: int, s: str):
+        self.value = v
+        self.label = s
+        self.children = []
+
+    fn add_child(c):
+        self.children.push(c)
+
+    fn total() -> int:
+        # Özyineleme: değer + çocukların toplamı (GC tarafı güçlü)
+        let t = self.value
+        for c in self.children:
+            t = t + c.total()
+        return t
+
+fn sum(xs: list) -> int:
+    let s = 0
+    for x in xs:
+        s = s + x
+    return s
+
+fn main():
+    # 1. Canlı ağaç: normal GC referansları
+    let root = TreeNode(10, "root")
+    let left = TreeNode(20, "L")
+    let right = TreeNode(30, "R")
+    root.add_child(left)
+    root.add_child(right)
+    print(str(root.total()))                       # 60
+
+    # 2. Snapshot: yaprak DEĞERLERI @own'a derin kopya — canlı ağaç
+    #    sonradan değişse de snapshot ETKİLENMEZ.
+    @own let snapshot = to_own([left.value, right.value])
+
+    # 3. Kanıt: canlıya yeni dal ekle — snapshot sızıntısız
+    root.add_child(TreeNode(40, "post-snapshot"))
+    let probe = 0
+    if true:
+        let sv = &snapshot                         # paylaşımlı borç
+        probe = sv[1]                              # borç üzerinden okuma serbest
+    print(str(probe))                              # 30
+
+    # 4. Borç-through yazma: snapshot içeriğini &mut ile düzelt
+    if true:
+        let sw = &mut snapshot
+        sw[0] = 500
+
+    # 5. Devir: to_gc ile snapshot GC tarafına gider; uzunluk/sum GC'de
+    let data = to_gc(snapshot)
+    print(str(len(data)))                          # 2  ← izolasyon kanıtı (canlı 3 eleman)
+    print(str(sum(data)))                          # 530 (500 + 30)
+    print(str(root.total()))                       # 100 (canlı 3 dal)
+
+main()
