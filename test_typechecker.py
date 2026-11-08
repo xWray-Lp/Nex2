@@ -517,6 +517,12 @@ fn main():
         case _ if len(x) > 0 -> print("nope")
 """, expect_errors=["cannot copy @own value 'x'"])
 
+run("Match guard: non-bool guard is compile error", """
+fn main():
+    match 5:
+        case _ if 42 -> print("nope")
+""", expect_errors=["Match guard must be 'bool', got 'int'"])
+
 run("Match guard: guard expression checked (match expr)", """
 fn main():
     let v = match 1:

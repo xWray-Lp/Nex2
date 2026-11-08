@@ -811,10 +811,16 @@ class TypeChecker:
         for arm in node.arms:
             self.push_scope("match:arm")
             pat_t = self._check_pattern(arm.pattern, subject_t, arm)
-            # Guard da bir ifadedir: ayrı ziyaret edilmezse undefined var /
-            # @own sızıntısı / tip hataları checker'dan sessizce geçer.
             if arm.guard is not None:
-                self.visit(arm.guard)
+                # arm.guard önceden hiç visit() edilmiyordu — guard içindeki
+                # her şey (undefined değişken, @own/borrow sızıntısı, tip
+                # hataları) checker'dan tamamen görünmezdi.
+                guard_t = self.visit(arm.guard)
+                self._reject_own_value(guard_t, arm.guard, "match guard")
+                if not isinstance(guard_t, (BoolType, UnknownType)):
+                    self.error(
+                        f"Match guard must be 'bool', got '{guard_t}'",
+                        arm.guard)
             if isinstance(arm.body, Block):
                 self.visit_Block(arm.body)
             else:
@@ -1541,9 +1547,15 @@ class TypeChecker:
         for arm in node.arms:
             self.push_scope("match:arm")
             self._check_pattern(arm.pattern, subject_t, arm)
-            # Guard da bir ifadedir (visit_MatchStmt'teki delikle aynı sınıf).
             if arm.guard is not None:
-                self.visit(arm.guard)
+                # bkz. visit_MatchStmt — aynı eksiklik (guard hiç visit()
+                # edilmiyordu), MatchExpr'de bağımsız bir kopya olarak vardı.
+                guard_t = self.visit(arm.guard)
+                self._reject_own_value(guard_t, arm.guard, "match guard")
+                if not isinstance(guard_t, (BoolType, UnknownType)):
+                    self.error(
+                        f"Match guard must be 'bool', got '{guard_t}'",
+                        arm.guard)
             bt = self.visit(arm.body)
             result_types.append(bt)
             self.pop_scope()
