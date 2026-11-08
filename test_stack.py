@@ -448,6 +448,22 @@ fn main():
 main()
 """, ["null"])
 
+expect_output("Forward class reference: runtime matches --check", """
+fn main():
+    let d = Dog()
+    print(d.speak())
+
+class Dog:
+    name: str
+
+    fn init():
+        self.name = "Rex"
+
+    fn speak() -> str:
+        return "Woof!"
+main()
+""", ["Woof!"])
+
 
 # ─── Sonuç ────────────────────────────────────────────────────────
 

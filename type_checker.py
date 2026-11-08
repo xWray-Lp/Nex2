@@ -273,6 +273,18 @@ class TypeChecker:
             elif isinstance(stmt, ClassDecl):
                 ct = ClassType(stmt.name, type_params=stmt.type_params)
                 self.type_registry[stmt.name] = ct
+                # Forward-reference uyumu: field ve method imzalarını ön-geçişte
+                # de kaydet ki sınıf tanımından ÖNCE kullanım --check'i geçsin.
+                # visit_ClassDecl sonradan aynı değerleri tekrar doldurur
+                # (idempotent); interface listesi ise tek geçişte eklenir.
+                if stmt.base:
+                    bt = self.type_registry.get(stmt.base)
+                    if bt is not None:
+                        ct.base = bt
+                for f in stmt.fields:
+                    ct.fields[f.name] = self.resolve_type_node(f.type_ann)
+                for m in stmt.methods:
+                    ct.methods[m.name] = self._fn_signature(m)
                 self.current_scope.define(stmt.name, ct)
             elif isinstance(stmt, InterfaceDecl):
                 it = InterfaceType(stmt.name)

@@ -393,9 +393,21 @@ class Function:
         """Fonksiyonu çalıştır."""
         func_env = Environment(self.closure, f"fn:{self.name}")
 
+        # Constructor (init.call(self, [self_val] + args)) ve bound method
+        # (BoundMethod.call) argümanların başına instance'ı ekler; decl
+        # parametrelerinde 'self' tanımlı olmadığından burada örtük bağlanır.
+        # Checker arg sayısı uyuşmazlığını zaten reddettiği için +1 şekli
+        # yalnızca instance-binding durumunda oluşabilir (ilk arg bir
+        # NexInstance değilse normal fonksiyon gibi davran).
+        call_args = args
+        if (len(args) == len(self.decl.params) + 1
+                and isinstance(args[0], NexInstance)):
+            func_env.define("self", args[0])
+            call_args = args[1:]
+
         for i, param in enumerate(self.decl.params):
-            if i < len(args):
-                func_env.define(param.name, args[i])
+            if i < len(call_args):
+                func_env.define(param.name, call_args[i])
             elif param.default is not None:
                 dval = interpreter.evaluate(param.default)
                 # Default değer de kaçış bağlamıdır: stack dizisi referanssız kopyalanır
@@ -663,8 +675,25 @@ class Interpreter:
 
     # ── İfadeler ────────────────────────────────────────────────────────────────
 
+    def _env_get(self, name: str, node: Node) -> Any:
+        """env.get + node'suz StackPanic'e konum ekle (satır 0:0 olmasın)."""
+        try:
+            return self.current_env.get(name)
+        except StackPanic as e:
+            if e.node is None:
+                raise StackPanic(str(e), node) from e
+            raise
+
+    def _env_set(self, name: str, value: Any, node: Node) -> None:
+        try:
+            self.current_env.set(name, value)
+        except StackPanic as e:
+            if e.node is None:
+                raise StackPanic(str(e), node) from e
+            raise
+
     def eval_Ident(self, node: Ident) -> Any:
-        v = self.current_env.get(node.name)
+        v = self._env_get(node.name, node)
         if isinstance(v, StackArray):
             v._check()
         return v
@@ -932,8 +961,16 @@ class Interpreter:
         return None
 
     def eval_Program(self, node: Program) -> Any:
+        # Checker'daki _pre_declare ile tutarlılık: üst-düzey sınıflar önce
+        # tanımlanır. Böylece tanımdan önce kullanım (forward reference) hem
+        # --check'te hem runtime'da aynı sonucu verir.
+        for stmt in node.stmts:
+            if isinstance(stmt, ClassDecl):
+                self.evaluate(stmt)
         result = None
         for stmt in node.stmts:
+            if isinstance(stmt, ClassDecl):
+                continue  # zaten tanımlandı
             result = self.evaluate(stmt)
         return result
 
@@ -946,7 +983,7 @@ class Interpreter:
             if op == "ASSIGN":
                 cur = None
                 try:
-                    cur = self.current_env.get(name)
+                    cur = self._env_get(name, node)
                 except (NameError, RuntimeError):
                     cur = None
                 if isinstance(cur, StackArray):
@@ -973,9 +1010,9 @@ class Interpreter:
                 if isinstance(value, StackArray):
                     # GC bağlamına kaçış heap kopyasıdır; stack ömrü devretmez.
                     value = value.to_list()
-                self.current_env.set(name, value)
+                self._env_set(name, value, node)
             else:
-                current = self.current_env.get(name)
+                current = self._env_get(name, node)
                 if op == "PLUS_EQ":
                     value = current + value
                 elif op == "MINUS_EQ":
@@ -984,7 +1021,7 @@ class Interpreter:
                     value = current * value
                 elif op == "SLASH_EQ":
                     value = current / value
-                self.current_env.set(name, value)
+                self._env_set(name, value, node)
             return value
         elif isinstance(node.target, IndexExpr):
             obj = self.evaluate(node.target.obj)
@@ -1108,12 +1145,12 @@ class Interpreter:
                     klass = base_cls
                 else:
                     break
-            self.error(f"'{{obj.klass.name}}' has no attribute '{{attr}}'", node)
+            self.error(f"'{obj.klass.name}' has no attribute '{attr}'", node)
 
         if isinstance(obj, dict):
             if attr in obj:
                 return obj[attr]
-            self.error(f"Key '{{attr}}' not found in dict", node)
+            self.error(f"Key '{attr}' not found in dict", node)
 
         if isinstance(obj, StackArray):
             obj._check()
@@ -1170,7 +1207,7 @@ class Interpreter:
             }
             if attr in props:
                 return props[attr]
-            self.error(f"List has no attribute '{{attr}}'", node)
+            self.error(f"List has no attribute '{attr}'", node)
 
         if isinstance(obj, str):
             _obj = obj
@@ -1200,10 +1237,10 @@ class Interpreter:
                 return BuiltinFunction("find", lambda s, o=_obj: o.find(s), 1)
             if attr in ("length", "len"):
                 return len(obj)
-            self.error(f"String has no attribute '{{attr}}'", node)
+            self.error(f"String has no attribute '{attr}'", node)
 
         self.error(
-            f"Cannot access attribute '{{attr}}' on {{type(obj).__name__}}", node
+            f"Cannot access attribute '{attr}' on {type(obj).__name__}", node
         )
 
     def eval_NullCoalExpr(self, node: NullCoalExpr) -> Any:
