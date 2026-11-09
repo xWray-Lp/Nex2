@@ -198,6 +198,9 @@ bytecode VM'e geçilince gerçek bir CFG/lifetime analizine genişletilebilir
    adres/aliasing VM dönemi işi).
 6. **(Bytecode VM sonrası)** Katman 1'i gerçek CFG/lifetime analizine
    genişlet — fonksiyonlar arası, döngü/dal duyarlı borrow checker.
+   **VM iskeleti:** barınma, GC yönü, bytecode şekli ve borrow/NLL
+   yerleşimi `NEX_VM_DESIGN.md` içinde; bu madde orada compiler-side
+   liveness olarak konumlanır (yeni VM opcode'u gerektirmez).
 
 Sıralamanın mantığı: önce en hızlı geri bildirim veren (runtime), sonra
 onu destekleyen statik katman, sonra geçiş fonksiyonları, en son (VM

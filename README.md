@@ -10,6 +10,8 @@ kontrolüne kaçış kapısı bırakmayı hedefleyen, sıfırdan Python ile
 geliştirilen bir programlama dili.
 
 Bu proje aktif geliştirme aşamasında, "proof of concept" niteliğinde.
+Mimari notlar: [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) (bellek modeli),
+[`NEX_VM_DESIGN.md`](./NEX_VM_DESIGN.md) (bytecode VM iskeleti).
 
 ## Hızlı örnek
 
