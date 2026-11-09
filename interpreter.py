@@ -290,7 +290,7 @@ class Environment:
 
 # Saf/yapısal builtin'ler: referansı saklamazlar, çağrı süresince okurlar.
 # type_checker.PURE_BORROW_BUILTINS ile aynı liste olmalı (§4 v1 allowlist).
-PURE_BORROW_BUILTINS: frozenset[str] = frozenset({"len", "keys", "values"})
+PURE_BORROW_BUILTINS: frozenset[str] = frozenset({"len", "length", "keys", "values"})
 
 
 class BuiltinFunction:
@@ -447,6 +447,9 @@ def builtin_keys(d):
     if isinstance(d, BorrowRef):
         d._check()
         d = d.own._value
+    if not isinstance(d, dict):
+        raise TypeError(
+            f"keys() expects a dict, got '{type(d).__name__}'")
     return list(d.keys())
 
 
@@ -455,6 +458,9 @@ def builtin_values(d):
     if isinstance(d, BorrowRef):
         d._check()
         d = d.own._value
+    if not isinstance(d, dict):
+        raise TypeError(
+            f"values() expects a dict, got '{type(d).__name__}'")
     return list(d.values())
 
 
@@ -652,6 +658,7 @@ class Interpreter:
             "print": BuiltinFunction("print", builtin_print, -1),
             "println": BuiltinFunction("println", builtin_println, -1),
             "len": BuiltinFunction("len", builtin_len, 1),
+            "length": BuiltinFunction("length", builtin_len, 1),
             "type": BuiltinFunction("type", builtin_type, 1),
             "range": BuiltinFunction("range", builtin_range, -1),
             "input": BuiltinFunction("input", builtin_input, -1),
@@ -1151,6 +1158,16 @@ class Interpreter:
                 self.error(f"Base class '{base_name}' not found", node)
                 return None
             args = [self.evaluate(a) for a in node.args]
+            for i, av in enumerate(args):
+                at = node.args[i] if i < len(node.args) else node
+                if isinstance(av, BorrowRef):
+                    self.error(
+                        "borrowed references cannot cross function boundaries yet (v1)",
+                        at)
+                if isinstance(av, OwnValue) and av.alive:
+                    self.error(
+                        f"cannot pass @own value as argument {i + 1}; "
+                        f"move it with to_gc(x) first", at)
             init = next(
                 (
                     Function(m, self.current_env)
@@ -1186,8 +1203,28 @@ class Interpreter:
                     self.error(
                         f"cannot pass @own value as argument {i + 1}; "
                         f"move it with to_gc(x) first", at)
-            return callee(*args)
+            try:
+                return callee(*args)
+            except NexRuntimeError:
+                raise
+            except TypeError as e:
+                # Builtin içi tip hatası "Internal Error"a düşmesin:
+                # çağrı konumuyla birlikte normal runtime hatası olarak bas.
+                self.error(str(e), node)
         elif hasattr(callee, "call"):
+            # Kullanıcı fonksiyonu / bound method / constructor: checker
+            # sınır kuralını uygular, burada runtime güvenlik ağı. Builtin
+            # allowlist'i burada GEÇERSİZ — isim gölgelense bile sınır korunur.
+            for i, av in enumerate(args):
+                at = node.args[i] if i < len(node.args) else node
+                if isinstance(av, BorrowRef):
+                    self.error(
+                        "borrowed references cannot cross function boundaries yet (v1)",
+                        at)
+                if isinstance(av, OwnValue) and av.alive:
+                    self.error(
+                        f"cannot pass @own value as argument {i + 1}; "
+                        f"move it with to_gc(x) first", at)
             return callee.call(self, args)
         elif callable(callee):
             return callee(*args)

@@ -582,6 +582,16 @@ fn main():
     print(str(len(values(r))))
 """, expect_clean=True)
 
+run("allowlist does not survive shadowing (user fn len)", """
+fn len(x: [int]) -> int:
+    return 99
+
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    print(str(len(r)))
+""", expect_errors=["borrowed references cannot cross function boundaries"])
+
 run("return borrow expr", """
 fn leak() -> [int]:
     @own let p = to_own([1, 2])
@@ -633,6 +643,30 @@ fn main():
     print(str(r))
 main()
 """, "borrowed references cannot cross function boundaries")
+
+expect_runtime_output("len(&expr) — direct BorrowExpr argument", """
+fn main():
+    @own let xs = to_own([1, 2, 3])
+    print(str(len(&xs)))
+main()
+""", ["3"])
+
+expect_runtime_error("shadowed fn len still rejects borrow at runtime", """
+fn len(x: list) -> int:
+    return 99
+
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    print(str(len(r)))
+main()
+""", "cannot cross function boundaries")
+
+expect_runtime_error("keys() on non-dict gives a positioned error", """
+fn main():
+    print(str(keys([1, 2])))
+main()
+""", "keys() expects a dict")
 
 expect_runtime_error("mut borrow after shared conflicts", """
 fn main():

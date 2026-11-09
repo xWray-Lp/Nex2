@@ -36,7 +36,7 @@ class TypeDiag:
 #
 # DİKKAT: yeni bir isim eklemek için hem checker'da FnType kaydı hem runtime'da
 # BorrowRef çözümü gerekir; aksi halde izin sessizce etkisiz kalır.
-PURE_BORROW_BUILTINS: frozenset[str] = frozenset({"len", "keys", "values"})
+PURE_BORROW_BUILTINS: frozenset[str] = frozenset({"len", "length", "keys", "values"})
 
 
 # ─── Sembol Tablosu ───────────────────────────────────────────────────────────
@@ -198,6 +198,10 @@ class TypeChecker:
         }
         for name, typ in builtins.items():
             self.global_scope.define(name, typ)
+        # Builtin kimliği: allowlist yalnızca GERÇEKTEN builtin'e çözülen
+        # çağrılarda geçerli. Kullanıcı `fn len(...)` ile gölgelerse lookup
+        # farklı bir nesne döner ve istisna uygulanmaz (referans sızdırmasın).
+        self._builtin_types: dict[str, NexType] = dict(builtins)
 
     # ── Scope yönetimi ────────────────────────────────────────────
 
@@ -1309,14 +1313,24 @@ class TypeChecker:
                 return self._check_free(node)
         # Saf/yapısal builtin'ler referansı saklamaz → &arg serbest (§4 v1).
         # Kullanıcı fonksiyonları ve diğer builtin'ler için sınır kuralı aynen.
+        # ÖNEMLİ: isim eşleşmesi yeterli değil — kullanıcı `fn len(...)` ile
+        # builtin'i gölgelerse çağrı kullanıcı fonksiyonudur ve referans
+        # sızdırabilir. Bu yüzden lookup'ın GERÇEK builtin nesnesine çözülmesi
+        # şart (kimlik karşılaştırması).
+        callee_name = node.callee.name if isinstance(node.callee, Ident) else None
+        builtin_type = (self._builtin_types.get(callee_name)
+                        if callee_name is not None else None)
         pure_builtin = (
-            isinstance(node.callee, Ident)
-            and node.callee.name in PURE_BORROW_BUILTINS
+            builtin_type is not None
+            and callee_name in PURE_BORROW_BUILTINS
+            and self.current_scope.lookup(callee_name) is builtin_type
         )
         # Borrow ifadeleri fonksiyon sınırını geçemez (v1, §4).
+        reported_borrow: set[int] = set()
         if not pure_builtin:
             for i, arg in enumerate(node.args):
                 if isinstance(arg, BorrowExpr):
+                    reported_borrow.add(id(arg))
                     self.error(
                         "borrowed references cannot cross function boundaries yet (v1)",
                         arg)
@@ -1369,7 +1383,7 @@ class TypeChecker:
                     if pure_builtin:
                         # Saf builtin referansı saklamaz; iç değeri denetle.
                         arg_t = arg_t.inner
-                    else:
+                    elif id(arg) not in reported_borrow:
                         self.error(
                             "borrowed references cannot cross function boundaries yet (v1)",
                             arg)
