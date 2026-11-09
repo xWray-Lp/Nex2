@@ -729,7 +729,7 @@ class Parser:
         while True:
             tok = self.peek()
             prec, assoc = self._get_infix_prec(tok.type)
-            if prec <= min_prec:
+            if prec == 0 or prec < min_prec:
                 break
 
             # Assignment operatörleri
