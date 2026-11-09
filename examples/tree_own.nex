@@ -7,9 +7,9 @@
 # snapshot'a hiçbir paylaşımlı referans tutan yoktur, borçlanarak
 # okunur/yazılır, iş bitince to_gc ile GC'ye bırakılır.
 #
-# v1 sınırları (bilinçli): sahiplik fonksiyon sınırından geçemez;
-# borç üzerinden BUILTIN çağrısı da yapılamaz (len(&x) yasak) —
-# uzunluk, devir sonrası GC tarafında ölçülür.
+# v1 sınırları (bilinçli): sahiplik fonksiyon sınırından geçemez.
+# Borç da kullanıcı fonksiyonlarına geçemez; ancak saf/yapısal builtin'ler
+# (len/keys/values) referansı saklamadığı için `len(&x)` serbesttir.
 # ═══════════════════════════════════════════════════════════════
 
 class TreeNode:
@@ -54,10 +54,13 @@ fn main():
     # 3. Kanıt: canlıya yeni dal ekle — snapshot sızıntısız
     root.add_child(TreeNode(40, "post-snapshot"))
     let probe = 0
+    let snapshot_len = 0
     if true:
         let sv = &snapshot                         # paylaşımlı borç
         probe = sv[1]                              # borç üzerinden okuma serbest
+        snapshot_len = len(sv)                     # saf builtin: &arg serbest
     print(str(probe))                              # 30
+    print(str(snapshot_len))                       # 2 (canlı 3 eleman)
 
     # 4. Borç-through yazma: snapshot içeriğini &mut ile düzelt
     if true:

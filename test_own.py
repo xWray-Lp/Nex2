@@ -567,6 +567,21 @@ fn main():
     take(&p)
 """, expect_errors=["borrowed references cannot cross function boundaries"])
 
+run("len(&own) allowed — pure builtin allowlist", """
+fn main():
+    @own let p = to_own([1, 2])
+    let r = &p
+    print(str(len(r)))
+""", expect_clean=True)
+
+run("keys(&own) / values(&own) allowed — pure builtin allowlist", """
+fn main():
+    @own let d = to_own({"a": 1, "b": 2})
+    let r = &d
+    print(str(len(keys(r))))
+    print(str(len(values(r))))
+""", expect_clean=True)
+
 run("return borrow expr", """
 fn leak() -> [int]:
     @own let p = to_own([1, 2])
@@ -593,6 +608,31 @@ fn main():
     print(str(b[0]))
 main()
 """, ["1", "1"])
+
+expect_runtime_output("pure builtin len accepts borrow", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    print(str(len(r)))
+main()
+""", ["2"])
+
+expect_runtime_output("pure builtins keys/values accept borrow (dict)", """
+fn main():
+    @own let d = to_own({"a": 1, "b": 2})
+    let r = &d
+    print(str(len(keys(r))))
+    print(str(len(values(r))))
+main()
+""", ["2", "2"])
+
+expect_runtime_error("non-pure builtin str still rejects borrow arg", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    print(str(r))
+main()
+""", "borrowed references cannot cross function boundaries")
 
 expect_runtime_error("mut borrow after shared conflicts", """
 fn main():
@@ -638,6 +678,22 @@ fn main():
     let g = to_gc(xs)
 main()
 """, "cannot move/free")
+
+
+# ─── 13 · Allowlist tutarlılığı ───────────────────────────────────
+
+section("13 · PURE_BORROW_BUILTINS checker/runtime senkronu")
+
+from type_checker import PURE_BORROW_BUILTINS as CHECKER_PURE
+from interpreter import PURE_BORROW_BUILTINS as RUNTIME_PURE
+
+if CHECKER_PURE == RUNTIME_PURE:
+    print(f"  {GREEN}✓ Both sides agree: {sorted(CHECKER_PURE)}{RESET}")
+    passed += 1
+else:
+    print(f"  {RED}✗ Drift: checker={sorted(CHECKER_PURE)} "
+          f"runtime={sorted(RUNTIME_PURE)}{RESET}")
+    failed += 1
 
 
 # ─── Sonuç ────────────────────────────────────────────────────────

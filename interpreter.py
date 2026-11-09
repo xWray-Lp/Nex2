@@ -288,6 +288,11 @@ class Environment:
 # ─── Built-in Fonksiyonlar ───────────────────────────────────────────────────────
 
 
+# Saf/yapısal builtin'ler: referansı saklamazlar, çağrı süresince okurlar.
+# type_checker.PURE_BORROW_BUILTINS ile aynı liste olmalı (§4 v1 allowlist).
+PURE_BORROW_BUILTINS: frozenset[str] = frozenset({"len", "keys", "values"})
+
+
 class BuiltinFunction:
     """Built-in fonksiyon wrapper'ı."""
 
@@ -316,11 +321,16 @@ def builtin_print(*args):
 
 def builtin_len(obj):
     """len built-in fonksiyonu."""
+    if isinstance(obj, BorrowRef):
+        # Saf builtin: referansı saklamaz, çağrı süresince çözer (§4 v1
+        # allowlist). `len(&x)` bu yüzden fonksiyon sınırı sayılmaz.
+        obj._check()
+        obj = obj.own._value
     if isinstance(obj, StackArray):
         return len(obj)
-    if isinstance(obj, (list, str)):
+    if isinstance(obj, (list, str, dict)):
         return len(obj)
-    raise TypeError(f"len() expects a list or string, got {type(obj).__name__}")
+    raise TypeError(f"len() expects a list, dict or string, got {type(obj).__name__}")
 
 
 def builtin_type(obj):
@@ -434,11 +444,17 @@ def builtin_pop(lst):
 
 def builtin_keys(d):
     """dict.keys() built-in."""
+    if isinstance(d, BorrowRef):
+        d._check()
+        d = d.own._value
     return list(d.keys())
 
 
 def builtin_values(d):
     """dict.values() built-in."""
+    if isinstance(d, BorrowRef):
+        d._check()
+        d = d.own._value
     return list(d.values())
 
 
@@ -1157,8 +1173,10 @@ class Interpreter:
             # Wrapper temizliği: borrow/sahiplik proxy'leri fonksiyon
             # sınırını (builtin dahil) geçemez (§4 v1); konumsuz
             # 'Internal Error' yerine konumlu hata ver.
+            # İstisna: saf builtin'ler referansı saklamaz (allowlist).
+            pure = callee.name in PURE_BORROW_BUILTINS
             for i, av in enumerate(args):
-                if isinstance(av, BorrowRef):
+                if isinstance(av, BorrowRef) and not pure:
                     at = node.args[i] if i < len(node.args) else node
                     self.error(
                         "borrowed references cannot cross function boundaries yet (v1)",

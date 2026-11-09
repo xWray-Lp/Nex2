@@ -101,6 +101,12 @@ kaynakları büyük ölçüde uygulanabilir).
   sonunda otomatik bırakılır (release-before-kill).
 - **v1 sınırı:** Borrow referansı fonksiyon sınırını geçemez; VM sonrası gerçek
   kısmi geçiş (parametre olarak borrow) ertelenmiştir.
+- **v1 istisnası (allowlist):** Saf/yapısal builtin'ler (`len`, `keys`,
+  `values`) referansı yalnız çağrı süresince okur, saklamaz — bu yüzden
+  `len(&x)`, `keys(&d)`, `values(&d)` serbesttir. Liste checker'da
+  `PURE_BORROW_BUILTINS`, runtime'da aynı adlı sabit ile tutulur; iki taraf
+  birlikte güncellenmelidir. Kullanıcı fonksiyonları ve diğer builtin'ler
+  (`str(&x)` gibi) hâlâ sınır kuralına tabidir.
 
 ## 5. Uygulama katmanı: neden runtime + statik ikisi birden
 

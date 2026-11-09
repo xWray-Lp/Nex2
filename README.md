@@ -61,7 +61,9 @@ interpreter'da çalışıyor anlamına gelmez — aşağıdakiler gerçekten
   Ayrıntı: [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) Bölüm 6, madde 0
 - `@own` sahipliği: `@own let p = to_own(x)` (GC'den derin kopya), `to_gc(p)`
   (GC'ye taşıma; sonrasında `p` geçersiz), `free(p)`; `&x` / `&mut x` borrow'ları
-  blok sonunda otomatik bırakılır, çakışmalar runtime'da yakalanır.
+  blok sonunda otomatik bırakılır, çakışmalar runtime'da yakalanır. Borrow
+  kullanıcı fonksiyonlarına geçemez; saf builtin'lerde (`len`, `keys`,
+  `values`) `len(&x)` serbesttir.
   Ayrıntı: [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) Bölüm 2/4/5
 
 ## Henüz gerçek davranışı olmayan (sözdizimi var, semantik yok)

@@ -27,6 +27,18 @@ class TypeDiag:
         return f"  {icon} [{self.kind.upper()}] {loc}{self.line}:{self.col} — {self.message}"
 
 
+# ─── Saf/yapısal builtin izin listesi (§4 v1) ────────────────────────────────
+#
+# v1 kuralı: borrow referansı fonksiyon sınırını geçemez. Ancak bu kural
+# kullanıcı fonksiyonları için vardır: referansı saklayıp ömrünü uzatabilirler.
+# Aşağıdaki builtin'ler referansı yalnız çağrı süresince okur, saklamaz —
+# bu yüzden `len(&x)` / `keys(&d)` / `values(&d)` serbesttir.
+#
+# DİKKAT: yeni bir isim eklemek için hem checker'da FnType kaydı hem runtime'da
+# BorrowRef çözümü gerekir; aksi halde izin sessizce etkisiz kalır.
+PURE_BORROW_BUILTINS: frozenset[str] = frozenset({"len", "keys", "values"})
+
+
 # ─── Sembol Tablosu ───────────────────────────────────────────────────────────
 
 class Scope:
@@ -161,6 +173,11 @@ class TypeChecker:
         # ele alınır; buradaki FnType yalnızca ismin tanımlı olması için.
         to_own_fn = FnType([UNKNOWN], UNKNOWN)
         to_gc_fn  = FnType([UNKNOWN], UNKNOWN)
+        # Runtime'da zaten var olan saf dict builtin'leri (interpreter
+        # builtin tablosu). PURE_BORROW_BUILTINS ile birlikte &d argümanı
+        # serbesttir.
+        keys_fn   = FnType([UNKNOWN], ListType(UNKNOWN))
+        values_fn = FnType([UNKNOWN], ListType(UNKNOWN))
 
         builtins = {
             "print": print_fn, "println": print_fn,
@@ -172,6 +189,7 @@ class TypeChecker:
             "str": str_fn, "int": int_fn,
             "float": float_fn, "bool": bool_fn,
             "alloc": alloc_fn, "free": free_fn, "sizeof": sizeof_fn,
+            "keys": keys_fn, "values": values_fn,
             "to_own": to_own_fn, "to_gc": to_gc_fn,
             # Logical operators - built-in olarak tanımla
             "and": FnType([BOOL, BOOL], BOOL),
@@ -1289,12 +1307,19 @@ class TypeChecker:
                 return self._check_to_gc(node)
             if node.callee.name == "free":
                 return self._check_free(node)
+        # Saf/yapısal builtin'ler referansı saklamaz → &arg serbest (§4 v1).
+        # Kullanıcı fonksiyonları ve diğer builtin'ler için sınır kuralı aynen.
+        pure_builtin = (
+            isinstance(node.callee, Ident)
+            and node.callee.name in PURE_BORROW_BUILTINS
+        )
         # Borrow ifadeleri fonksiyon sınırını geçemez (v1, §4).
-        for i, arg in enumerate(node.args):
-            if isinstance(arg, BorrowExpr):
-                self.error(
-                    "borrowed references cannot cross function boundaries yet (v1)",
-                    arg)
+        if not pure_builtin:
+            for i, arg in enumerate(node.args):
+                if isinstance(arg, BorrowExpr):
+                    self.error(
+                        "borrowed references cannot cross function boundaries yet (v1)",
+                        arg)
         # Metod çağrısı: callee tipini doğrudan kullan — obj'yi tekrar ziyaret
         # etme (eski kod MemberExpr dalında çift ziyarete yol açıyordu).
         if isinstance(node.callee, MemberExpr):
@@ -1341,9 +1366,13 @@ class TypeChecker:
                 arg_t = self.visit(arg)
                 self._reject_own_value(arg_t, arg, f"argument {i+1}")
                 if isinstance(arg_t, RefType):
-                    self.error(
-                        "borrowed references cannot cross function boundaries yet (v1)",
-                        arg)
+                    if pure_builtin:
+                        # Saf builtin referansı saklamaz; iç değeri denetle.
+                        arg_t = arg_t.inner
+                    else:
+                        self.error(
+                            "borrowed references cannot cross function boundaries yet (v1)",
+                            arg)
                 if not isinstance(param_t, UnknownType):
                     self.check_assign(arg_t, param_t, arg,
                                       f"argument {i+1}")
