@@ -1,0 +1,50 @@
+# Nex VM prototipi — desteklenen alt küme (int/print/if/while/fn çağrısı)
+#
+# Çalıştır:  python main.py --vm examples/vm_basics.nex
+# Döküm:     python main.py --disasm examples/vm_basics.nex
+#
+# Not: @own/@stack/@raw, list/dict, sınıf ve match bu prototipte kapsam
+# dışıdır; derleyici bunları sessizce yanlış kodlamak yerine reddeder.
+
+fn fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+fn gcd(a: int, b: int) -> int:
+    while b != 0:
+        let t = b
+        b = a % b
+        a = t
+    return a
+
+fn classify(n: int) -> str:
+    if n < 0:
+        return "negative"
+    elif n == 0:
+        return "zero"
+    else:
+        return "positive"
+
+fn main():
+    print("nex vm basics")
+    print(fib(10))
+    print(gcd(48, 36))
+    print(classify(-7))
+    print(classify(0))
+    print(classify(42))
+
+    let i = 0
+    let total = 0
+    while i < 10:
+        i = i + 1
+        if i % 2 == 0:
+            continue
+        if i > 7:
+            break
+        total = total + i
+    print(total)
+
+    print(len("bytecode") + len("vm"))
+    print("and:" + str((1 < 2) and (2 < 3)))
+    print("or:" + str((1 > 2) or (3 > 2)))

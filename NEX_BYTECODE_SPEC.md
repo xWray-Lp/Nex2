@@ -46,8 +46,8 @@ offset  size  alan
 ```
 
 Tüm `*_off` değerleri modül başına göre **mutlak** bayt ofsetidir.
-Bölümler sırayla yazılır: const pool → func table → native table → code →
-debug.
+Bölümler sırayla yazılır: const pool → func table → native table →
+slot mode tablosu → code → debug.
 
 ---
 
@@ -66,6 +66,8 @@ tag 0x04 FUNC_REF : u32 func_idx
 tag 0x05 NATIVE_REF: u32 native_idx
 tag 0x06 TYPE     : u8 kind + u32 size     // @stack eleman/boyut tanımı
 tag 0x07 NAME     : STR ile aynı; sembol/debug adı (opsiyonel ayrım)
+tag 0x08 BOOL     : u8 (0 = false, 1 = true)
+tag 0x09 NULL     : payload yok
 ```
 
 `TYPE.kind`: `0x01 INT`, `0x02 FLOAT`, `0x03 BYTE`, `0x04 BOOL`, `0x05 PTR`.
@@ -83,7 +85,7 @@ FuncInfo {
   code_off:       u32   // mutlak
   code_len:       u32
   slot_modes_off: u32   // n_locals baytlık mod tablosu (mutlak)
-  line_off:       u32   // debug bölümü içinde
+  line_off:       u32   // mutlak; debug bölümündeki line tablosuna işaret eder
   line_len:       u32
   flags:          u32   // bit0 = async (v1 rezerve), bit1 = entry
 }
@@ -118,6 +120,20 @@ NativeInfo {
 - `len`/`length`/`keys`/`values`: `retains_ref = 0, pure = 1, structural = 1`.
   Checker'daki `PURE_BORROW_BUILTINS` ile **aynı liste** olmak zorunda;
   drift testi (`test_own.py` §13) bunu korur.
+
+**İsim çözümleme / shadowing (derleme zamanı kuralı):** `CALL_NATIVE` ve
+`CALL_PURE_NATIVE` seçimi isim string'iyle **yapılmaz**. Derleyici, `Ident`
+callee'sini kendi sembol tablosunda çözer ve sıra sabittir:
+
+1. kullanıcı fonksiyon tablosu (top-level `FnDecl`'ler / yerel `fn`),
+2. yerleşik (native) tablo.
+
+Yani `fn len(...)` tanımlıysa `len(...)` çağrısı **`CALL`** üretir; saf
+native istisnası hiç devreye girmez. Ters yönde, native tabloda olmayan bir
+isim `CALL_PURE_NATIVE` ile kodlanamaz (derleyici hedefi bulamaz). Bu,
+checker'daki kimlik karşılaştırmasının VM karşılığıdır; prototipte
+disassembly üzerinden test edilir (shadowing varsa `CALL`, yoksa
+`CALL_PURE_NATIVE`).
 
 ---
 
@@ -158,7 +174,10 @@ Gösterim: `AD ` = operand, `(a b -- c)` = operand stack etkisi.
 | 0x1E | `NOT` | `(a -- bool)` |
 
 `and`/`or` kısa devre gerektirdiği için **opcode değildir**; `JUMP_IF_*`
-ile derlenir.
+ile derlenir. Not: mevcut tree-walker `and`/`or`'u Python semantiğiyle
+*eager* değerlendirir (sağ taraf her zaman çalışır, sonuç operandlardan
+biridir). Prototip bu davranışı korumak için geçici slot + `JUMP_IF_*`
+kullanır; dil ileride gerçek kısa devreye geçerse yalnız derleyici değişir.
 
 ### 6.3 Kontrol akışı
 
@@ -173,10 +192,10 @@ ile derlenir.
 
 | Hex | Mnemonic | Operandlar | Etki | Not |
 |---|---|---|---|---|
-| 0x28 | `CALL` | `u32 fi` | `(args -- ret)` | arity `FuncInfo`'dan |
-| 0x29 | `CALL_NATIVE` | `u32 ni` | `(args -- ret)` | `retains_ref` olabilir |
-| 0x2A | `CALL_PURE_NATIVE` | `u32 ni` | `(args -- ret)` | hedef `pure=1` olmalı |
-| 0x2B | `RET` | — | `(ret? -- )` | own/borrow temizliği frame'de |
+| 0x28 | `CALL` | `u32 fi, u32 argc` | `(args -- ret)` | `argc == FuncInfo.arity` (verifier) |
+| 0x29 | `CALL_NATIVE` | `u32 ni, u32 argc` | `(args -- ret)` | `retains_ref` olabilir; variadic argc burada |
+| 0x2A | `CALL_PURE_NATIVE` | `u32 ni, u32 argc` | `(args -- ret)` | hedef `pure=1, retains_ref=0` |
+| 0x2B | `RET` | — | `(ret -- )` | çıplak `return` derleyicide `CONST null` üretir |
 
 **Çağrı sınırı kuralı:** `CALL` ve `CALL_NATIVE` argümanlarında OWN/BORROW
 modu varsa runtime hatası (v1: sahiplik/borç fonksiyon sınırını geçemez).
@@ -201,7 +220,7 @@ BORROW modlu bir değer `GET_INDEX`/`GET_MEMBER` operandı olabilir (per-access
 
 | Hex | Mnemonic | Operandlar | Etki | Not |
 |---|---|---|---|---|
-| 0x40 | `OWN_ALLOC` | `u32 si` | `(v -- )` | derin kopya + OWN slot |
+| 0x40 | `OWN_ALLOC` | `u32 si` | `(v -- )` | derin kopya + OWN slot. Not: her `to_own` derin kopyadır; büyük yapılarda maliyetlidir — Faz 2'de "sahipliğe terfi" (move-in) optimizasyonu ayrı tur (bkz. §12). |
 | 0x41 | `OWN_MOVE` | `u32 si` | `( -- v)` | `to_gc`; borrow varsa hata, slot moved |
 | 0x42 | `OWN_FREE` | `u32 si` | `( -- )` | `free`; borrow varsa hata, slot moved |
 | 0x43 | `STACK_ALLOC` | `u32 si, u32 ti, u32 n` | `( -- )` | TYPE const + eleman sayısı |
@@ -250,6 +269,11 @@ Bytecode yüklenirken zorunlu; ihlal = program çalışmaz (runtime'a düşmez).
 Tip doğrulaması v1 verifier'ın kapsamında değil (checker zaten yapıyor);
 verifier mod/yığın/akış güvenliğinden sorumlu.
 
+> **Prototip (v0.1) kapsamı:** 1, 2, 3, 5 ve 7 tam uygulanır. 4 (borrow
+> ömrü / NLL) ve 6 (`BLOCK_*` dengesi) borrow ve blok opcode'ları
+> derlenmeye başlayınca devreye girer; bu opcode'ları taşıyan modüllerde
+> şimdilik yalnız slot modu düzeyinde denetim yapılır.
+
 ---
 
 ## 8. Debug / line tablosu
@@ -284,7 +308,7 @@ karşılaştırması yapabilsin.
 
 ```
 50 01 00 00 00 00 00 00 00   BORROW_SHARED dst=1, src=0
-2A 00 00 00 00               CALL_PURE_NATIVE 0   ; len
+2A 00 00 00 00 01 00 00 00   CALL_PURE_NATIVE ni=0 argc=1   ; len
 52 01 00 00 00               BORROW_END 1
 ```
 
@@ -296,18 +320,19 @@ karşılaştırması yapabilsin.
 ## 10. Disassembler biçimi (araç sözleşmesi)
 
 ```
-; fn main  arity=0 locals=3 max_stack=8
-0000  CONST        K0        ; 1
-0005  CONST        K1        ; 2
-0009  ADD
-000A  STORE_LOCAL  0
-000E  CALL_NATIVE  print(0)  ; argc=1
-0012  RET
+; fn main [entry] arity=0 locals=1 max_stack=2
+0000  CONST             K8 ; 1
+0005  CALL_PURE_NATIVE  0 argc=1 ; print
+000E  POP
+000F  CONST             K9 ; null
+0014  RET
 ```
 
+- `; fn` başlığı: ad, `[entry]` işareti (varsa), arity, locals, max_stack.
 - `--disasm` çıktısı deterministik olmalı (test karşılaştırması için).
-- Her satır: `pc`, mnemonic, operand, varsa `;` yorumu (satır numarası,
-  sabit değeri, hedef etiketi).
+- Her satır: `pc`, mnemonic, operand(lar), varsa `;` yorumu (sabit
+  değeri, çağrı hedefinin adı). Satır/kolon bilgisi line tablosunda
+  yaşar; disassembly'yi makine-okunur tutmak için her satıra basılmaz.
 
 ---
 
@@ -329,4 +354,8 @@ karşılaştırması yapabilsin.
 - `BLOCK_EXIT` cleanup kodlaması (bytecode'da mı, frame metadata'da mı) —
   prototipte ölçülüp kararlaştırılacak; semantik aynı.
 - Exception/trap tablosu (v1'de `TRAP` yeterli; `catch` VM dönemi işi).
+- **`to_own` derin kopya maliyeti:** `OWN_ALLOC` v1'de her zaman derin kopya.
+  Faz 2'de "sahipliğe terfi" (GC nesnesini kopyalamadan own'a taşıma) veya
+  move-in optimizasyonu değerlendirilmeli; Faz 1'in amacı semantik doğrulama
+  olduğu için şimdilik bilinçli olarak ertelendi.
 - Register machine eşlemesi — bu ISA'nın üstünde ayrı tur.

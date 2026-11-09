@@ -12,6 +12,9 @@ from lexer import Lexer
 from parser import Parser, ParseError
 from interpreter import Interpreter
 from type_checker import TypeChecker
+from compiler import compile_program, CompileError
+from bytecode import BytecodeError, disassemble, verify_module
+from vm import VMError, run_module
 
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
@@ -22,7 +25,8 @@ CYAN   = "\033[96m"
 DIM    = "\033[2m"
 
 
-def run_source(source: str, filename: str = "<stdin>", check_only: bool = False) -> bool:
+def run_source(source: str, filename: str = "<stdin>", check_only: bool = False,
+               backend: str = "tree", disasm: bool = False) -> bool:
     """Kaynak kodu çalıştır. Hata varsa False döner."""
     try:
         tokens = Lexer(source).tokenize()
@@ -53,12 +57,52 @@ def run_source(source: str, filename: str = "<stdin>", check_only: bool = False)
     if not ok:
         return False
 
+    if backend == "vm":
+        return _run_vm(tree, filename, disasm=disasm)
+
     interp = Interpreter()
     interp.interpret(tree)
     return True
 
 
-def run_file(path: str, check_only: bool = False) -> None:
+def _run_vm(tree, filename: str, disasm: bool = False) -> bool:
+    """AST'yi bytecode'a derleyip VM'de çalıştır (prototip)."""
+    try:
+        module = compile_program(tree, filename)
+    except CompileError as e:
+        print(f"{RED}Compile Error:{RESET} {e}", file=sys.stderr)
+        return False
+
+    try:
+        verify_module(module)
+    except BytecodeError as e:
+        print(f"{RED}Verifier Error:{RESET} {e}", file=sys.stderr)
+        return False
+
+    if disasm:
+        print(f"{DIM}; module {filename} — "
+              f"{len(module.functions)} fn, "
+              f"{len(module.natives)} native{RESET}")
+        print(disassemble(module))
+
+    try:
+        run_module(module)
+    except VMError as e:
+        # Spec §8: hata metni tree-walker ile aynı biçimde olmalı.
+        if e.line:
+            print(f"{RED}Runtime Error at line {e.line}:{e.col} — "
+                  f"{e.message}{RESET}", file=sys.stderr)
+        else:
+            print(f"{RED}Runtime Error:{RESET} {e.message}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"{RED}VM Error:{RESET} {e}", file=sys.stderr)
+        return False
+    return True
+
+
+def run_file(path: str, check_only: bool = False,
+             backend: str = "tree", disasm: bool = False) -> None:
     """Dosyayı oku ve çalıştır."""
     if not os.path.exists(path):
         print(f"{RED}Error:{RESET} File not found: {path}", file=sys.stderr)
@@ -70,7 +114,8 @@ def run_file(path: str, check_only: bool = False) -> None:
     if not source.strip():
         return
 
-    success = run_source(source, path, check_only=check_only)
+    success = run_source(source, path, check_only=check_only,
+                         backend=backend, disasm=disasm)
     if not success and not check_only:
         sys.exit(1)
 
@@ -155,6 +200,8 @@ def main() -> None:
         return
 
     check_only = False
+    backend = "tree"
+    disasm = False
     files = []
 
     i = 0
@@ -162,9 +209,16 @@ def main() -> None:
         arg = args[i]
         if arg in ("--check", "-c"):
             check_only = True
+        elif arg in ("--vm",):
+            backend = "vm"
+        elif arg in ("--disasm",):
+            backend = "vm"
+            disasm = True
         elif arg in ("--help", "-h"):
             print("Usage:")
-            print("  main.py [file.nex]          — dosya çalıştır")
+            print("  main.py [file.nex]          — dosya çalıştır (tree-walker)")
+            print("  main.py --vm [file.nex]     — bytecode derle + VM'de çalıştır")
+            print("  main.py --disasm [file.nex] — --vm + disassembly dökümü")
             print("  main.py                     — REPL başlat")
             print("  main.py --check [file.nex]  — sadece tip kontrolü")
             return
@@ -172,12 +226,16 @@ def main() -> None:
             files.append(arg)
         i += 1
 
+    if check_only and backend == "vm":
+        print(f"{YELLOW}Warning:{RESET} --check ignores --vm/--disasm",
+              file=sys.stderr)
+
     if not files:
         repl()
         return
 
     for path in files:
-        run_file(path, check_only=check_only)
+        run_file(path, check_only=check_only, backend=backend, disasm=disasm)
 
 
 if __name__ == "__main__":
