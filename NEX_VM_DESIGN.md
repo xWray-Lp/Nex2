@@ -244,6 +244,11 @@ backend=vm        main.py --vm program.nex -> stdout, exit, diagnostics
   ikinci backend ile de koşulur (CI matrisi).
 - Bilinen farklar (ör. hata mesajı metni) beyaz listede tutulur; sessiz fark yok.
 - Faz 1'in tamamlanma ölçütü: **tüm süitler VM backend'inde yeşil.**
+- **Fuzz (v0.1 prototip):** 11k+ mutasyonlu decode/verify turunda beklenmeyen
+  exception yok. Execute fuzz'ında iki sınır sınıfı doğrulandı: (a) bozulmuş
+  `CALL` hedefi → çağrı derinliği sınırı (konumlu `VMError`, varsayılan 256);
+  (b) bozulmuş `JUMP` döngüsü → sonlanma verifier'ın garanti edemeyeceği
+  sınıf; güvenilmeyen bytecode için adım bütçesi Faz 2 işi.
 
 ---
 
@@ -267,6 +272,8 @@ ve gerçek evinin Faz 2 olduğunu netleştirir.
    **v0.1 yazıldı:** `NEX_BYTECODE_SPEC.md`.
 2. AST → bytecode derleyici (alt küme: int, print, if/while, fn çağrısı).
 3. VM döngüsü + Frame + host arayüzü (Faz 1).
+   **Durum:** 2-3 v0.1 prototipinde tamam (control-flow alt kümesi);
+   own/stack/borrow opcode'ları 4. adımda.
 4. Mod/borrow opcode'ları + mevcut own/stack süitlerinin parity'si.
 5. Differential harness + CI matrisi.
 6. Ancak bundan sonra: register machine / GC ailesi / Rust port

@@ -32,7 +32,7 @@ from bytecode import (
     NAT_PURE, NAT_RETAINS_REF, TAG_FUNC_REF, TAG_NATIVE_REF,
     encode_module, decode_module, decode_code, disassemble, verify_module,
 )
-from vm import VMError, run_module
+from vm import VM, VMError, run_module
 
 GREEN  = "\033[92m"
 RED    = "\033[91m"
@@ -534,6 +534,47 @@ fn main():
 """, "not a callable")
 
 
+def test_call_depth():
+    section("Çağrı derinliği sınırı")
+    deep = """
+fn down(n: int) -> int:
+    if n == 0:
+        return 0
+    return down(n - 1)
+
+fn main():
+    print(down(%d))
+"""
+    expect_vm_error("derin özyineleme çıplak RecursionError değil VMError verir",
+                    deep % 5000, "call depth limit")
+
+    expect_output("makul derinlik sınırın altında çalışır", deep % 100, ["0"])
+
+    module = compile_source(deep % 10)
+    try:
+        run_module(module, max_call_depth=3)
+    except VMError as e:
+        check("max_call_depth yapılandırılabilir", 
+              "call depth limit" in str(e) and e.line > 0,
+              f"line={e.line} msg={e}")
+    except Exception as e:  # noqa: BLE001
+        check("max_call_depth yapılandırılabilir", False,
+              f"wrong error {type(e).__name__}: {e}")
+    else:
+        check("max_call_depth yapılandırılabilir", False,
+              "expected VMError, got success")
+
+    try:
+        VM(module, max_call_depth=0)
+    except ValueError:
+        check("max_call_depth=0 reddedilir", True)
+    except Exception as e:  # noqa: BLE001
+        check("max_call_depth=0 reddedilir", False,
+              f"wrong error {type(e).__name__}: {e}")
+    else:
+        check("max_call_depth=0 reddedilir", False, "accepted invalid limit")
+
+
 def test_and_or():
     section("and / or — eager semantik")
     expect_parity("and truthy → sağ operand", """
@@ -1016,6 +1057,7 @@ def main() -> None:
     test_execution_basics()
     test_control_flow()
     test_functions()
+    test_call_depth()
     test_and_or()
     test_errors()
     test_verifier_negatives()

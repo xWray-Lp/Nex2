@@ -358,4 +358,12 @@ karşılaştırması yapabilsin.
   Faz 2'de "sahipliğe terfi" (GC nesnesini kopyalamadan own'a taşıma) veya
   move-in optimizasyonu değerlendirilmeli; Faz 1'in amacı semantik doğrulama
   olduğu için şimdilik bilinçli olarak ertelendi.
+- **Yürütme bütçeleri:** VM çağrı derinliğini sınırlar (varsayılan 256;
+  aşımda konumlu `VMError`). Verifier sonlanmayı garanti edemez; dışarıdan
+  gelen güvenilmeyen bytecode için adım (instruction) bütçesi Faz 2'ye
+  ertelendi.
+- **`**` (STARSTAR): lexer/parser önceliği ve sağdan birleşmesi doğru,
+  ancak ne tree-walker runtime'ında ne de VM opcode tablosunda karşılığı
+  var. Operatörün semantiği (int/float, negatif taban önceliği) v0.2'de
+  kararlaştırılıp eklenecek.
 - Register machine eşlemesi — bu ISA'nın üstünde ayrı tur.

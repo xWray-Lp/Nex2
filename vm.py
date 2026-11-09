@@ -12,7 +12,7 @@ nesneleridir (int/float/str/bool/None) — Faz 1'in "host GC" kararı gereği.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from bytecode import FunctionCode, Instr, Module, decode_code, verify_module
 
@@ -70,11 +70,21 @@ class _Frame:
 
 
 class VM:
-    def __init__(self, module: Module):
+    #: Prototip için varsayılan çağrı derinliği sınırı. Host Python'un
+    #: özyineleme limitinden (~496 Nex frame) güvenli pay bırakır; aşılırsa
+    #: çıplak RecursionError yerine konumlu VMError üretilir.
+    MAX_CALL_DEPTH = 256
+
+    def __init__(self, module: Module, max_call_depth: Optional[int] = None):
         # Spec §7: verifier yükleme anında zorunlu; doğrudan `run_module`
         # çağıranlar da doğrulanmamış bytecode çalıştıramaz.
         verify_module(module)
         self.module = module
+        self.max_call_depth = (self.MAX_CALL_DEPTH if max_call_depth is None
+                               else max_call_depth)
+        if self.max_call_depth < 1:
+            raise ValueError("max_call_depth must be >= 1")
+        self._depth = 0
         self._decoded: list[list[Instr]] = []
         self._pc_maps: list[dict[int, int]] = []
         for fn in module.functions:
@@ -86,10 +96,20 @@ class VM:
     def run(self) -> Any:
         if self.module.entry is None:
             raise VMError("module has no entry function")
-        return self.call(self.module.entry, [])
+        try:
+            return self.call(self.module.entry, [])
+        except RecursionError:
+            # Ortamın host recursion limiti VM sınırından düşükse son savunma:
+            # çıplak RecursionError VMError'a çevrilir.
+            raise VMError(
+                f"call depth limit exceeded ({self.max_call_depth})") from None
 
     def call(self, fi: int, args: list[Any]) -> Any:
         fn = self.module.functions[fi]
+        if self._depth >= self.max_call_depth:
+            raise VMError(
+                f"call depth limit exceeded ({self.max_call_depth}) "
+                f"in function '{fn.name}'")
         if len(args) != fn.arity:
             raise VMError(
                 f"function '{fn.name}' expects {fn.arity} args, got {len(args)}")
@@ -100,7 +120,11 @@ class VM:
             fn=fn, slots=slots, stack=[],
             pc=0, decoded=self._decoded[fi], pc_to_index=self._pc_maps[fi],
         )
-        return self._execute(frame)
+        self._depth += 1
+        try:
+            return self._execute(frame)
+        finally:
+            self._depth -= 1
 
     # -- ana döngü -----------------------------------------------------------
     def _execute(self, fr: _Frame) -> Any:
@@ -159,6 +183,10 @@ class VM:
                 call_args = [st.pop() for _ in range(argc)]
                 call_args.reverse()
                 if name == "CALL":
+                    if self._depth >= self.max_call_depth:
+                        raise VMError(
+                            f"call depth limit exceeded "
+                            f"({self.max_call_depth})", *fr.fn.line_of(ins.pc))
                     result = self.call(a[0], call_args)
                 else:
                     result = self._native_call(a[0], call_args, fr, ins)
@@ -245,5 +273,5 @@ class VM:
         return True
 
 
-def run_module(module: Module) -> Any:
-    return VM(module).run()
+def run_module(module: Module, max_call_depth: Optional[int] = None) -> Any:
+    return VM(module, max_call_depth=max_call_depth).run()
