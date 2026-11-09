@@ -11,7 +11,8 @@ geliştirilen bir programlama dili.
 
 Bu proje aktif geliştirme aşamasında, "proof of concept" niteliğinde.
 Mimari notlar: [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) (bellek modeli),
-[`NEX_VM_DESIGN.md`](./NEX_VM_DESIGN.md) (bytecode VM iskeleti).
+[`NEX_VM_DESIGN.md`](./NEX_VM_DESIGN.md) (bytecode VM iskeleti),
+[`NEX_BYTECODE_SPEC.md`](./NEX_BYTECODE_SPEC.md) (opcode/encoding sözleşmesi).
 
 ## Hızlı örnek
 

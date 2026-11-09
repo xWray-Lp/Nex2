@@ -205,6 +205,10 @@ FuncInfo { name_idx, arity, n_locals, max_stack, code_off, code_len,
 **Encoding:** 1 bayt opcode + sabit genişlikte `u32` operand (v1'de basitlik;
 ileride varint/compact encoding ayrı optimizasyon). Tüm operandlar little-endian.
 
+> Ayrıntılı sözleşme (modül yerleşimi, sabit havuzu, tam opcode tablosu,
+> verifier kuralları, line tablosu, örnek encoding ve disassembler biçimi):
+> [`NEX_BYTECODE_SPEC.md`](./NEX_BYTECODE_SPEC.md).
+
 **Opcode grupları (v1 çekirdeği):**
 
 | Grup | Örnekler |
@@ -260,6 +264,7 @@ ve gerçek evinin Faz 2 olduğunu netleştirir.
 ## 10. Uygulama sırası (iskelet sonrası)
 
 1. Bu belgeyi opcode tablosu + encoding detayına genişlet (spec).
+   **v0.1 yazıldı:** `NEX_BYTECODE_SPEC.md`.
 2. AST → bytecode derleyici (alt küme: int, print, if/while, fn çağrısı).
 3. VM döngüsü + Frame + host arayüzü (Faz 1).
 4. Mod/borrow opcode'ları + mevcut own/stack süitlerinin parity'si.
