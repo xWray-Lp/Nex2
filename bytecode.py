@@ -109,6 +109,23 @@ TAG_INT, TAG_FLOAT, TAG_STR = 0x01, 0x02, 0x03
 TAG_FUNC_REF, TAG_NATIVE_REF, TAG_TYPE = 0x04, 0x05, 0x06
 TAG_NAME, TAG_BOOL, TAG_NULL = 0x07, 0x08, 0x09
 
+# TYPE sabiti kind kodları (spec §3)
+TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE = 0x01, 0x02, 0x03
+TYPE_KIND_BOOL, TYPE_KIND_PTR = 0x04, 0x05
+TYPE_KIND_NAMES = {
+    TYPE_KIND_INT: "int",
+    TYPE_KIND_FLOAT: "float",
+    TYPE_KIND_BYTE: "byte",
+    TYPE_KIND_BOOL: "bool",
+    TYPE_KIND_PTR: "ptr",
+}
+TYPE_KIND_BY_NAME = {v: k for k, v in TYPE_KIND_NAMES.items()}
+
+#: Prototip sınırı: bozuk/elle yazılmış bytecode'un STACK_ALLOC ile host
+#: belleğini tüketmesini engeller (tree-walker kaynakta aynı sınıra tabi
+#: değil; güvenilmeyen bytecode için adım bütçesiyle birlikte Faz 2 işi).
+MAX_STACK_ELEMS = 1_000_000
+
 
 # ─── Modül modeli ────────────────────────────────────────────────────────────
 
@@ -527,6 +544,11 @@ def _verify_function(m: Module, f: FunctionCode) -> list[str]:
         errs.append("slot mode table size mismatch")
     if f.n_locals < f.arity:
         errs.append("n_locals is smaller than arity")
+    # Parametre slotları argüman bağlamayla kurulur; STACK modu orada
+    # anlamsızdır ve callee çıkışında çağıranın canlı tamponunu öldürürdü.
+    for i in range(min(f.arity, len(f.slot_modes))):
+        if f.slot_modes[i] == MODE_STACK:
+            errs.append(f"parameter slot {i} cannot be STACK")
     if any(m > MODE_TEMP for m in f.slot_modes):
         errs.append("invalid slot mode value")
     if f.max_stack < 1:
@@ -551,6 +573,11 @@ def _verify_function(m: Module, f: FunctionCode) -> list[str]:
         elif ins.name in ("LOAD_LOCAL", "STORE_LOCAL"):
             if a[0] >= f.n_locals:
                 errs.append(f"local slot {a[0]} out of range")
+            elif (ins.name == "STORE_LOCAL" and a[0] < len(f.slot_modes)
+                  and f.slot_modes[a[0]] == MODE_STACK):
+                # STACK slotları yalnız STACK_ALLOC ile kurulur; ham atama
+                # stack değerinin ömrünü/kaçış kuralını bozar.
+                errs.append(f"STORE_LOCAL into STACK slot {a[0]}")
         elif ins.name == "CALL":
             if a[0] >= len(m.functions):
                 errs.append(f"function index {a[0]} out of range")
@@ -592,6 +619,37 @@ def _verify_function(m: Module, f: FunctionCode) -> list[str]:
             elif slot_mode(a[0]) not in (None, MODE_STACK):
                 errs.append(
                     f"STACK_MATERIALIZE on non-STACK slot {a[0]}")
+        if ins.name == "STACK_ALLOC":
+            si, ti, n = a
+            if si >= f.n_locals:
+                errs.append(f"STACK_ALLOC local slot {si} out of range")
+            elif slot_mode(si) not in (None, MODE_STACK):
+                errs.append(f"STACK_ALLOC on non-STACK slot {si}")
+            if ti >= len(m.consts):
+                errs.append(
+                    f"STACK_ALLOC type const index {ti} out of range")
+            elif m.consts[ti][0] != TAG_TYPE:
+                errs.append(
+                    f"STACK_ALLOC const {ti} is not a TYPE constant")
+            else:
+                payload = m.consts[ti][1]
+                if (not isinstance(payload, tuple) or len(payload) != 2
+                        or not all(isinstance(x, int) for x in payload)):
+                    errs.append(
+                        f"STACK_ALLOC const {ti} has malformed TYPE payload")
+                else:
+                    kind, size = payload
+                    if kind not in TYPE_KIND_NAMES:
+                        errs.append(f"STACK_ALLOC type kind {kind} is invalid")
+                    if n < 1:
+                        errs.append("STACK_ALLOC element count must be >= 1")
+                    elif n > MAX_STACK_ELEMS:
+                        errs.append(
+                            f"STACK_ALLOC element count {n} exceeds "
+                            f"limit {MAX_STACK_ELEMS}")
+                    elif size != n:
+                        errs.append(
+                            f"STACK_ALLOC element count {n} != type size {size}")
         if ins.name in ("BORROW_SHARED", "BORROW_MUT"):
             dst, src = a[0], a[1]
             if dst >= f.n_locals or src >= f.n_locals:
@@ -687,6 +745,22 @@ def disassemble(m: Module) -> str:
             elif ins.name in ("CALL_NATIVE", "CALL_PURE_NATIVE"):
                 nat = m.natives[ins.args[0]].name if ins.args[0] < len(m.natives) else "?"
                 args = f"{ins.args[0]} argc={ins.args[1]} ; {nat}"
+            elif ins.name == "STACK_ALLOC":
+                si, ti, n = ins.args
+                args = f"{si} K{ti} n={n}"
+                if ti < len(m.consts) and m.consts[ti][0] == TAG_TYPE:
+                    payload = m.consts[ti][1]
+                    if isinstance(payload, tuple) and len(payload) == 2:
+                        kind, size = payload
+                        extra = (f" ; {TYPE_KIND_NAMES.get(kind, '?')}"
+                                 f" size={size}")
+                    else:
+                        extra = " ; malformed TYPE payload"
+            elif ins.name == "STACK_MATERIALIZE":
+                args = f"{ins.args[0]}"
+                mode = (f.slot_modes[ins.args[0]]
+                        if ins.args[0] < len(f.slot_modes) else "?")
+                extra = f" ; stack slot {ins.args[0]} (mode {mode})"
             elif ins.args:
                 args = " ".join(str(x) for x in ins.args)
             else:

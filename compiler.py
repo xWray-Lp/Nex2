@@ -3,11 +3,14 @@ Nex Compiler — AST → bytecode (prototip alt kümesi).
 
 Kapsam (v0.1 prototip): int/float/str/bool/null, print/str/int/float/len
 native'leri, aritmetik/karşılaştırma, let/atama, if/elif/else, while,
-break/continue, fonksiyon tanımı + çağrı, return, and/or (eager semantik).
+break/continue, fonksiyon tanımı + çağrı, return, and/or (eager semantik),
+`@stack` sabit boyutlu diziler (STACK_ALLOC/STACK_MATERIALIZE, indeks
+okuma/yazma, kaçışta derin heap kopyası).
 
-Kapsam dışı (bilinçli): @own/@stack/@raw ve borrow opcode'ları, list/dict/
-tuple, sınıflar, match, for, import, lambda, f-string, pipe. Bunlar açık
-CompileError üretir — sessizce yanlış kod üretilmez.
+Kapsam dışı (bilinçli): @own/@raw ve borrow opcode'ları, nested @stack,
+`str` elemanlı stack dizi, list/dict/tuple, sınıflar, match, for, import,
+lambda, f-string, pipe. Bunlar açık CompileError üretir — sessizce yanlış
+kod üretilmez.
 
 Sözleşme: NEX_BYTECODE_SPEC.md. İsim çözümleme kuralı (shadowing):
 önce kullanıcı fonksiyonları, sonra native tablo → `fn len` tanımlıysa
@@ -22,8 +25,9 @@ from typing import Optional
 import ast_nodes as A
 from bytecode import (
     FunctionCode, Instr, Module, NativeInfo, OPCODES,
-    NAT_PURE, NAT_STRUCTURAL, MODE_TEMP,
-    TAG_FLOAT, TAG_INT, TAG_NAME, TAG_NULL, TAG_BOOL, TAG_STR,
+    NAT_PURE, NAT_STRUCTURAL, MODE_TEMP, MODE_STACK,
+    TAG_FLOAT, TAG_INT, TAG_NAME, TAG_NULL, TAG_BOOL, TAG_STR, TAG_TYPE,
+    TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE, TYPE_KIND_BOOL,
     stack_effect,
 )
 
@@ -54,6 +58,15 @@ NATIVES: list[NativeInfo] = [
     NativeInfo("len",   1, NAT_PURE | NAT_STRUCTURAL),
 ]
 _NATIVE_INDEX = {n.name: i for i, n in enumerate(NATIVES)}
+
+#: VM'in ilk @stack kapsamı: ilkel eleman tipleri. `ptr` bilinçli olarak
+#: yok — Nex kaynak dilinde `ptr` tipi yok, yalnız TYPE kodlamasında rezerve.
+_STACK_ELEM_KINDS = {
+    "int":   TYPE_KIND_INT,
+    "float": TYPE_KIND_FLOAT,
+    "byte":  TYPE_KIND_BYTE,
+    "bool":  TYPE_KIND_BOOL,
+}
 
 
 # ─── Emisyon yardımcıları ────────────────────────────────────────────────────
@@ -90,14 +103,17 @@ class _FnBuilder:
     def pop_scope(self) -> None:
         self._scopes.pop()
 
-    def declare(self, name: str, node: A.Node) -> int:
+    def declare(self, name: str, node: A.Node, mode: int = MODE_TEMP) -> int:
         if name in self._scopes[-1]:
             raise CompileError(f"variable '{name}' already declared in this block", node)
         slot = self.n_locals
         self.n_locals += 1
-        self.slot_modes.append(MODE_TEMP)
+        self.slot_modes.append(mode)
         self._scopes[-1][name] = slot
         return slot
+
+    def slot_mode(self, slot: int) -> int:
+        return self.slot_modes[slot]
 
     def resolve(self, name: str) -> Optional[int]:
         for scope in reversed(self._scopes):
@@ -327,6 +343,9 @@ class Compiler:
     def _compile_stmt(self, node: A.Node) -> None:
         b = self._builder
         if isinstance(node, A.VarDecl):
+            if node.mem_mode == "stack":
+                self._compile_stack_decl(node)
+                return
             if node.mem_mode is not None:
                 raise CompileError(
                     f"@{node.mem_mode} is not supported in the VM prototype", node)
@@ -389,6 +408,55 @@ class Compiler:
         raise CompileError(
             f"{type(node).__name__} is not supported in the VM prototype", node)
 
+    def _compile_stack_decl(self, node: A.VarDecl) -> None:
+        """`@stack let buf: [T; N]` → STACK_ALLOC (+ literal init için SET_INDEX).
+
+        İlk VM kapsamı bilinçli olarak dar: yalnız ilkel eleman tipleri,
+        literal init veya öntanımlı değerler, indeks erişimi ve kaçışta
+        STACK_MATERIALIZE. Nested stack dizi / `str` eleman / for / `.length`
+        bu turda kapsam dışı (konumlu CompileError)."""
+        b = self._builder
+        ta = node.type_ann
+        if (not isinstance(ta, A.TypeStackArray)
+                or not isinstance(ta.size, A.IntLit)):
+            raise CompileError(
+                f"@stack declaration '{node.name}' requires a fixed-size "
+                f"array type such as [int; 4]", node)
+        size = int(ta.size.value)
+        if size < 1:
+            raise CompileError("@stack array size must be at least 1", node)
+        elem = ta.elem
+        if isinstance(elem, A.TypeStackArray):
+            raise CompileError(
+                "nested stack arrays are not supported in the VM prototype", node)
+        if not isinstance(elem, A.TypeName) or elem.name not in _STACK_ELEM_KINDS:
+            name = getattr(elem, "name", type(elem).__name__)
+            raise CompileError(
+                f"stack array element type '{name}' is not supported in the "
+                f"VM prototype (int/float/byte/bool only)", node)
+
+        if node.value is not None and not isinstance(node.value, A.ListLit):
+            raise CompileError(
+                f"@stack declaration '{node.name}' requires an array literal",
+                node.value)
+        if node.value is not None and len(node.value.elements) != size:
+            raise CompileError(
+                f"Stack array size mismatch for '{node.name}': declared size "
+                f"{size}, got {len(node.value.elements)} element(s)", node.value)
+
+        kind = _STACK_ELEM_KINDS[elem.name]
+        slot = b.declare(node.name, node, MODE_STACK)
+        type_const = self._const(TAG_TYPE, (kind, size))
+        b.emit("STACK_ALLOC", slot, type_const, size, node=node)
+
+        # Başlatıcı yoksa tampon TYPE kind'a göre öntanımlı doldurulur (VM).
+        if node.value is not None:
+            for i, element in enumerate(node.value.elements):
+                b.emit("LOAD_LOCAL", slot, node=node)
+                b.emit("CONST", self._const(TAG_INT, i), node=node)
+                self._compile_expr(element)
+                b.emit("SET_INDEX", node=element)
+
     def _compile_if(self, node: A.IfStmt) -> None:
         b = self._builder
         end = b.new_label()
@@ -430,7 +498,16 @@ class Compiler:
             slot = b.resolve(node.name)
             if slot is None:
                 raise CompileError(f"undefined variable '{node.name}'", node)
-            b.emit("LOAD_LOCAL", slot, node=node)
+            if b.slot_mode(slot) == MODE_STACK:
+                # Kaçış kuralı: stack değeri ifade bağlamında bağımsız heap
+                # kopyasıdır. STACK_MATERIALIZE slotu okur, stack'e list iter.
+                b.emit("STACK_MATERIALIZE", slot, node=node)
+            else:
+                b.emit("LOAD_LOCAL", slot, node=node)
+            return
+
+        if isinstance(node, A.IndexExpr):
+            self._compile_index(node)
             return
 
         if isinstance(node, A.UnaryExpr):
@@ -454,18 +531,25 @@ class Compiler:
                 raise CompileError(
                     f"compound assignment '{node.op}' is not supported in the VM prototype",
                     node)
-            if not isinstance(node.target, A.Ident):
-                raise CompileError(
-                    "only variable assignment is supported in the VM prototype",
-                    node)
-            slot = b.resolve(node.target.name)
-            if slot is None:
-                raise CompileError(
-                    f"undefined variable '{node.target.name}'", node)
-            self._compile_expr(node.value)
-            b.emit("DUP", node=node)
-            b.emit("STORE_LOCAL", slot, node=node)
-            return
+            if isinstance(node.target, A.Ident):
+                slot = b.resolve(node.target.name)
+                if slot is None:
+                    raise CompileError(
+                        f"undefined variable '{node.target.name}'", node)
+                if b.slot_mode(slot) == MODE_STACK:
+                    raise CompileError(
+                        "whole stack array reassignment is not supported in the "
+                        "VM prototype (assign elements instead)", node)
+                self._compile_expr(node.value)
+                b.emit("DUP", node=node)
+                b.emit("STORE_LOCAL", slot, node=node)
+                return
+            if isinstance(node.target, A.IndexExpr):
+                self._compile_index_assign(node)
+                return
+            raise CompileError(
+                "only variable and index assignment are supported in the "
+                "VM prototype", node)
 
         if isinstance(node, A.CallExpr):
             self._compile_call(node)
@@ -511,6 +595,42 @@ class Compiler:
         self._compile_expr(node.left)
         self._compile_expr(node.right)
         b.emit(opcode, node=node)
+
+    def _compile_index(self, node: A.IndexExpr) -> None:
+        b = self._builder
+        # Stack dizisinin kendisi kaçmaz: ham slot yüklenip GET_INDEX uygulanır
+        # (STACK_MATERIALIZE yalnız değer bağlamlarında).
+        if isinstance(node.obj, A.Ident):
+            slot = b.resolve(node.obj.name)
+            if slot is not None and b.slot_mode(slot) == MODE_STACK:
+                b.emit("LOAD_LOCAL", slot, node=node.obj)
+                self._compile_expr(node.index)
+                b.emit("GET_INDEX", node=node)
+                return
+        self._compile_expr(node.obj)
+        self._compile_expr(node.index)
+        b.emit("GET_INDEX", node=node)
+
+    def _compile_index_assign(self, node: A.AssignExpr) -> None:
+        """`obj[i] = v` — ifade değeri olarak atanan değer stack'te kalır."""
+        b = self._builder
+        target = node.target
+        assert isinstance(target, A.IndexExpr)
+        tmp = b.new_tmp(node)
+        self._compile_expr(node.value)          # [v]
+        b.emit("DUP", node=node)                # [v, v]
+        b.emit("STORE_LOCAL", tmp, node=node)   # [v]
+        if isinstance(target.obj, A.Ident):
+            slot = b.resolve(target.obj.name)
+            if slot is not None and b.slot_mode(slot) == MODE_STACK:
+                b.emit("LOAD_LOCAL", slot, node=target.obj)
+            else:
+                self._compile_expr(target.obj)
+        else:
+            self._compile_expr(target.obj)      # [v, obj]
+        self._compile_expr(target.index)        # [v, obj, idx]
+        b.emit("LOAD_LOCAL", tmp, node=node)    # [v, obj, idx, v]
+        b.emit("SET_INDEX", node=node)          # [v]
 
     def _compile_call(self, node: A.CallExpr) -> None:
         b = self._builder

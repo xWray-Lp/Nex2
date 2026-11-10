@@ -272,9 +272,13 @@ ve gerçek evinin Faz 2 olduğunu netleştirir.
    **v0.1 yazıldı:** `NEX_BYTECODE_SPEC.md`.
 2. AST → bytecode derleyici (alt küme: int, print, if/while, fn çağrısı).
 3. VM döngüsü + Frame + host arayüzü (Faz 1).
-   **Durum:** 2-3 v0.1 prototipinde tamam (control-flow alt kümesi);
-   own/stack/borrow opcode'ları 4. adımda.
+   **Durum:** 2-3 v0.1 prototipinde tamam (control-flow alt kümesi).
 4. Mod/borrow opcode'ları + mevcut own/stack süitlerinin parity'si.
+   **Durum:** `@stack` ilk alt küme tamam (STACK_ALLOC/STACK_MATERIALIZE,
+   indeks okuma/yazma, kaçışta derin kopya, frame ömrü, verifier kuralları,
+   tree-walker parity). Nested stack/`str` eleman/`for`/`.length` ve
+   blok-erken kill sonraki turlara ertelendi. `@own` + borrow
+   `(frame, slot, epoch)` takibi sıradaki adım.
 5. Differential harness + CI matrisi.
 6. Ancak bundan sonra: register machine / GC ailesi / Rust port
    alternatiflerinin karşılaştırması (bu iskeletin içinde).

@@ -227,6 +227,27 @@ BORROW modlu bir değer `GET_INDEX`/`GET_MEMBER` operandı olabilir (per-access
 | 0x44 | `STACK_MATERIALIZE` | `u32 si` | `( -- list)` | kaçışta heap kopyası |
 | 0x45 | `RAW_MAKE` | `u32 si` | `(v -- )` | yalnız ilkel/stack kaynak (checker) |
 
+**`@stack` v0.1 semantiği (uygulanan alt küme):**
+- `STACK_ALLOC`: slotu STACK moduna alır, TYPE sabitinin `kind`'ına göre
+  (`int/float/byte/bool`) öntanımlı doldurur. Verifier: `si < n_locals`,
+  `si >= arity` (parametre slotu argüman bağlamayla kurulur, STACK olamaz),
+  `slot_modes[si] == STACK`, `ti` geçerli ve iyi biçimli bir `TYPE` sabiti,
+  `kind` 0x01–0x05, `1 <= n <= 1_000_000` ve `n == TYPE.size`. Aynı slotun
+  yeniden `STACK_ALLOC`'u eski tamponu öldürür (döngü gövdesi bildirimi).
+- İndeks okuma/yazma `GET_INDEX`/`SET_INDEX` ile yapılır; `int` olmayan
+  indeks ve sınır dışı erişim tree-walker ile aynı konumlu hatayı üretir.
+- **Kaçış kuralı:** stack değeri ifade/değer bağlamına girdiğinde
+  `STACK_MATERIALIZE` derin heap kopyası üretir (GC değişkeni, argüman,
+  `return`, native argümanı). Böylece frame ömrü dışına canlı referans
+  çıkmaz; ham bayt kodunda kaçarsa runtime `stack-use-after-scope` hatası
+  verir (frame çıkışında tamponlar öldürülür).
+- İlk VM kapsamı dışı (konumlu `CompileError`): nested `@stack` diziler,
+  `str` eleman tipi, whole-buffer yeniden atama, `for`, `.length`,
+  metotlar. Bunlar ileride aynı opcode'larla genişletilir.
+- **Ömür notu:** tampon şimdilik **frame ömrü** boyunca yaşar; blok-erken
+  kill (`BLOCK_EXIT` cleanup) borrow/own turuna ertelendi. Kapsam dışına
+  çıkan hiçbir referans olmadığı için gözlemlenebilir fark yoktur.
+
 ### 6.7 Borrow opcode'ları
 
 | Hex | Mnemonic | Operandlar | Etki | Not |
@@ -265,14 +286,18 @@ Bytecode yüklenirken zorunlu; ihlal = program çalışmaz (runtime'a düşmez).
    `CALL_NATIVE` serbest.
 6. **Kapsam:** `BLOCK_ENTER`/`BLOCK_EXIT` dengeli.
 7. **Sabitler:** indeksler aralıkta; `FUNC_REF`/`NATIVE_REF` geçerli.
+8. **Stack slotu:** `STACK_ALLOC` yalnız STACK modlu ve arity dışı slota
+   yazar; parametre slotu STACK olamaz; STACK slotuna `STORE_LOCAL` yasak
+   (tek kuruluş yolu `STACK_ALLOC`). `STACK_MATERIALIZE` yalnız STACK
+   slotunu okur.
 
 Tip doğrulaması v1 verifier'ın kapsamında değil (checker zaten yapıyor);
 verifier mod/yığın/akış güvenliğinden sorumlu.
 
-> **Prototip (v0.1) kapsamı:** 1, 2, 3, 5 ve 7 tam uygulanır. 4 (borrow
-> ömrü / NLL) ve 6 (`BLOCK_*` dengesi) borrow ve blok opcode'ları
-> derlenmeye başlayınca devreye girer; bu opcode'ları taşıyan modüllerde
-> şimdilik yalnız slot modu düzeyinde denetim yapılır.
+> **Prototip (v0.1) kapsamı:** 1, 2, 3, 5, 7 ve stack slotu (8) tam
+> uygulanır. 4 (borrow ömrü / NLL) ve 6 (`BLOCK_*` dengesi) borrow ve blok
+> opcode'ları derlenmeye başlayınca devreye girer; bu opcode'ları taşıyan
+> modüllerde şimdilik yalnız slot modu düzeyinde denetim yapılır.
 
 ---
 
@@ -359,9 +384,10 @@ karşılaştırması yapabilsin.
   move-in optimizasyonu değerlendirilmeli; Faz 1'in amacı semantik doğrulama
   olduğu için şimdilik bilinçli olarak ertelendi.
 - **Yürütme bütçeleri:** VM çağrı derinliğini sınırlar (varsayılan 256;
-  aşımda konumlu `VMError`). Verifier sonlanmayı garanti edemez; dışarıdan
-  gelen güvenilmeyen bytecode için adım (instruction) bütçesi Faz 2'ye
-  ertelendi.
+  aşımda konumlu `VMError`). `STACK_ALLOC` eleman sayısı verifier'da
+  `1_000_000` ile sınırlıdır (host belleği koruması). Verifier sonlanmayı
+  garanti edemez; dışarıdan gelen güvenilmeyen bytecode için adım
+  (instruction) bütçesi Faz 2'ye ertelendi.
 - **`**` (STARSTAR): lexer/parser önceliği ve sağdan birleşmesi doğru,
   ancak ne tree-walker runtime'ında ne de VM opcode tablosunda karşılığı
   var. Operatörün semantiği (int/float, negatif taban önceliği) v0.2'de

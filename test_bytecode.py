@@ -29,10 +29,11 @@ from compiler import compile_program, CompileError
 from bytecode import (
     BytecodeError, VerifyError, Module, FunctionCode, NativeInfo,
     OPCODES, MODE_TEMP, MODE_OWN, MODE_STACK, MODE_BORROW,
-    NAT_PURE, NAT_RETAINS_REF, TAG_FUNC_REF, TAG_NATIVE_REF,
+    NAT_PURE, NAT_RETAINS_REF, TAG_FUNC_REF, TAG_NATIVE_REF, TAG_TYPE,
+    TAG_NULL, TAG_INT,
     encode_module, decode_module, decode_code, disassemble, verify_module,
 )
-from vm import VM, VMError, run_module
+from vm import VM, VMError, run_module, StackArrayValue
 
 GREEN  = "\033[92m"
 RED    = "\033[91m"
@@ -631,6 +632,320 @@ fn main():
 """, ["0", "42"])
 
 
+def test_stack_vm():
+    section("`@stack` — STACK_ALLOC / STACK_MATERIALIZE")
+
+    # ── Geçerli programlar (tree-walker parity) ─────────────────────────
+    expect_output("stack decl + index read/write", """
+fn main():
+    @stack let buf: [int; 4] = [0, 0, 0, 0]
+    buf[0] = 10
+    print(str(buf[0]))
+""", ["10"])
+
+    expect_output("bare 'stack' anahtar kelimesi", """
+fn main():
+    stack let buf: [int; 2] = [7, 8]
+    print(str(buf[1]))
+""", ["8"])
+
+    expect_output("başlatıcısız öntanımlı değerler (int/float/bool)", """
+fn main():
+    @stack let a: [int; 3]
+    @stack let f: [float; 2]
+    @stack let b: [bool; 2] = [true, false]
+    print(str(a[0]))
+    print(str(a))
+    print(str(f[0]))
+    print(str(b[0]) + "/" + str(b[1]))
+""", ["0", "[0, 0, 0]", "0.0", "true/false"])
+
+    expect_output("escape by copy: GC var bağımsız", """
+fn main():
+    @stack let buf: [int; 2] = [1, 2]
+    let xs = buf
+    xs[0] = 99
+    print(str(buf[0]))
+    print(str(xs[0]))
+    print(str(len(xs)))
+""", ["1", "99", "2"])
+
+    expect_output("escape by copy: argüman ve return", """
+fn total(xs: [int]) -> int:
+    xs[0] = 100
+    return xs[0] + xs[1]
+
+fn get() -> [int]:
+    @stack let buf: [int; 2] = [1, 2]
+    return buf
+
+fn main():
+    @stack let buf: [int; 2] = [7, 8]
+    print(total(buf))
+    print(buf[0])
+    let xs = get()
+    print(str(xs[0]) + "/" + str(xs[1]))
+""", ["108", "7", "1/2"])
+
+    expect_output("dinamik indeks (while) + atama değeri", """
+fn main():
+    @stack let buf: [int; 4] = [0, 0, 0, 0]
+    let i = 0
+    while i < 4:
+        buf[i] = i * i
+        i = i + 1
+    print(str(buf[3]))
+    print(str(buf[0] = 5))
+    print(str(buf[0]))
+""", ["9", "5", "5"])
+
+    expect_output("döngü gövdesinde @stack (slot yeniden kurulur)", """
+fn main():
+    let i = 0
+    let total = 0
+    while i < 3:
+        @stack let t: [int; 2] = [i, i + 1]
+        total = total + t[1]
+        i = i + 1
+    print(total)
+""", ["6"])
+
+    expect_output("float/bool dizi yazdırma + int→float eleman", """
+fn main():
+    @stack let f: [float; 2]
+    f[0] = 3
+    print(str(f))
+    @stack let b: [bool; 2] = [true, false]
+    print(str(b))
+""", ["[3, 0.0]", "[True, False]"])
+
+    # encode → decode → verify: TAG_TYPE + STACK_ALLOC roundtrip
+    stack_src = """
+fn main():
+    @stack let buf: [int; 3] = [4, 5, 6]
+    buf[1] = buf[0] + 10
+    print(str(buf[1]))
+"""
+    m_rt = compile_source(stack_src)
+    m_rt2 = decode_module(encode_module(m_rt))
+    verify_module(m_rt2)
+    buf_rt = io.StringIO()
+    with contextlib.redirect_stdout(buf_rt):
+        run_module(m_rt2)
+    check("TAG_TYPE + STACK_ALLOC encode/decode roundtrip",
+          buf_rt.getvalue().splitlines() == ["14"], buf_rt.getvalue())
+
+    # ── Disassembly / metadata ───────────────────────────────────────────
+    m = compile_source("""
+fn main():
+    @stack let buf: [int; 3] = [1, 2, 3]
+    buf[1] = 4
+    let xs = buf
+    print(str(xs[0]))
+""")
+    d = disassemble(m)
+    f = m.functions[0]
+    check("STACK_ALLOC disasm'da tip/size ile görünür",
+          "STACK_ALLOC" in d and "; int size=3" in d, d)
+    check("SET_INDEX/GET_INDEX disasm'da", "SET_INDEX" in d
+          and "GET_INDEX" in d)
+    check("kaçışta STACK_MATERIALIZE üretilir", "STACK_MATERIALIZE" in d, d)
+    check("stack slot modu MODE_STACK",
+          f.slot_modes[0] == MODE_STACK,
+          f"slot_modes={list(f.slot_modes)}")
+    check("STACK_ALLOC slotu TİP sabiti taşır",
+          m.consts[next(i.args[1] for i in decode_code(f.code)
+                        if i.name == "STACK_ALLOC")][0] == TAG_TYPE)
+
+    # ── Derleme zamanı reddi (kapsam dışı) ──────────────────────────────
+    expect_compile_error("@stack tipi zorunlu", """
+fn main():
+    @stack let b = [1, 2]
+""", "fixed-size")
+    expect_compile_error("@stack 'str' eleman VM'de kapsam dışı", """
+fn main():
+    @stack let b: [str; 2] = ["a", "b"]
+""", "not supported")
+    expect_compile_error("nested stack dizi VM'de kapsam dışı", """
+fn main():
+    @stack let m: [[int; 2]; 2] = [[1, 2], [3, 4]]
+""", "nested stack")
+    expect_compile_error("whole-buffer reassign reddedilir", """
+fn main():
+    @stack let b: [int; 2] = [1, 2]
+    b = [9, 8]
+""", "reassignment")
+    expect_compile_error("stack literal boyut uyuşmazlığı", """
+fn main():
+    @stack let b: [int; 4] = [1, 2]
+""", "size mismatch")
+    expect_compile_error("stack init literal olmalı", """
+fn main():
+    let xs = 1
+    @stack let b: [int; 2] = xs
+""", "array literal")
+    expect_compile_error("stack dizi boyutu >= 1", """
+fn main():
+    @stack let b: [int; 0] = []
+""", "at least 1")
+    expect_compile_error("ptr eleman tipi VM'de yok", """
+fn main():
+    @stack let p: [ptr; 2]
+""", "not supported")
+
+    # ── Çalışma zamanı hataları (tree-walker metinleriyle) ─────────────
+    expect_vm_error("stack indeksi int değil", """
+fn main():
+    @stack let b: [int; 2] = [1, 2]
+    print(str(b["a"]))
+""", "Stack array index must be 'int', got 'str'")
+    expect_vm_error("stack negatif indeks", """
+fn main():
+    @stack let b: [int; 2] = [1, 2]
+    print(str(b[-1]))
+""", "Index -1 out of bounds for stack array of size 2")
+    expect_vm_error("stack değişken indeks sınır dışı", """
+fn main():
+    @stack let b: [int; 2] = [1, 2]
+    let i = 5
+    print(str(b[i]))
+""", "Index 5 out of bounds")
+    expect_vm_error("stack yazma sınır dışı", """
+fn main():
+    @stack let b: [int; 2] = [1, 2]
+    let i = 5
+    b[i] = 1
+""", "Index 5 out of bounds")
+
+    # ── Verifier negatifleri ───────────────────────────────────────────
+    def stack_mod(code, *, consts=None, n_locals=1,
+                  slot_modes=bytes([MODE_STACK]), max_stack=2):
+        return mk_module(code, consts=consts or [], n_locals=n_locals,
+                         slot_modes=slot_modes, max_stack=max_stack)
+
+    good_consts = [(TAG_TYPE, (1, 4)), (TAG_NULL, None)]
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 0, 0, 4), ("CONST", 1),
+                           ("RET",)), consts=good_consts)
+    check("geçerli STACK_ALLOC verify'dan geçer",
+          verify_module(m) is None)
+
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 0, 0, 4), ("CONST", 1),
+                           ("RET",)), consts=good_consts,
+                  slot_modes=bytes([MODE_TEMP]))
+    expect_verify_error("STACK_ALLOC non-STACK slotta", m, "non-STACK")
+
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 0, 0, 4), ("CONST", 1),
+                           ("RET",)),
+                  consts=[(TAG_NULL, None), (TAG_NULL, None)])
+    expect_verify_error("STACK_ALLOC TİP olmayan sabit", m, "not a TYPE")
+
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 0, 0, 4), ("CONST", 1),
+                           ("RET",)),
+                  consts=[(TAG_TYPE, (0x09, 4)), (TAG_NULL, None)])
+    expect_verify_error("STACK_ALLOC geçersiz kind", m, "kind")
+
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 0, 0, 0), ("CONST", 1),
+                           ("RET",)), consts=good_consts)
+    expect_verify_error("STACK_ALLOC n=0", m, ">= 1")
+
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 0, 0, 3), ("CONST", 1),
+                           ("RET",)), consts=good_consts)
+    expect_verify_error("STACK_ALLOC n != tip size", m, "type size")
+
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 2, 0, 4), ("CONST", 1),
+                           ("RET",)), consts=good_consts)
+    expect_verify_error("STACK_ALLOC slot taşması", m, "out of range")
+
+    m = stack_mod(fn_bytes(("CONST", 1), ("STORE_LOCAL", 0), ("CONST", 1),
+                           ("RET",)), consts=good_consts)
+    expect_verify_error("STORE_LOCAL STACK slotuna yazamaz", m, "STACK slot")
+
+    # Parametre slotu STACK olamaz: argüman bağlama ikinci kuruluş yolu olur
+    # ve callee çıkışında çağıranın canlı tamponunu öldürürdü.
+    m = stack_mod(fn_bytes(("CONST", 1), ("RET",)), consts=good_consts)
+    m.functions[0].arity = 1
+    expect_verify_error("parametre slotu STACK olamaz", m, "cannot be STACK")
+
+    # Bozuk TYPE payload'ı TypeError değil VerifyError üretmeli.
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 0, 0, 4), ("CONST", 1),
+                           ("RET",)),
+                  consts=[(TAG_TYPE, None), (TAG_NULL, None)])
+    expect_verify_error("bozuk TYPE payload'ı reddedilir", m,
+                        "malformed TYPE payload")
+
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 0, 0, 4), ("CONST", 1),
+                           ("RET",)),
+                  consts=[(TAG_TYPE, (1,)), (TAG_NULL, None)])
+    expect_verify_error("eksik TYPE payload boyutu reddedilir", m,
+                        "malformed TYPE payload")
+
+    # Aşırı eleman sayısı host belleğini tüketmeden reddedilir.
+    big = 1_000_001
+    m = stack_mod(fn_bytes(("STACK_ALLOC", 0, 0, big), ("CONST", 1),
+                           ("RET",)),
+                  consts=[(TAG_TYPE, (1, big)), (TAG_NULL, None)])
+    expect_verify_error("STACK_ALLOC eleman sınırı", m, "exceeds limit")
+
+    # ── Frame ömrü: ham kaçış ölü tampona dönüşür ──────────────────────
+    f_code = fn_bytes(("STACK_ALLOC", 0, 0, 2), ("LOAD_LOCAL", 0), ("RET",))
+    main_code = fn_bytes(("CALL", 0, 0), ("STORE_LOCAL", 0),
+                         ("LOAD_LOCAL", 0), ("CONST", 1), ("GET_INDEX",),
+                         ("POP",), ("CONST", 2), ("RET",))
+    m = Module(
+        consts=[(TAG_TYPE, (1, 2)), (TAG_INT, 0), (TAG_NULL, None)],
+        functions=[
+            FunctionCode(name="leak", arity=0, n_locals=1, max_stack=1,
+                         code=f_code, slot_modes=bytes([MODE_STACK])),
+            FunctionCode(name="main", arity=0, n_locals=1, max_stack=3,
+                         code=main_code, slot_modes=bytes([MODE_TEMP])),
+        ],
+        natives=[], entry=1,
+    )
+    try:
+        run_module(m)
+    except VMError as e:
+        check("frame çıkışında @stack ölür (stack-use-after-scope)",
+              "stack-use-after-scope" in str(e), f"msg={e}")
+    except Exception as e:  # noqa: BLE001
+        check("frame çıkışında @stack ölür (stack-use-after-scope)", False,
+              f"wrong error {type(e).__name__}: {e}")
+    else:
+        check("frame çıkışında @stack ölür (stack-use-after-scope)", False,
+              "expected VMError, got success")
+
+    # Materialize edilmiş kopya frame ölümünden etkilenmez.
+    check("materialize kopyası bağımsız list",
+          StackArrayValue(2, 1).to_list() == [0, 0])
+
+    # Aynı slotun yeniden STACK_ALLOC'u eski tamponu öldürür: döngü
+    # gövdesindeki bildirimin ham-bytecode karşılığı.
+    realloc_code = fn_bytes(
+        ("STACK_ALLOC", 0, 0, 2),
+        ("LOAD_LOCAL", 0), ("STORE_LOCAL", 1),
+        ("STACK_ALLOC", 0, 0, 2),
+        ("LOAD_LOCAL", 1), ("CONST", 1), ("GET_INDEX",),
+        ("POP",), ("CONST", 2), ("RET",))
+    m = Module(
+        consts=[(TAG_TYPE, (1, 2)), (TAG_INT, 0), (TAG_NULL, None)],
+        functions=[FunctionCode(
+            name="main", arity=0, n_locals=2, max_stack=3,
+            code=realloc_code,
+            slot_modes=bytes([MODE_STACK, MODE_TEMP]))],
+        natives=[], entry=0,
+    )
+    try:
+        run_module(m)
+    except VMError as e:
+        check("yeniden STACK_ALLOC eski tamponu öldürür",
+              "stack-use-after-scope" in str(e), f"msg={e}")
+    except Exception as e:  # noqa: BLE001
+        check("yeniden STACK_ALLOC eski tamponu öldürür", False,
+              f"wrong error {type(e).__name__}: {e}")
+    else:
+        check("yeniden STACK_ALLOC eski tamponu öldürür", False,
+              "expected VMError, got success")
+
+
 def test_errors():
     section("Hatalar ve konum bilgisi")
     expect_vm_error("sıfıra bölme VMError", """
@@ -1017,6 +1332,35 @@ fn main():
     let y = 2
     print(x / y)
 """,
+        "@stack: okuma/yazma/kaçış kopyası": """
+fn fill(buf: [int]) -> [int]:
+    buf[0] = 42
+    return buf
+
+fn main():
+    @stack let buf: [int; 3] = [1, 2, 3]
+    buf[1] = 7
+    let copy = fill(buf)
+    print(str(buf[0]))
+    print(str(buf[1]))
+    print(str(copy[0]))
+    print(str(len(copy)))
+""",
+        "@stack: döngü gövdesi + float/bool": """
+fn main():
+    let i = 0
+    let total = 0
+    while i < 3:
+        @stack let t: [int; 2] = [i, i + 1]
+        total = total + t[1]
+        i = i + 1
+    print(total)
+    @stack let f: [float; 2]
+    f[0] = 3
+    print(str(f))
+    @stack let b: [bool; 2] = [true, false]
+    print(str(b))
+""",
     }
     for name, src in programs.items():
         expect_parity(name, src)
@@ -1059,6 +1403,7 @@ def main() -> None:
     test_functions()
     test_call_depth()
     test_and_or()
+    test_stack_vm()
     test_errors()
     test_verifier_negatives()
     test_vm_cli()

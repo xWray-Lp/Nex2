@@ -3,8 +3,10 @@
 # Çalıştır:  python main.py --vm examples/vm_basics.nex
 # Döküm:     python main.py --disasm examples/vm_basics.nex
 #
-# Not: @own/@stack/@raw, list/dict, sınıf ve match bu prototipte kapsam
-# dışıdır; derleyici bunları sessizce yanlış kodlamak yerine reddeder.
+# Not: @own/@raw, list/dict, sınıf ve match bu prototipte kapsam dışıdır;
+# `@stack` sabit boyutlu diziler (ilkel eleman, indeks erişimi, kaçışta
+# kopya) desteklenir. Derleyici kapsam dışı yapıları sessizce yanlış
+# kodlamak yerine reddeder.
 
 fn fib(n: int) -> int:
     if n < 2:
@@ -48,3 +50,11 @@ fn main():
     print(len("bytecode") + len("vm"))
     print("and:" + str((1 < 2) and (2 < 3)))
     print("or:" + str((1 > 2) or (3 > 2)))
+
+    # @stack: gömülü tampon; kaçış (let copy = buf) bağımsız heap kopyasıdır.
+    @stack let buf: [int; 4] = [1, 2, 3, 4]
+    buf[1] = 20
+    let copy = buf
+    copy[0] = 99
+    print("stack:" + str(buf[0]) + "/" + str(buf[1]))
+    print("copy:" + str(copy[0]) + "/" + str(len(copy)))
