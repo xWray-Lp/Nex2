@@ -8,6 +8,8 @@ Kapsam:
 - disassembler determinism ve okunabilirlik
 - aritmetik/karşılaştırma, if/elif/else, while + break/continue
 - fonksiyon çağrısı, özyineleme, native çağrıları
+- list/dict literalleri (NEW_LIST/NEW_DICT), indeks okuma/yazma,
+  to_own(list/dict literal) uçtan uca
 - and/or eager semantiği (tree-walker parity)
 - shadowing: kullanıcı `fn len` → CALL, aksi hâlde CALL_PURE_NATIVE
 - verifier negatifleri: jump operand ortası, stack underflow/overflow,
@@ -1218,6 +1220,135 @@ fn main():
     check("OwnValueValue repr ölü", repr(ov) == "<freed own 'x'>", repr(ov))
 
 
+def test_list_dict_vm():
+    section("list/dict literalleri — NEW_LIST / NEW_DICT")
+
+    # ── Geçerli programlar ───────────────────────────────────────────────
+    expect_output("list literal: eleman okuma/yazma, len/str", """
+fn main():
+    let xs = [1, 2, 3]
+    print(xs[1])
+    xs[0] = 9
+    print(str(xs))
+    print(len(xs))
+""", ["2", "[9, 2, 3]", "3"])
+
+    expect_output("nested list literal", """
+fn main():
+    let xs = [[1, 2], [3, 4]]
+    print(str(xs[1]))
+    print(xs[0][1] + xs[1][0])
+""", ["[3, 4]", "5"])
+
+    expect_output("dict literal: okuma/yazma, len/str", """
+fn main():
+    let d = { "k": "v", "a": 1 }
+    print(d["k"])
+    d["a"] = 2
+    print(str(d))
+    print(len(d))
+""", ["v", "{'k': 'v', 'a': 2}", "2"])
+
+    expect_output("boş dict literal → NEW_DICT 0", """
+fn main():
+    let e = {}
+    print(str(e))
+    print(len(e))
+""", ["{}", "0"])
+
+    expect_output("to_own([1, 2, 3]) → to_gc → yazdırma", """
+fn main():
+    @own let x = to_own([1, 2, 3])
+    let y = to_gc(x)
+    print(str(y))
+""", ["[1, 2, 3]"])
+
+    expect_output("to_own(dict literal) → to_gc", """
+fn main():
+    @own let x = to_own({ "a": 1, "b": [2, 3] })
+    let y = to_gc(x)
+    print(str(y["b"][1]))
+""", ["3"])
+
+    expect_output("dict'te @stack kaçışı: STACK_MATERIALIZE + NEW_DICT", """
+fn main():
+    @stack let buf: [int; 2] = [7, 8]
+    let w = { "k": buf }
+    print(str(w["k"]))
+""", ["[7, 8]"])
+
+    expect_output("list'te @stack kaçışı: STACK_MATERIALIZE + NEW_LIST", """
+fn main():
+    @stack let buf: [int; 2] = [7, 8]
+    let w = [buf, 9]
+    print(str(w[0]) + "/" + str(w[1]))
+""", ["[7, 8]/9"])
+
+    # ── Bytecode seviyesi: emisyon biçimi ───────────────────────────────
+    d0 = decode_code(compile_source("""
+fn main():
+    let e = {}
+""").functions[0].code)
+    nd = [i for i in d0 if i.name == "NEW_DICT"]
+    check("boş dict → tek NEW_DICT 0",
+          len(nd) == 1 and nd[0].args == (0,), str([(i.name, i.args) for i in d0]))
+
+    dl = decode_code(compile_source("""
+fn main():
+    let d = { "k": "v", "a": 1 }
+""").functions[0].code)
+    nd = [i for i in dl if i.name == "NEW_DICT"]
+    check("2 çiftli dict → NEW_DICT 2",
+          len(nd) == 1 and nd[0].args == (2,), str([(i.name, i.args) for i in dl]))
+
+    ll = decode_code(compile_source("""
+fn main():
+    let xs = [1, 2, 3]
+""").functions[0].code)
+    nl = [i for i in ll if i.name == "NEW_LIST"]
+    check("3 elemanlı list → NEW_LIST 3",
+          len(nl) == 1 and nl[0].args == (3,), str([(i.name, i.args) for i in ll]))
+
+    # ── Kapsam dışı (bilinçli reddedilen) kullanımlar ───────────────────
+    expect_compile_error("list üzerinde compound assignment reddedilir", """
+fn main():
+    let xs = [1, 2]
+    xs[0] += 1
+""", "compound assignment")
+
+    expect_compile_error("list metodu (.push) reddedilir", """
+fn main():
+    let xs = [1, 2]
+    xs.push(3)
+""", "direct function calls")
+
+    expect_compile_error("list metodu (.length) reddedilir", """
+fn main():
+    let xs = [1, 2]
+    print(xs.length)
+""", "memberexpr is not supported")
+
+    # ── Tree-walker ↔ VM parity ─────────────────────────────────────────
+    expect_parity("parity: list literal + indeks yazma", """
+fn main():
+    let xs = [1, 2, 3]
+    xs[0] = 9
+    print(str(xs))
+    print(len(xs))
+    print(str([xs[0], xs[2]]))
+""")
+
+    expect_parity("parity: dict literal + @stack kaçışı", """
+fn main():
+    @stack let buf: [int; 2] = [7, 8]
+    let d = { "k": buf, "n": 1 }
+    d["n"] = 2
+    print(str(d))
+    print(str(d["k"]))
+    print(len(d))
+""")
+
+
 def test_errors():
     section("Hatalar ve konum bilgisi")
     expect_vm_error("sıfıra bölme VMError", """
@@ -1248,8 +1379,8 @@ fn main():
 
     expect_compile_error("tanımsız değişken",
                          "fn main():\n    print(y)\n", "undefined variable")
-    expect_compile_error("desteklenmeyen list literal",
-                         "fn main():\n    let x = [1, 2]\n",
+    expect_compile_error("desteklenmeyen tuple literal",
+                         "fn main():\n    let x = (1, 2)\n",
                          "not supported")
     expect_compile_error("@own VM prototipinde desteklenmez",
                          "fn main():\n    @own let x = 1\n", "@own")
@@ -1552,7 +1683,7 @@ fn main():
             contextlib.redirect_stderr(buf_err):
         ok = nexmain.run_source("""
 fn main():
-    let x = [1, 2]
+    let x = (1, 2)
 """, "<cli>", backend="vm")
     check("derleme hatası CLI'da Compile Error olarak raporlanır",
           not ok and "Compile Error" in buf_err.getvalue(),
@@ -1714,6 +1845,7 @@ def main() -> None:
     test_and_or()
     test_stack_vm()
     test_own_vm()
+    test_list_dict_vm()
     test_errors()
     test_verifier_negatives()
     test_vm_cli()

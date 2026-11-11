@@ -5,13 +5,15 @@ Kapsam (v0.1 prototip): int/float/str/bool/null, print/str/int/float/len
 native'leri, aritmetik/karşılaştırma, let/atama, if/elif/else, while,
 break/continue, fonksiyon tanımı + çağrı, return, and/or (eager semantik),
 `@stack` sabit boyutlu diziler (STACK_ALLOC/STACK_MATERIALIZE, indeks
-okuma/yazma, kaçışta derin heap kopyası) ve `@own` sahipliği
-(OWN_ALLOC/OWN_MOVE/OWN_FREE; borrow yok).
+okuma/yazma, kaçışta derin heap kopyası), `@own` sahipliği
+(OWN_ALLOC/OWN_MOVE/OWN_FREE; borrow yok) ve genel list/dict literalleri
+(NEW_LIST/NEW_DICT + GET_INDEX/SET_INDEX).
 
 Kapsam dışı (bilinçli): borrow (`&x` / `&mut x` / BORROW_*), @raw, nested
-@stack, `str` elemanlı stack dizi, list/dict/tuple, sınıflar, match, for,
-import, lambda, f-string, pipe. Bunlar açık CompileError üretir — sessizce
-yanlış kod üretilmez.
+@stack, `str` elemanlı stack dizi, tuple, sınıflar, match, for,
+import, lambda, f-string, pipe; ayrıca list/dict üzerinde compound
+atama ve metotlar (`.push`, `.length`). Bunlar açık CompileError
+üretir — sessizce yanlış kod üretilmez.
 
 `@own` kuralları (tree-walker parity, borrow hariç):
 - `@own let x = to_own(expr)` ve mevcut @own değişkene `x = to_own(expr)`
@@ -539,6 +541,24 @@ class Compiler:
             return
         if isinstance(node, A.NullLit):
             b.emit("CONST", self._const(TAG_NULL, None), node=node)
+            return
+
+        if isinstance(node, A.ListLit):
+            # Genel liste ifadesi: elemanlar sırayla değerlendirilir, sonra
+            # NEW_LIST hepsini tek host listesinde toplar. Eleman bir @stack
+            # değeri ise Ident yolu STACK_MATERIALIZE üretir (bağımsız kopya).
+            for elem in node.elements:
+                self._compile_expr(elem)
+            b.emit("NEW_LIST", len(node.elements), node=node)
+            return
+
+        if isinstance(node, A.DictLit):
+            # Genel dict ifadesi: k1 v1 k2 v2 ... sırasıyla stack'e itilir,
+            # NEW_DICT n ikiliyi sözlüğe toplar. Boş literal NEW_DICT 0.
+            for key_node, value_node in node.pairs:
+                self._compile_expr(key_node)
+                self._compile_expr(value_node)
+            b.emit("NEW_DICT", len(node.pairs), node=node)
             return
 
         if isinstance(node, A.Ident):

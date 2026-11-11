@@ -386,6 +386,40 @@ class VM:
                 # OWN_FREE yığına bir şey bırakmaz; derleyici ifade bağlamı
                 # için ayrıca CONST null üretir.
 
+            elif name == "NEW_LIST":
+                n = a[0]
+                loc = fr.fn.line_of(ins.pc)
+                if len(st) < n:
+                    raise VMError("stack underflow at NEW_LIST", *loc)
+                if n:
+                    items = st[-n:]
+                    del st[-n:]
+                else:
+                    items = []
+                st.append(items)
+
+            elif name == "NEW_DICT":
+                n = a[0]
+                loc = fr.fn.line_of(ins.pc)
+                need = 2 * n
+                if len(st) < need:
+                    raise VMError("stack underflow at NEW_DICT", *loc)
+                if n:
+                    flat = st[-need:]
+                    del st[-need:]
+                else:
+                    flat = []
+                result = {}
+                for i in range(n):
+                    try:
+                        result[flat[2 * i]] = flat[2 * i + 1]
+                    except TypeError:
+                        raise VMError(
+                            f"Dictionary key must be hashable, got unhashable "
+                            f"'{type(flat[2 * i]).__name__}' "
+                            f"(list/dict/set cannot be dict keys)", *loc)
+                st.append(result)
+
             elif name == "GET_INDEX":
                 idx = st.pop()
                 obj = st.pop()
