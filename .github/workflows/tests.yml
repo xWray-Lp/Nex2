@@ -41,12 +41,8 @@ jobs:
       - name: Run bytecode/VM tests
         run: python test_bytecode.py
 
-      - name: VM example — tree-walker parity
-        run: |
-          python main.py examples/vm_basics.nex > tree.out
-          python main.py --vm examples/vm_basics.nex > vm.out
-          diff tree.out vm.out
-          python main.py --disasm examples/vm_basics.nex > /dev/null
+      - name: VM ↔ tree-walker parity matrix (all examples)
+        run: python check_vm_parity.py
 
       - name: Run examples
         run: |
