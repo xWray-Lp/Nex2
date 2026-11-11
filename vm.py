@@ -245,6 +245,17 @@ def _nex_values(d: Any) -> list:
     return list(d.values())
 
 
+def _nex_push(lst: Any, val: Any) -> None:
+    """list.push(val) — tree-walker builtin_push ile birebir (None döner).
+
+    Borç argümanı zaten CALL_NATIVE sınırında reddedilir (allowlist dışı);
+    buraya canlı stack/own değeri de ulaşamaz (call() argüman denetimi)."""
+    if not isinstance(lst, list):
+        raise TypeError("push() expects a list")
+    lst.append(val)
+    return None
+
+
 NATIVE_FUNCS = {
     "print": lambda *args: print(" ".join(str(a) for a in args)),
     "str":   _nex_str,
@@ -253,6 +264,7 @@ NATIVE_FUNCS = {
     "len":   _nex_len,
     "keys":  _nex_keys,
     "values": _nex_values,
+    "push":  _nex_push,
 }
 
 #: Spec §6.4/§5: borrow argümanı yalnız bu saf/yapısal native'lere

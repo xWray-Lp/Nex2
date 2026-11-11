@@ -6,7 +6,8 @@ Sözleşme: NEX_BYTECODE_SPEC.md (v0.1). Tasarım: NEX_VM_DESIGN.md.
 Kapsam:
 - encode → decode → encode roundtrip (byte eşitliği) + determinism
 - disassembler determinism ve okunabilirlik
-- aritmetik/karşılaştırma, if/elif/else, while + break/continue
+- aritmetik/karşılaştırma, if/elif/else, while + break/continue,
+  for (range + indeksle yineleme) + break/continue, list.push metodu
 - fonksiyon çağrısı, özyineleme, native çağrıları
 - list/dict literalleri (NEW_LIST/NEW_DICT), indeks okuma/yazma,
   to_own(list/dict literal) uçtan uca
@@ -1407,7 +1408,7 @@ fn main():
           and "BORROW_END" in d, d)
     check("allowlist native'ler tabloda",
           [n.name for n in m.natives] ==
-          ["print", "str", "int", "float", "len", "keys", "values"],
+          ["print", "str", "int", "float", "len", "keys", "values", "push"],
           str([n.name for n in m.natives]))
 
     # ── Handwritten bytecode: BORROW_END released işaretler ─────────────
@@ -1761,11 +1762,12 @@ fn main():
     xs[0] += 1
 """, "compound assignment")
 
-    expect_compile_error("list metodu (.push) reddedilir", """
+    expect_output("list metodu (.push) artık desteklenir", """
 fn main():
     let xs = [1, 2]
     xs.push(3)
-""", "direct function calls")
+    print(str(xs))
+""", ["[1, 2, 3]"])
 
     expect_compile_error("list metodu (.length) reddedilir", """
 fn main():
@@ -2422,6 +2424,279 @@ print(f() + g())
         "no functions to compile")
 
 
+def test_for_vm():
+    section("for döngüsü — range + indeksle yineleme (A.ForStmt)")
+
+    # ── Range: while-style tamsayı sayaç döngüsü ────────────────────────
+    expect_parity("for i in 0..10 sum (range, parity)", """
+fn main():
+    let total = 0
+    for i in 0..10:
+        total = total + i
+    print(total)
+""")
+
+    expect_parity("for i in 1..6 (start != 0, parity)", """
+fn main():
+    let s = 0
+    for i in 1..6:
+        s = s + i
+    print(s)
+""")
+
+    expect_output("range for: sayaç gövdede görünür + boş aralık", """
+fn main():
+    let total = 0
+    for i in 2..5:
+        total = total + i * i
+    print(total)
+    for i in 3..3:
+        print("never")
+    print("done")
+""", ["29", "done"])
+
+    # ── Indeksle yineleme: list ────────────────────────────────────────
+    expect_parity("for n in [list] max-like reduction (parity)", """
+fn main():
+    let nums = [3, 1, 4, 1, 5, 9, 2, 6]
+    let max_val = nums[0]
+    for n in nums:
+        if n > max_val:
+            max_val = n
+    print(max_val)
+""")
+
+    expect_output("for over list: eleman sırası korunur", """
+fn main():
+    let acc = ""
+    for w in ["a", "b", "c"]:
+        acc = acc + w
+    print(acc)
+    for x in []:
+        print("never")
+    print("empty ok")
+""", ["abc", "empty ok"])
+
+    # ── @stack: Ident yolu STACK_MATERIALIZE kopyası (to_list parity) ──
+    expect_parity("for v in @stack buf (copy semantics, parity)", """
+fn main():
+    @stack let buf: [int; 4] = [2, 4, 6, 8]
+    let total = 0
+    for v in buf:
+        total = total + v
+    print(total)
+""")
+
+    # ── str: karakter karakter ─────────────────────────────────────────
+    expect_parity('for c in "abc": print(c) (parity)', """
+fn main():
+    let out = ""
+    for c in "abc":
+        print(c)
+        out = out + c
+    print(out)
+""")
+
+    # ── break / continue / iç içe for ──────────────────────────────────
+    expect_output("for + break", """
+fn main():
+    let s = 0
+    for i in 0..100:
+        if i == 4:
+            break
+        s = s + i
+    print(s)
+""", ["6"])
+
+    expect_output("for + continue", """
+fn main():
+    let s = 0
+    for i in 0..6:
+        if i % 2 == 0:
+            continue
+        s = s + i
+    print(s)
+""", ["9"])
+
+    expect_output("iç içe for + return gövdeden", """
+fn find():
+    for i in 0..3:
+        for j in 0..3:
+            if i * j == 2:
+                return j
+    return -1
+
+fn main():
+    print(find())
+""", ["2"])
+
+    # ── Borrow: continue gövde borrow'unu release etmeli ───────────────
+    for_src = """
+fn main():
+    @own let xs = to_own([1, 2, 3])
+    for v in 0..3:
+        let r = &xs
+        if v == 0:
+            continue
+    let g = to_gc(xs)
+    print(str(len(g)))
+"""
+    expect_parity("for: continue releases loop-body borrow (parity)", for_src)
+
+    # Sayaç kanıtı: continue release etmezse owner sayacı birikirdi.
+    import vm as _vm
+    acq_rec: list[int] = []
+    _orig_acq = _vm.OwnValueValue.acquire_shared
+
+    def _rec_acq(self):
+        _orig_acq(self)
+        acq_rec.append(self.shared)
+
+    _vm.OwnValueValue.acquire_shared = _rec_acq
+    try:
+        _m, got = run_vm(for_src)
+    finally:
+        _vm.OwnValueValue.acquire_shared = _orig_acq
+    check("for continue path: shared counter never exceeds 1",
+          acq_rec and max(acq_rec) == 1, f"counters={acq_rec}")
+
+    break_for_src = """
+fn main():
+    @own let xs = to_own([1, 2, 3])
+    for v in 0..3:
+        let r = &xs
+        if v == 1:
+            break
+    let g = to_gc(xs)
+    print(str(g[0]))
+"""
+    expect_parity("for: break releases loop-body borrow (parity)",
+                  break_for_src)
+
+    ret_for_src = """
+fn probe() -> int:
+    @own let xs = to_own([7, 8])
+    for v in 0..3:
+        let r = &xs
+        if v == 2:
+            return len(r)
+    return 0
+
+fn main():
+    print(str(probe()))
+"""
+    expect_output("for: return from body releases borrow before RET",
+                  ret_for_src, ["2"])
+
+    m = compile_source(ret_for_src)
+    for fn in m.functions:
+        if fn.name == "probe":
+            instrs = decode_code(fn.code)
+            check("in-for return emits BORROW_END before RET",
+                  any(ins.name == "RET" and instrs[idx - 1].name == "BORROW_END"
+                      for idx, ins in enumerate(instrs) if idx > 0),
+                  "no RET preceded by BORROW_END")
+
+    # Hedef slot döngü kapsamındadır: gövde dışında görünmez.
+    expect_compile_error("for hedefi gövde dışında görünmez", """
+fn main():
+    for i in 0..2:
+        print(i)
+    print(i)
+""", "undefined variable")
+
+    # ── Derleme zamanı reddi ───────────────────────────────────────────
+    expect_compile_error("destructuring for target reddedilir", """
+fn main():
+    for a, b in [[1, 2], [3, 4]]:
+        print(a)
+""", "destructuring in for loops is not supported")
+
+    # ── list.push ──────────────────────────────────────────────────────
+    expect_output("xs.push(v) + len + eleman kontrolü", """
+fn main():
+    let xs = []
+    xs.push(10)
+    xs.push(20)
+    xs.push(30)
+    print(str(len(xs)))
+    print(str(xs[0]) + "/" + str(xs[2]))
+    print(str(xs))
+""", ["3", "10/30", "[10, 20, 30]"])
+
+    expect_parity("push + for döngüsü parity", """
+fn main():
+    let out = []
+    for i in 0..5:
+        out.push(i * 2)
+    let total = 0
+    for v in out:
+        total = total + v
+    print(total)
+    print(str(out))
+""")
+
+    expect_parity("push tree-walker ile None döner (parity)", """
+fn main():
+    let xs = [1]
+    let r = xs.push(2)
+    print(str(r == null))
+    print(str(len(xs)))
+""")
+
+    # to_own + push etkileşimi: borrow üzerinden push yok, GC kopyasında var
+    expect_output("to_own → to_gc sonrası push serbest", """
+fn main():
+    let g = [1]
+    g.push(2)
+    @own let p = to_own(g)
+    g.push(99)
+    let h = to_gc(p)
+    print(str(h))
+    print(str(g))
+""", ["[1, 2]", "[1, 2, 99]"])
+
+    expect_output("bare push(...) da CALL_NATIVE olur", """
+fn main():
+    let xs = [1]
+    push(xs, 5)
+    print(str(len(xs)))
+""", ["2"])
+
+    expect_compile_error("push 0 argüman reddedilir", """
+fn main():
+    let xs = [1]
+    xs.push()
+""", "push() accepts exactly one argument")
+
+    expect_compile_error("push 2 argüman reddedilir", """
+fn main():
+    let xs = [1]
+    xs.push(1, 2)
+""", "push() accepts exactly one argument")
+
+    expect_compile_error("desteklenmeyen metot çağrısı reddedilir", """
+fn main():
+    let xs = [1]
+    xs.foo(1)
+""", "method call '.foo' is not supported")
+
+    # push native'i tabloda: impure (CALL_NATIVE), borç argümanı
+    # CALL_NATIVE sınırında reddedilir.
+    m_push = compile_source("""
+fn main():
+    let xs = [1]
+    xs.push(2)
+""")
+    push_native = next(n for n in m_push.natives if n.name == "push")
+    check("push native impure (flags=0, argc=2)",
+          push_native.argc == 2 and push_native.flags == 0,
+          f"argc={push_native.argc} flags={push_native.flags}")
+    d_push = disassemble(m_push)
+    check("push CALL_NATIVE ile kodlanır (CALL_PURE_NATIVE değil)",
+          "CALL_NATIVE" in d_push and "CALL_PURE_NATIVE" not in d_push, d_push)
+
+
 def test_metadata():
     section("Meta — max_stack / line table / slot modu")
     m = compile_source(SAMPLE)
@@ -2463,6 +2738,7 @@ def main() -> None:
     test_own_vm()
     test_borrow_vm()
     test_borrow_escape_paths()
+    test_for_vm()
     test_list_dict_vm()
     test_errors()
     test_verifier_negatives()

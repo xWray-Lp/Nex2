@@ -30,19 +30,17 @@ ROOT = Path(__file__).resolve().parent
 MATRIX = {
     # examples/vm_basics.nex: designed for the VM; tree output matches exactly.
     "examples/vm_basics.nex": ("SUPPORTED", None),
-    # examples/hello.nex: VM compiles top-level statements into a synthetic
-    # <script> entry, but fails at the first `for` (line 17) — no loops yet.
-    "examples/hello.nex": ("KNOWN_VM_UNSUPPORTED",
-                           "ForStmt is not supported in the VM prototype"),
-    # examples/fizzbuzz.nex: top-level `for` (line 1) — no loops in VM yet.
-    "examples/fizzbuzz.nex": ("KNOWN_VM_UNSUPPORTED",
-                              "ForStmt is not supported in the VM prototype"),
-    # examples/stack.nex: top-level `for` (line 10) — no loops in VM yet.
-    "examples/stack.nex": ("KNOWN_VM_UNSUPPORTED",
-                           "ForStmt is not supported in the VM prototype"),
-    # examples/data_pipeline.nex: top-level `for` (line 22) — no loops yet.
-    "examples/data_pipeline.nex": ("KNOWN_VM_UNSUPPORTED",
-                                   "ForStmt is not supported in the VM prototype"),
+    # examples/hello.nex: for loops (range + list by-index) compile and run
+    # byte-identical to the tree backend.
+    "examples/hello.nex": ("SUPPORTED", None),
+    # examples/fizzbuzz.nex: top-level `for` (line 1) — range loop, VM parity.
+    "examples/fizzbuzz.nex": ("SUPPORTED", None),
+    # examples/stack.nex: `for v in buf` materializes the @stack buffer as a
+    # heap copy (STACK_MATERIALIZE), matching the tree backend's to_list.
+    "examples/stack.nex": ("SUPPORTED", None),
+    # examples/data_pipeline.nex: for over list params + `out.push(...)`
+    # (CALL_NATIVE push); full parity with the tree backend.
+    "examples/data_pipeline.nex": ("SUPPORTED", None),
     # examples/buffer_econ.nex: top-level `@raw` (line 19) — @raw not in VM.
     "examples/buffer_econ.nex": ("KNOWN_VM_UNSUPPORTED",
                                  "@raw is not supported in the VM prototype"),

@@ -3,16 +3,20 @@ Nex Compiler — AST → bytecode (prototip alt kümesi).
 
 Kapsam (v0.1 prototip): int/float/str/bool/null, print/str/int/float/len
 native'leri, aritmetik/karşılaştırma, let/atama, if/elif/else, while,
-break/continue, fonksiyon tanımı + çağrı, return, and/or (eager semantik),
-`@stack` sabit boyutlu diziler (STACK_ALLOC/STACK_MATERIALIZE, indeks
-okuma/yazma, kaçışta derin heap kopyası), `@own` sahipliği
-(OWN_ALLOC/OWN_MOVE/OWN_FREE; borrow yok) ve genel list/dict literalleri
-(NEW_LIST/NEW_DICT + GET_INDEX/SET_INDEX).
+break/continue, for (A.ForStmt: range → while-style tamsayı döngüsü,
+list/str/@stack → indeksle yineleme; destructuring hedef reddedilir),
+fonksiyon tanımı + çağrı, return, and/or (eager semantik), `@stack`
+sabit boyutlu diziler (STACK_ALLOC/STACK_MATERIALIZE, indeks okuma/yazma,
+kaçışta derin heap kopyası), `@own` sahipliği (OWN_ALLOC/OWN_MOVE/
+OWN_FREE; borrow yok) ve genel list/dict literalleri (NEW_LIST/NEW_DICT +
+GET_INDEX/SET_INDEX). `list.push` metodu CALL_NATIVE push ile desteklenir;
+diğer metot çağrıları `.X` kapsam dışıdır.
 
 Kapsam dışı (bilinçli): @raw, nested @stack, `str` elemanlı stack dizi,
-tuple, sınıflar, match, for, import, lambda, f-string, pipe; ayrıca
-list/dict üzerinde compound atama ve metotlar (`.push`, `.length`).
-Bunlar açık CompileError üretir — sessizce yanlış kod üretilmez.
+tuple, sınıflar, match, for'da destructuring, import, lambda, f-string,
+pipe; ayrıca list/dict üzerinde compound atama ve diğer metotlar
+(`.length`, `.pop`, ...). Bunlar açık CompileError üretir — sessizce
+yanlış kod üretilmez.
 
 `@own` kuralları (tree-walker parity) ve borrow (Phase B, v1 alt kümesi):
 - `@own let x = to_own(expr)` ve mevcut @own değişkene `x = to_own(expr)`
@@ -74,6 +78,9 @@ NATIVES: list[NativeInfo] = [
     # keys/values: saf/yapısal (borç argümanı allowlist'i, spec §5).
     NativeInfo("keys",   1, NAT_PURE | NAT_STRUCTURAL),
     NativeInfo("values", 1, NAT_PURE | NAT_STRUCTURAL),
+    # push: impure (list'i mutasyona uğratır) → NAT_PURE yok; derleyici
+    # bunu CALL_NATIVE ile kodlar (CALL_PURE_NATIVE verifier'da reddedilir).
+    NativeInfo("push", 2, 0),
 ]
 _NATIVE_INDEX = {n.name: i for i, n in enumerate(NATIVES)}
 
@@ -475,6 +482,10 @@ class Compiler:
             b.mark(end)
             return
 
+        if isinstance(node, A.ForStmt):
+            self._compile_for(node)
+            return
+
         if isinstance(node, A.ReturnStmt):
             if node.value is not None:
                 self._compile_expr(node.value)
@@ -636,6 +647,87 @@ class Compiler:
         if node.else_block is not None:
             self._compile_block(node.else_block)
         b.mark(end)
+
+    def _compile_for(self, node: A.ForStmt) -> None:
+        """`for item in iterable:` — while makinesiyle aynı ödünç alma
+        semantiği (self._loops = (end, continue=incr, base)).
+
+        - RangeExpr (`0..10`): host range nesnesi YOK; start/end bir kez
+          temp slot'lara alınır, tamsayı sayaç `counter < end` ile döner.
+        - Diğer iterable'lar (list/str, `@stack` Ident yolu zaten
+          STACK_MATERIALIZE ile kopya üretir — tree-walker to_list kopya
+          semantiği) İNDEKSLE döner: `_iter`/`_i`/`_len` temp slot'ları;
+          `len` bir kez CALL_PURE_NATIVE ile hesaplanır; her turda
+          `LOAD _iter; LOAD _i; GET_INDEX → hedef slot`.
+        - Döngü kapsamı: push_scope → pop_scope; hedef yalnız gövdede
+          görünür. break/continue gövde borrow'larını döngü tabanına
+          kadar release eder (while ile aynı); continue etiketi ARTIŞ
+          adımına iner (koşula değil, yoksa sonsuz döngü)."""
+        b = self._builder
+        if not isinstance(node.target, A.Ident):
+            raise CompileError(
+                "destructuring in for loops is not supported in the VM "
+                "prototype", node.target)
+
+        is_range = isinstance(node.iterable, A.RangeExpr)
+        cond = b.new_label()
+        incr = b.new_label()
+        end = b.new_label()
+
+        if is_range:
+            self._compile_expr(node.iterable.start)
+            start_slot = b.new_tmp(node)
+            b.emit("STORE_LOCAL", start_slot, node=node)
+            self._compile_expr(node.iterable.end)
+            end_slot = b.new_tmp(node)
+            b.emit("STORE_LOCAL", end_slot, node=node)
+            b.emit("LOAD_LOCAL", start_slot, node=node)
+            counter_slot = b.new_tmp(node)
+            b.emit("STORE_LOCAL", counter_slot, node=node)
+            cond_a, cond_b = counter_slot, end_slot
+        else:
+            # İterable bir kez değerlendirilir (tree-walker sequence kopyası).
+            self._compile_expr(node.iterable)
+            iter_slot = b.new_tmp(node)
+            b.emit("STORE_LOCAL", iter_slot, node=node)
+            b.emit("CONST", self._const(TAG_INT, 0), node=node)
+            i_slot = b.new_tmp(node)
+            b.emit("STORE_LOCAL", i_slot, node=node)
+            b.emit("LOAD_LOCAL", iter_slot, node=node)
+            b.emit("CALL_PURE_NATIVE", _NATIVE_INDEX["len"], 1, node=node)
+            len_slot = b.new_tmp(node)
+            b.emit("STORE_LOCAL", len_slot, node=node)
+            cond_a, cond_b = i_slot, len_slot
+
+        # Döngü kapsamı: hedef yalnız gövdede görünür.
+        base = len(b._scope_borrows)
+        b.push_scope()
+        target_slot = b.declare(node.target.name, node.target)
+        self._loops.append((end, incr, base))
+        b.mark(cond)
+        b.emit("LOAD_LOCAL", cond_a, node=node)
+        b.emit("LOAD_LOCAL", cond_b, node=node)
+        b.emit("LT", node=node)
+        b.emit("JUMP_IF_FALSE", end, node=node)
+        # item: range → sayaç değeri; diğer → _iter[_i].
+        if is_range:
+            b.emit("LOAD_LOCAL", counter_slot, node=node)
+        else:
+            b.emit("LOAD_LOCAL", iter_slot, node=node)
+            b.emit("LOAD_LOCAL", i_slot, node=node)
+            b.emit("GET_INDEX", node=node)
+        b.emit("STORE_LOCAL", target_slot, node=node)
+        self._compile_block(node.body, new_scope=True)
+        b.mark(incr)
+        step_slot = counter_slot if is_range else i_slot
+        b.emit("LOAD_LOCAL", step_slot, node=node)
+        b.emit("CONST", self._const(TAG_INT, 1), node=node)
+        b.emit("ADD", node=node)
+        b.emit("STORE_LOCAL", step_slot, node=node)
+        b.emit("JUMP", cond, node=node)
+        b.mark(end)
+        self._loops.pop()
+        b.pop_scope()
 
     # -- expression'lar ------------------------------------------------------
     def _compile_expr(self, node: A.Node) -> None:
@@ -859,6 +951,10 @@ class Compiler:
 
     def _compile_call(self, node: A.CallExpr) -> None:
         b = self._builder
+        if isinstance(node.callee, A.MemberExpr):
+            # `obj.push(v)` — prototipteki tek metot çağrısı.
+            self._compile_member_call(node)
+            return
         if not isinstance(node.callee, A.Ident):
             raise CompileError(
                 "only direct function calls are supported in the VM prototype",
@@ -907,16 +1003,41 @@ class Compiler:
             else:
                 self._compile_expr(arg)
 
-        # İsim çözümleme: kullanıcı fonksiyonu ÖNCE, native SONRA.
+        # İsim çözümleme: kullanıcı fonksiyonu ÖNCE, native SONRA. Impure
+        # native (push) CALL_NATIVE ister: CALL_PURE_NATIVE verifier'da
+        # "not pure" ile reddedilir.
         if name in self._func_index:
             b.emit("CALL", self._func_index[name], len(node.args), node=node)
         elif name in _NATIVE_INDEX:
-            b.emit("CALL_PURE_NATIVE", _NATIVE_INDEX[name], len(node.args),
-                   node=node)
+            nat = NATIVES[_NATIVE_INDEX[name]]
+            opcode = ("CALL_PURE_NATIVE"
+                      if nat.pure and not nat.retains_ref else "CALL_NATIVE")
+            b.emit(opcode, _NATIVE_INDEX[name], len(node.args), node=node)
         else:
             raise CompileError(f"undefined function '{name}'", node)
         for tmp in borrow_temps:
             b.emit("BORROW_END", tmp, node=node)
+
+    def _compile_member_call(self, node: A.CallExpr) -> None:
+        """`obj.push(v)` — list.push native'i (CALL_NATIVE, argc=2).
+
+        Diğer her metot adı kapsam dışıdır: `method call '.X' is not
+        supported in the VM prototype`. Argüman sayısı tam 1 olmalı."""
+        b = self._builder
+        assert isinstance(node.callee, A.MemberExpr)
+        member = node.callee.member
+        if member != "push":
+            raise CompileError(
+                f"method call '.{member}' is not supported in the VM "
+                f"prototype", node)
+        if node.type_args:
+            raise CompileError("call-site type args are not supported in VM",
+                               node)
+        if len(node.args) != 1:
+            raise CompileError("push() accepts exactly one argument", node)
+        self._compile_expr(node.callee.obj)      # [obj]
+        self._compile_expr(node.args[0])         # [obj, val]
+        b.emit("CALL_NATIVE", _NATIVE_INDEX["push"], 2, node=node)
 
     def _compile_own_move_call(self, node: A.CallExpr, name: str) -> None:
         """`to_gc(x)` / `free(x)` — x @own slot olmalı; OWN_MOVE/OWN_FREE.
