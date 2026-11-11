@@ -218,11 +218,11 @@ BORROW modlu bir değer `GET_INDEX`/`GET_MEMBER` operandı olabilir (per-access
 
 ### 6.6 Mod opcode'ları
 
-> **Phase notu:** `@own` (0x40–0x42) v0.1 prototipinde **Phase A** olarak
-> uygulandı (derin kopya, move/free, frame sonu kill, OWN slotuna LOAD/STORE
-> yasağı). Borrow opcode'ları (0x50–0x53) **Phase B**'dir; `slot_epochs`
-> nesli ve `frame_id` Phase B için rezerve edildi, `BORROW_END` bayat
-> epoch'ta sayacı düşürmez.
+> **Phase notu:** `@own` (0x40–0x42) **Phase A** olarak uygulandı (derin
+> kopya, move/free, frame sonu kill, OWN slotuna LOAD/STORE yasağı);
+> borrow opcode'ları (0x50–0x52) **Phase B** olarak uygulandı — **@own
+> Phase A + borrow Phase B uygulandı.** `slot_epochs` nesli ve `frame_id`
+> devrede; `BORROW_END` bayat epoch'ta sayacı düşürmez.
 
 | Hex | Mnemonic | Operandlar | Etki | Not |
 |---|---|---|---|---|
@@ -267,6 +267,25 @@ BORROW modlu bir değer `GET_INDEX`/`GET_MEMBER` operandı olabilir (per-access
 mutable, released}`. NLL geldiğinde derleyici yalnız `BORROW_END`'in
 konumunu değiştirir — **yeni opcode yok**.
 
+**Uygulanan semantik (Phase B):**
+- `BORROW_SHARED`/`BORROW_MUT`: pop yapmaz; `src` canlı OWN yükü olmalı,
+  epoch `fr.slot_epochs[src]`'ten çözülür; owner sayaçları güncellenir
+  (`shared += 1` / `mut_borrowed = 1`). Çakışmada konumlu hata:
+  `borrow conflict: shared borrow of '<name>' while mutably borrowed` /
+  `borrow conflict: exclusive &mut borrow of '<name>' while borrowed`.
+- `BORROW_END`: `release()` — borrow'u released işaretler ve owner
+  sayacını düşürür; slot nesli borrow'un epoch'uyla uyuşmuyorsa (slot
+  yeniden kurulduysa) sayaç **düşürülmez** (stale-decrement kuralı).
+  Slot ölü wrapper tutar; sonraki erişim
+  `use of released borrow '<name>'` hatasıdır.
+- **Blok çıkışı:** derleyici her scope'ta bildirilen BORROW slotlarına
+  blok sonunda `BORROW_END` yazar (ters bildirim sırası); fonksiyon en
+  dış bloğu frame çıkışı kill'e emanettir. Frame çıkış sırası
+  **borrow → own → stack** (tree-walker `close()` ile aynı).
+- `GET_INDEX`/`SET_INDEX` ve `len/keys/values` borrow'u per-access
+  `check()` sonrası `owner._value` çözümlemesiyle uygular; paylaşımlı
+  borrow'dan yazma `cannot write through shared borrow '<name>'` hatasıdır.
+
 ### 6.8 Kapsam / temizlik
 
 | Hex | Mnemonic | Etki | Not |
@@ -301,9 +320,12 @@ Tip doğrulaması v1 verifier'ın kapsamında değil (checker zaten yapıyor);
 verifier mod/yığın/akış güvenliğinden sorumlu.
 
 > **Prototip (v0.1) kapsamı:** 1, 2, 3, 5, 7 ve stack slotu (8) tam
-> uygulanır. 4 (borrow ömrü / NLL) ve 6 (`BLOCK_*` dengesi) borrow ve blok
-> opcode'ları derlenmeye başlayınca devreye girer; bu opcode'ları taşıyan
-> modüllerde şimdilik yalnız slot modu düzeyinde denetim yapılır.
+> uygulanır. 4 (borrow ömrü) **kısmen uygulanır:** `BORROW_*` slot modu
+> kuralları (`BORROW_SHARED`/`BORROW_MUT` src OWN / dst BORROW,
+> `BORROW_END`/`BORROW_CHECK` BORROW) yükleme anında zorunludur; lexical
+> iç içelik denetlenmez, istisna yolunda frame çıkışı borrow release
+> (borrow → own → stack) temizliği yapar. 6 (`BLOCK_*` dengesi) blok
+> opcode'ları devreye girince uygulanır.
 
 ---
 
@@ -398,4 +420,14 @@ karşılaştırması yapabilsin.
   ancak ne tree-walker runtime'ında ne de VM opcode tablosunda karşılığı
   var. Operatörün semantiği (int/float, negatif taban önceliği) v0.2'de
   kararlaştırılıp eklenecek.
+- **Borrow yaşam v1:** borrow block-lokaldir (derleyici scope çıkışına
+  `BORROW_END` yazar). `break`/`continue` scope çıkışını atladığı için
+  derleyici artık döngü scope'unun taban derinliğine kadar açık borrow'ları
+  JUMP'tan önce ters bildirim sırasıyla `BORROW_END` ile release eder;
+  `return` ise RET'ten önce açık olan tüm scope borrow'larını release eder.
+  Frame kill (borrow → own → stack) istisna yolları için genel güvenlik
+  ağı olarak kalır; çift `BORROW_END` zararsızdır (release idempotent).
+  NLL geldiğinde yalnız `BORROW_END` konumu değişir. Ayrıca RET anında
+  dönüş değeri borrow/@own içeremez — ham bytecode'da container'a sızdırma
+  denemesi konumlu `VMError` ("function boundary violation") verir.
 - Register machine eşlemesi — bu ISA'nın üstünde ayrı tur.

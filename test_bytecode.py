@@ -1220,6 +1220,449 @@ fn main():
     check("OwnValueValue repr ölü", repr(ov) == "<freed own 'x'>", repr(ov))
 
 
+def test_borrow_vm():
+    section("Borrow — BORROW_SHARED / BORROW_MUT / BORROW_END (Phase B)")
+
+    # ── Geçerli programlar (tree-walker parity, test_own.py §12 matrisi) ─
+    expect_parity("mut borrow read/write", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &mut xs
+    r[0] = 42
+    print(str(r[0]))
+""")
+
+    expect_parity("two shared borrows fine", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let a = &xs
+    let b = &xs
+    print(str(a[0]))
+    print(str(b[0]))
+""")
+
+    expect_parity("len(&expr) — direct BorrowExpr argument", """
+fn main():
+    @own let xs = to_own([1, 2, 3])
+    print(str(len(&xs)))
+""")
+
+    expect_parity("len(r) on list", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    print(str(len(r)))
+""")
+
+    expect_parity("len(r) on dict", """
+fn main():
+    @own let d = to_own({"a": 1, "b": 2})
+    let r = &d
+    print(str(len(r)))
+""")
+
+    expect_parity("keys(r)/values(r) on dict (allowlist natives)", """
+fn main():
+    @own let d = to_own({"a": 1, "b": 2})
+    let r = &d
+    print(str(len(keys(r))))
+    print(str(len(values(r))))
+""")
+
+    expect_parity("list index write via &mut", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &mut xs
+    r[0] = 42
+    print(str(r[1]))
+    print(str(len(r)))
+""")
+
+    expect_parity("dict index write via &mut", """
+fn main():
+    @own let d = to_own({"a": 1})
+    let r = &mut d
+    r["a"] = 5
+    print(str(r["a"]))
+""")
+
+    expect_parity("scope auto-release allows to_gc after block", """
+fn main():
+    @own let xs = to_own([7, 8])
+    if true:
+        let r = &xs
+        print(str(r[0]))
+    let g = to_gc(xs)
+    print(str(g[1]))
+""")
+
+    # ── Derleme zamanı reddi ────────────────────────────────────────────
+    expect_compile_error("borrow non-own rejected", """
+fn main():
+    let x = [1, 2]
+    let r = &x
+""", "only @own values can be borrowed")
+
+    expect_compile_error("borrow into user fn rejected", """
+fn take(xs: [int]):
+    let n = len(xs)
+
+fn main():
+    @own let p = to_own([1, 2])
+    take(&p)
+""", "borrowed references cannot cross function boundaries")
+
+    expect_compile_error("shadowed fn len rejects borrow at compile", """
+fn len(x: [int]) -> int:
+    return 99
+
+fn main():
+    @own let xs = to_own([1, 2])
+    print(str(len(&xs)))
+""", "borrowed references cannot cross function boundaries")
+
+    expect_compile_error("return borrow expr rejected", """
+fn leak() -> [int]:
+    @own let p = to_own([1, 2])
+    return &p
+
+fn main():
+    leak()
+""", "borrowed references cannot cross function boundaries")
+
+    expect_compile_error("reassign existing var via borrow expr rejected", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    r = &xs
+""", "borrow expressions need a fresh let binding")
+
+    # ── Runtime reddi (VMError) ─────────────────────────────────────────
+    expect_vm_error("shadowed fn len rejects borrow at runtime", """
+fn len(x: [int]) -> int:
+    return 99
+
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    print(str(len(r)))
+""", "borrowed references cannot cross function boundaries")
+
+    expect_vm_error("non-pure builtin str rejects borrow arg", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    print(str(r))
+""", "borrowed references cannot cross function boundaries")
+
+    expect_vm_error("free while borrowed", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    free(xs)
+""", "cannot move/free")
+
+    expect_vm_error("to_gc while borrowed", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    let g = to_gc(xs)
+""", "cannot move/free")
+
+    expect_vm_error("write through shared borrow", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let r = &xs
+    r[0] = 9
+""", "cannot write through shared borrow")
+
+    expect_vm_error("mut borrow after shared conflicts", """
+fn main():
+    @own let xs = to_own([1, 2])
+    let a = &xs
+    let b = &mut xs
+""", "borrow conflict")
+
+    expect_vm_error("keys() on non-dict gives a positioned error", """
+fn main():
+    print(str(keys([1, 2])))
+""", "keys() expects a dict")
+
+    # ── Borrow slot metadata / disassembly ──────────────────────────────
+    m = compile_source("""
+fn main():
+    @own let xs = to_own([1, 2])
+    if true:
+        let r = &mut xs
+        r[0] = 42
+        print(str(r[0]))
+""")
+    f = m.functions[0]
+    d = disassemble(m)
+    check("borrow slotu MODE_BORROW", MODE_BORROW in list(f.slot_modes),
+          f"slot_modes={list(f.slot_modes)}")
+    check("BORROW_MUT / BORROW_END disasm'da", "BORROW_MUT" in d
+          and "BORROW_END" in d, d)
+    check("allowlist native'ler tabloda",
+          [n.name for n in m.natives] ==
+          ["print", "str", "int", "float", "len", "keys", "values"],
+          str([n.name for n in m.natives]))
+
+    # ── Handwritten bytecode: BORROW_END released işaretler ─────────────
+    released_mod = mk_module(
+        fn_bytes(
+            ("NEW_LIST", 0),
+            ("OWN_ALLOC", 0),
+            ("BORROW_SHARED", 1, 0),
+            ("BORROW_END", 1),
+            ("LOAD_LOCAL", 1),
+            ("CONST", 0),
+            ("GET_INDEX",),
+            ("POP",),
+            ("CONST", 0),
+            ("RET",),
+        ),
+        consts=[(TAG_NULL, None)],
+        n_locals=2,
+        max_stack=3,
+        slot_modes=bytes([MODE_OWN, MODE_BORROW]),
+    )
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_module(released_mod)
+        check("BORROW_END sets released (use after end)", False, "no error")
+    except VMError as e:
+        check("BORROW_END sets released (use after end)",
+              "use of released borrow" in str(e), f"msg={e}")
+
+    # ── Handwritten: bayat epoch borrow deref → use-after-free ─────────
+    stale_mod = mk_module(
+        fn_bytes(
+            ("NEW_LIST", 0),
+            ("OWN_ALLOC", 0),          # epoch 1
+            ("BORROW_SHARED", 1, 0),   # target_epoch 1
+            ("NEW_LIST", 0),
+            ("OWN_ALLOC", 0),          # slot yeniden kuruldu: epoch 2
+            ("LOAD_LOCAL", 1),
+            ("CONST", 0),
+            ("GET_INDEX",),
+            ("POP",),
+            ("CONST", 0),
+            ("RET",),
+        ),
+        consts=[(TAG_NULL, None)],
+        n_locals=2,
+        max_stack=3,
+        slot_modes=bytes([MODE_OWN, MODE_BORROW]),
+    )
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_module(stale_mod)
+        check("stale epoch borrow deref panics", False, "no error")
+    except VMError as e:
+        check("stale epoch borrow deref panics",
+              "use-after-free" in str(e), f"msg={e}")
+
+    # ── Handwritten: bayat borrow'a BORROW_END sayaç düşürmez ──────────
+    # Owner sayaç 0 kalır → OWN_FREE (move/free) serbest geçer.
+    stale_end_mod = mk_module(
+        fn_bytes(
+            ("NEW_LIST", 0),
+            ("OWN_ALLOC", 0),          # epoch 1
+            ("BORROW_SHARED", 1, 0),
+            ("NEW_LIST", 0),
+            ("OWN_ALLOC", 0),          # epoch 2 (borrow bayat)
+            ("BORROW_END", 1),         # bayat: sayaç düşürülmez
+            ("OWN_FREE", 0),           # sayaç 0 → serbest
+            ("CONST", 0),
+            ("RET",),
+        ),
+        consts=[(TAG_NULL, None)],
+        n_locals=2,
+        max_stack=3,
+        slot_modes=bytes([MODE_OWN, MODE_BORROW]),
+    )
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_module(stale_end_mod)
+        check("BORROW_END on stale borrow leaves counters free", True)
+    except Exception as e:  # noqa: BLE001
+        check("BORROW_END on stale borrow leaves counters free", False,
+              f"{type(e).__name__}: {e}")
+
+    # ── Handwritten: BORROW_END non-borrow slotta VMError ──────────────
+    nonborrow_mod = mk_module(
+        fn_bytes(
+            ("BORROW_END", 0),
+            ("CONST", 0),
+            ("RET",),
+        ),
+        consts=[(TAG_NULL, None)],
+        n_locals=1,
+        max_stack=2,
+        slot_modes=bytes([MODE_BORROW]),
+    )
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_module(nonborrow_mod)
+        check("BORROW_END on non-borrow slot", False, "no error")
+    except VMError as e:
+        check("BORROW_END on non-borrow slot",
+              "BORROW_END on non-borrow slot" in str(e), f"msg={e}")
+
+
+def test_borrow_escape_paths():
+    """F1 (continue/break/return borrow release) + F2 (RET sınırı denetimi)."""
+    section("Borrow — continue/break/return scope release + RET boundary")
+
+    # ── F1: continue döngü gövdesi borrow'unu release etmeli ────────────
+    continue_src = """
+fn main():
+    @own let xs = to_own([1, 2, 3])
+    let i = 0
+    while i < 3:
+        let r = &xs
+        i = i + 1
+        if r[0] == 1:
+            continue
+    let g = to_gc(xs)
+    print(str(len(g)))
+"""
+    expect_parity("continue releases loop-body borrow (to_gc after loop)",
+                  continue_src)
+
+    # Doğrudan sayaç denetimi (tiny repro): acquire kayıtları — continue
+    # her turda release etmezse sayaç birikir (1,2,3…); düzeltilmişte 1.
+    import vm as _vm
+    acq_rec: list[int] = []
+    _orig_acq = _vm.OwnValueValue.acquire_shared
+
+    def _rec_acq(self):
+        _orig_acq(self)
+        acq_rec.append(self.shared)
+
+    _vm.OwnValueValue.acquire_shared = _rec_acq
+    try:
+        _m, got = run_vm(continue_src)
+    finally:
+        _vm.OwnValueValue.acquire_shared = _orig_acq
+    check("continue path: owner shared counter never exceeds 1",
+          acq_rec and max(acq_rec) == 1, f"counters={acq_rec}")
+
+    # ── F1: break aynı şekilde release etmeli ───────────────────────────
+    break_src = """
+fn main():
+    @own let xs = to_own([1, 2, 3])
+    let i = 0
+    while i < 3:
+        let r = &xs
+        i = i + 1
+        if i == 2:
+            break
+    let g = to_gc(xs)
+    print(str(g[0]))
+"""
+    expect_parity("break releases loop-body borrow (to_gc after loop)",
+                  break_src)
+
+    acq_rec2: list[int] = []
+    _orig_acq2 = _vm.OwnValueValue.acquire_shared
+
+    def _rec_acq2(self):
+        _orig_acq2(self)
+        acq_rec2.append(self.shared)
+
+    _vm.OwnValueValue.acquire_shared = _rec_acq2
+    try:
+        _m, got = run_vm(break_src)
+    finally:
+        _vm.OwnValueValue.acquire_shared = _orig_acq2
+    check("break path: owner shared counter never exceeds 1",
+          acq_rec2 and max(acq_rec2) == 1, f"counters={acq_rec2}")
+
+    # ── F1: return blok içinden — RET'ten önce BORROW_END ──────────────
+    ret_src = """
+fn probe() -> int:
+    @own let xs = to_own([7, 8])
+    let i = 0
+    while i < 3:
+        let r = &xs
+        i = i + 1
+        if i == 2:
+            return len(r)
+    return 0
+
+fn main():
+    print(str(probe()))
+"""
+    expect_output("return from loop body runs (borrow released before RET)",
+                  ret_src, ["2"])
+
+    m = compile_source(ret_src)
+    for fn in m.functions:
+        if fn.name == "probe":
+            instrs = decode_code(fn.code)
+            check("in-loop return emits BORROW_END before RET",
+                  any(ins.name == "RET" and instrs[idx - 1].name == "BORROW_END"
+                      for idx, ins in enumerate(instrs) if idx > 0),
+                  "no RET preceded by BORROW_END")
+
+    # ── F2: ham bytecode borrow'u NEW_LIST'e sızdırıp RET eder ─────────
+    leak_mod = mk_module(
+        fn_bytes(
+            ("NEW_LIST", 0),
+            ("OWN_ALLOC", 0),
+            ("BORROW_SHARED", 1, 0),
+            ("LOAD_LOCAL", 1),
+            ("NEW_LIST", 1),           # list içine canlı borrow
+            ("RET",),
+        ),
+        consts=[(TAG_NULL, None)],
+        n_locals=2,
+        max_stack=4,
+        slot_modes=bytes([MODE_OWN, MODE_BORROW]),
+    )
+    try:
+        run_module(leak_mod)
+        check("raw RET of borrow inside list rejected", False, "no error")
+    except VMError as e:
+        check("raw RET of borrow inside list rejected",
+              "function boundary violation" in str(e), f"msg={e}")
+
+    # ── F2: aynı denetim @own değeri için ───────────────────────────────
+    own_leak_mod = mk_module(
+        fn_bytes(
+            ("NEW_LIST", 0),
+            ("OWN_ALLOC", 0),
+            ("LOAD_LOCAL", 0),
+            ("CONST", 0),
+            ("NEW_DICT", 1),           # dict içine canlı @own (key)
+            ("RET",),
+        ),
+        consts=[(TAG_NULL, None)],
+        n_locals=1,
+        max_stack=4,
+        slot_modes=bytes([MODE_OWN]),
+    )
+    try:
+        # Verifier LOAD_LOCAL OWN'ı zaten reddeder; bu test ham bytecode
+        # savunma ağını (RET denetimi) hedefler, verifier'ı bypass eder.
+        _orig_verify = _vm.verify_module
+        _vm.verify_module = lambda _m: None
+        try:
+            run_module(own_leak_mod)
+            check("raw RET of @own inside dict rejected", False, "no error")
+        finally:
+            _vm.verify_module = _orig_verify
+    except VMError as e:
+        check("raw RET of @own inside dict rejected",
+              "function boundary violation" in str(e), f"msg={e}")
+
+
 def test_list_dict_vm():
     section("list/dict literalleri — NEW_LIST / NEW_DICT")
 
@@ -1845,6 +2288,8 @@ def main() -> None:
     test_and_or()
     test_stack_vm()
     test_own_vm()
+    test_borrow_vm()
+    test_borrow_escape_paths()
     test_list_dict_vm()
     test_errors()
     test_verifier_negatives()

@@ -4,8 +4,8 @@ Nex VM — stack tabanlı yürütücü (prototip alt kümesi).
 Bytecode sözleşmesi: NEX_BYTECODE_SPEC.md. Bu VM modsuz alt kümenin yanında
 `@stack` (STACK_ALLOC/STACK_MATERIALIZE, index erişimi, frame ömrü) ve
 `@own` (OWN_ALLOC/OWN_MOVE/OWN_FREE; derin kopya, move/free, frame sonu
-kill) desteği taşır. Borrow (BORROW_*) ve RAW opcode'ları Phase B'de
-eklenecek.
+kill) desteği taşır. Borrow opcode'ları (BORROW_SHARED/MUT/END/CHECK)
+Phase B'de uygulandı; RAW opcode'ları sonraki turda eklenecek.
 
 Faz 1 hedefi semantik doğrulamadır; performans değil. Değerler host Python
 nesneleridir (int/float/str/bool/None) — Faz 1'in "host GC" kararı gereği.
@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from bytecode import (
     FunctionCode, Instr, Module, decode_code, verify_module,
-    MODE_STACK, MODE_OWN, TAG_TYPE, MAX_STACK_ELEMS,
+    MODE_STACK, MODE_OWN, MODE_BORROW, TAG_TYPE, MAX_STACK_ELEMS,
     TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE,
     TYPE_KIND_BOOL, TYPE_KIND_PTR, TYPE_KIND_NAMES,
 )
@@ -122,10 +122,81 @@ class OwnValueValue:
         self.alive = False
         self._value = None
 
+    def acquire_shared(self) -> None:
+        """Paylaşımlı borrow talebi (tree-walker OwnValue.acquire_shared)."""
+        if self.mut_borrowed > 0:
+            raise VMError(
+                f"borrow conflict: shared borrow of '{self.name}' "
+                f"while mutably borrowed")
+        self.shared += 1
+
+    def acquire_mut(self) -> None:
+        """Dışlayıcı &mut borrow talebi (tree-walker OwnValue.acquire_mut)."""
+        if self.shared > 0 or self.mut_borrowed > 0:
+            raise VMError(
+                f"borrow conflict: exclusive &mut borrow of '{self.name}' "
+                f"while borrowed")
+        self.mut_borrowed = 1
+
     def __repr__(self) -> str:
         if not self.alive:
             return f"<freed own '{self.name}'>"
         return f"<own '{self.name}'>"
+
+    __str__ = __repr__
+
+
+class BorrowValue:
+    """`&x` / `&mut x` borrow wrapper'ı (tree-walker BorrowRef semantiği, v1).
+
+    Block-lokal ömür: BORROW_END (blok çıkışı) veya frame sonu release.
+    `(target_frame, target_slot, target_epoch)` borrow'un işaret ettiği
+    OWN slotun `(frame_id, slot, slot_epochs)` üçlüsüdür; release yalnız
+    slot nesli hâlâ taze ise owner sayacını düşürür — bayat borrow
+    (slot yeniden kurulduysa) sessizce release olur (stale-decrement
+    kuralı, NEX_VM_DESIGN.md §4-§5)."""
+
+    __slots__ = ("owner", "mutable", "name", "released",
+                 "target_frame", "target_slot", "target_epoch")
+
+    def __init__(self, owner: OwnValueValue, mutable: bool, name: str,
+                 target_frame: int, target_slot: int, target_epoch: int):
+        self.owner = owner
+        self.mutable = mutable
+        self.name = name
+        self.released = False
+        self.target_frame = target_frame
+        self.target_slot = target_slot
+        self.target_epoch = target_epoch
+
+    def release(self, fr: Optional["_Frame"] = None) -> None:
+        if self.released:
+            return
+        self.released = True
+        # Bayat borrow: slot yeni nesle kurulduysa sayaç düşürme (sayım
+        # eski neslin ölçümüdür; yeni yüke yanlış decrement sızmasın).
+        if (fr is not None
+                and self.target_slot < len(fr.slot_epochs)
+                and fr.slot_epochs[self.target_slot] != self.target_epoch):
+            return
+        if self.mutable:
+            if self.owner.mut_borrowed > 0:
+                self.owner.mut_borrowed -= 1
+        elif self.owner.shared > 0:
+            self.owner.shared -= 1
+
+    def check(self) -> None:
+        if self.released:
+            raise VMError(f"use of released borrow '{self.name}'")
+        if not self.owner.alive:
+            raise VMError(
+                f"@own value '{self.owner.name}' used after free/scope end "
+                f"(use-after-free)")
+
+    def __repr__(self) -> str:
+        kind = "&mut" if self.mutable else "&"
+        state = " (released)" if self.released else ""
+        return f"<borrow {kind} '{self.name}'{state}>"
 
     __str__ = __repr__
 
@@ -139,6 +210,11 @@ def _nex_str(v: Any) -> str:
 
 
 def _nex_len(v: Any) -> int:
+    if isinstance(v, BorrowValue):
+        # Saf builtin: referansı saklamaz, çağrı süresince çözer (§4 v1
+        # allowlist). `len(&x)` bu yüzden fonksiyon sınırı sayılmaz.
+        v.check()
+        v = v.owner._value
     if isinstance(v, StackArrayValue):
         return len(v)
     if isinstance(v, OwnValueValue):
@@ -151,13 +227,38 @@ def _nex_len(v: Any) -> int:
         f"len() expects a list, dict or string, got {type(v).__name__}")
 
 
+def _nex_keys(d: Any) -> list:
+    if isinstance(d, BorrowValue):
+        d.check()
+        d = d.owner._value
+    if not isinstance(d, dict):
+        raise TypeError(f"keys() expects a dict, got '{type(d).__name__}'")
+    return list(d.keys())
+
+
+def _nex_values(d: Any) -> list:
+    if isinstance(d, BorrowValue):
+        d.check()
+        d = d.owner._value
+    if not isinstance(d, dict):
+        raise TypeError(f"values() expects a dict, got '{type(d).__name__}'")
+    return list(d.values())
+
+
 NATIVE_FUNCS = {
     "print": lambda *args: print(" ".join(str(a) for a in args)),
     "str":   _nex_str,
     "int":   int,
     "float": float,
     "len":   _nex_len,
+    "keys":  _nex_keys,
+    "values": _nex_values,
 }
+
+#: Spec §6.4/§5: borrow argümanı yalnız bu saf/yapısal native'lere
+#: CALL_PURE_NATIVE ile geçebilir (checker PURE_BORROW_BUILTINS ile aynı
+#: liste; `length` native tablosunda yok, v1 VM listesi budur).
+BORROW_NATIVE_ALLOWLIST = frozenset({"len", "keys", "values"})
 
 
 @dataclass
@@ -231,6 +332,9 @@ class VM:
                 raise VMError(
                     f"cannot pass @own value as argument {i + 1} of "
                     f"'{fn.name}'; move it with to_gc(x) first")
+            if isinstance(a, BorrowValue):
+                raise VMError(
+                    "borrowed references cannot cross function boundaries")
         slots: list[Any] = [None] * fn.n_locals
         for i, a in enumerate(args):
             slots[i] = a
@@ -246,8 +350,55 @@ class VM:
             return self._execute(frame)
         finally:
             self._depth -= 1
-            self._kill_stack_slots(fn, slots)
+            # Frame çıkış sırası (tree-walker close()): borrow → own →
+            # stack. Borrow release owner sayaçlarını düşürür; hemen
+            # ardından own kill, sonra stack kill.
+            self._kill_borrow_slots(fn, frame)
             self._kill_own_slots(fn, frame)
+            self._kill_stack_slots(fn, slots)
+
+    @staticmethod
+    def _kill_borrow_slots(fn: FunctionCode, frame: "_Frame") -> None:
+        """Frame çıkışında canlı borrow'ları release et (scope sonu).
+
+        BORROW_END ile aynı rutin: release owner sayaçlarını düşürür
+        (bayat borrow stale-decrement kuralıyla sessizce düşer), slot ölü
+        wrapper tutar. Derleyici blok çıkışına BORROW_END yazdığı için bu
+        yalnız fonksiyon en dış bloğu ve istisna yolu içindir."""
+        for i, mode in enumerate(fn.slot_modes):
+            if mode != MODE_BORROW or i >= len(frame.slots):
+                continue
+            v = frame.slots[i]
+            if isinstance(v, BorrowValue) and not v.released:
+                v.release(frame)
+
+    @staticmethod
+    def _check_return_boundary(v: Any, fr: "_Frame", ins: Instr) -> None:
+        """RET anında borrow/@own kaçış denetimi (ham bytecode savunması).
+
+        call() yalnız argümanları doğrular; dönüş değeri frame'den çıktığı
+        için frame-exit kill ona ulaşamaz. Elle yazılmış bir modül
+        LOAD_LOCAL (BORROW slot) → NEW_LIST/NEW_DICT → RET ile borrow'u
+        kalıcı sızdırabilir. Derleyici kaynak seviyesinde borrow/own'un
+        container'a veya dönüş değerine girmesini zaten reddeder; bu ağ
+        yalnız raw bytecode içindir ve derleyicinin üretebileceği hiçbir
+        değeri reddetmez (recursion: host list/dict/tuple)."""
+        loc = fr.fn.line_of(ins.pc)
+        seen: set[int] = set()
+        todo: list[Any] = [v]
+        while todo:
+            cur = todo.pop()
+            if isinstance(cur, (BorrowValue, OwnValueValue)):
+                raise VMError(
+                    "returned value contains a live borrow/@own value "
+                    "(function boundary violation)", *loc)
+            if isinstance(cur, (list, dict, tuple)) and id(cur) not in seen:
+                seen.add(id(cur))
+                if isinstance(cur, dict):
+                    todo.extend(cur.keys())
+                    todo.extend(cur.values())
+                else:
+                    todo.extend(cur)
 
     @staticmethod
     def _kill_stack_slots(fn: FunctionCode, slots: list[Any]) -> None:
@@ -386,6 +537,49 @@ class VM:
                 # OWN_FREE yığına bir şey bırakmaz; derleyici ifade bağlamı
                 # için ayrıca CONST null üretir.
 
+            elif name in ("BORROW_SHARED", "BORROW_MUT"):
+                dst, src = a
+                loc = fr.fn.line_of(ins.pc)
+                owner = fr.slots[src] if src < len(fr.slots) else None
+                if not isinstance(owner, OwnValueValue) or not owner.alive:
+                    raise VMError("only @own values can be borrowed", *loc)
+                try:
+                    if name == "BORROW_SHARED":
+                        owner.acquire_shared()
+                    else:
+                        owner.acquire_mut()
+                except VMError as e:
+                    raise VMError(e.message, *loc) from None
+                # Epoch, borrow anındaki slot neslidir; BORROW_END bu
+                # epoch'u slotla karşılaştırır (stale-decrement kuralı).
+                epoch = (fr.slot_epochs[src]
+                         if src < len(fr.slot_epochs) else 0)
+                fr.slots[dst] = BorrowValue(
+                    owner=owner, mutable=(name == "BORROW_MUT"),
+                    name=owner.name, target_frame=fr.frame_id,
+                    target_slot=src, target_epoch=epoch)
+
+            elif name == "BORROW_END":
+                si = a[0]
+                loc = fr.fn.line_of(ins.pc)
+                v = fr.slots[si]
+                if not isinstance(v, BorrowValue):
+                    raise VMError("BORROW_END on non-borrow slot", *loc)
+                v.release(fr)
+                # Slot ölür; ölü wrapper yerinde kalır (sonraki erişim
+                # 'use of released borrow' hatasıdır).
+
+            elif name == "BORROW_CHECK":
+                si = a[0]
+                loc = fr.fn.line_of(ins.pc)
+                v = fr.slots[si]
+                if not isinstance(v, BorrowValue):
+                    raise VMError("BORROW_CHECK on non-borrow slot", *loc)
+                try:
+                    v.check()
+                except VMError as e:
+                    raise VMError(e.message, *loc) from None
+
             elif name == "NEW_LIST":
                 n = a[0]
                 loc = fr.fn.line_of(ins.pc)
@@ -460,6 +654,19 @@ class VM:
                                   *fr.fn.line_of(ins.pc))
                 call_args = [st.pop() for _ in range(argc)]
                 call_args.reverse()
+                loc = fr.fn.line_of(ins.pc)
+                # Sınır kuralı (spec §6.4): borrow fonksiyon sınırını
+                # geçemez; tek istisna allowlist saf native'lere
+                # (len/keys/values) CALL_PURE_NATIVE ile geçiş.
+                if not (name == "CALL_PURE_NATIVE"
+                        and 0 <= a[0] < len(self.module.natives)
+                        and self.module.natives[a[0]].name
+                        in BORROW_NATIVE_ALLOWLIST):
+                    for av in call_args:
+                        if isinstance(av, BorrowValue):
+                            raise VMError(
+                                "borrowed references cannot cross "
+                                "function boundaries", *loc)
                 if name == "CALL":
                     if self._depth >= self.max_call_depth:
                         raise VMError(
@@ -471,7 +678,9 @@ class VM:
                 st.append(result)
 
             elif name == "RET":
-                return st.pop() if st else None
+                rv = st.pop() if st else None
+                self._check_return_boundary(rv, fr, ins)
+                return rv
 
             elif name == "TRAP":
                 msg = str(self.module.const_value(a[0]))
@@ -488,6 +697,13 @@ class VM:
     def _get_index(self, obj: Any, idx: Any,
                    fr: _Frame, ins: Instr) -> Any:
         loc = fr.fn.line_of(ins.pc)
+        if isinstance(obj, BorrowValue):
+            # Per-access çözümleme (tree-walker eval_IndexExpr borrow yolu).
+            try:
+                obj.check()
+            except VMError as e:
+                raise VMError(e.message, *loc) from None
+            obj = obj.owner._value
         if isinstance(obj, StackArrayValue):
             if not obj.alive:
                 raise VMError(
@@ -512,6 +728,15 @@ class VM:
     def _set_index(self, obj: Any, idx: Any, val: Any,
                    fr: _Frame, ins: Instr) -> None:
         loc = fr.fn.line_of(ins.pc)
+        if isinstance(obj, BorrowValue):
+            try:
+                obj.check()
+            except VMError as e:
+                raise VMError(e.message, *loc) from None
+            if not obj.mutable:
+                raise VMError(
+                    f"cannot write through shared borrow '{obj.name}'", *loc)
+            obj = obj.owner._value
         if isinstance(obj, StackArrayValue):
             if not obj.alive:
                 raise VMError(
@@ -582,8 +807,10 @@ class VM:
                           *fr.fn.line_of(ins.pc))
         try:
             return func(*args)
-        except VMError:
-            raise
+        except VMError as e:
+            # Native içindeki borrow/use-after-free denetimleri konumlu
+            # olsun (spec §8: hata metni + konum tree-walker ile aynı).
+            raise VMError(e.message, *fr.fn.line_of(ins.pc)) from None
         except Exception as e:
             raise VMError(str(e), *fr.fn.line_of(ins.pc))
 

@@ -9,19 +9,23 @@ okuma/yazma, kaçışta derin heap kopyası), `@own` sahipliği
 (OWN_ALLOC/OWN_MOVE/OWN_FREE; borrow yok) ve genel list/dict literalleri
 (NEW_LIST/NEW_DICT + GET_INDEX/SET_INDEX).
 
-Kapsam dışı (bilinçli): borrow (`&x` / `&mut x` / BORROW_*), @raw, nested
-@stack, `str` elemanlı stack dizi, tuple, sınıflar, match, for,
-import, lambda, f-string, pipe; ayrıca list/dict üzerinde compound
-atama ve metotlar (`.push`, `.length`). Bunlar açık CompileError
-üretir — sessizce yanlış kod üretilmez.
+Kapsam dışı (bilinçli): @raw, nested @stack, `str` elemanlı stack dizi,
+tuple, sınıflar, match, for, import, lambda, f-string, pipe; ayrıca
+list/dict üzerinde compound atama ve metotlar (`.push`, `.length`).
+Bunlar açık CompileError üretir — sessizce yanlış kod üretilmez.
 
-`@own` kuralları (tree-walker parity, borrow hariç):
+`@own` kuralları (tree-walker parity) ve borrow (Phase B, v1 alt kümesi):
 - `@own let x = to_own(expr)` ve mevcut @own değişkene `x = to_own(expr)`
   tek meşru kuruluş yollarıdır; OWN_ALLOC derin kopya üretir.
 - `to_gc(x)` / `free(x)` yalnızca @own değişken adı alır → OWN_MOVE /
   OWN_FREE. `free` ifade bağlamı için null bırakır (tree-walker None).
 - @own değer ifade olarak okunamaz (LOAD_LOCAL yasak): `cannot copy @own
   value` hatası. Fonksiyon sınırı, print, return, list/dict depolama yok.
+- `let r = &x` / `&mut x` → BORROW_SHARED/BORROW_MUT; borrow block-lokal
+  (scope çıkışında BORROW_END, ters bildirim sırası). BorrowExpr yalnız
+  @own let başlatıcısı ve allowlist saf native argümanında (len/keys/
+  values, gölgelemesiz) derlenir; başka her bağlamda `borrowed references
+  cannot cross function boundaries` hatası.
 
 Sözleşme: NEX_BYTECODE_SPEC.md. İsim çözümleme kuralı (shadowing):
 önce kullanıcı fonksiyonları, sonra native tablo → `fn len` tanımlıysa
@@ -36,7 +40,7 @@ from typing import Optional
 import ast_nodes as A
 from bytecode import (
     FunctionCode, Instr, Module, NativeInfo, OPCODES,
-    NAT_PURE, NAT_STRUCTURAL, MODE_TEMP, MODE_STACK, MODE_OWN,
+    NAT_PURE, NAT_STRUCTURAL, MODE_TEMP, MODE_STACK, MODE_OWN, MODE_BORROW,
     TAG_FLOAT, TAG_INT, TAG_NAME, TAG_NULL, TAG_BOOL, TAG_STR, TAG_TYPE,
     TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE, TYPE_KIND_BOOL,
     stack_effect,
@@ -67,6 +71,9 @@ NATIVES: list[NativeInfo] = [
     NativeInfo("int",   1, NAT_PURE),
     NativeInfo("float", 1, NAT_PURE),
     NativeInfo("len",   1, NAT_PURE | NAT_STRUCTURAL),
+    # keys/values: saf/yapısal (borç argümanı allowlist'i, spec §5).
+    NativeInfo("keys",   1, NAT_PURE | NAT_STRUCTURAL),
+    NativeInfo("values", 1, NAT_PURE | NAT_STRUCTURAL),
 ]
 _NATIVE_INDEX = {n.name: i for i, n in enumerate(NATIVES)}
 
@@ -110,12 +117,20 @@ class _FnBuilder:
         self.n_locals = 0
         self.slot_modes: list[int] = []
         self._scopes: list[dict[str, int]] = [{}]
+        #: Her scope'ta bildirilen BORROW slotları; pop_scope blok çıkışında
+        #: ters bildirim sırasıyla BORROW_END üretir (tree-walker close()).
+        self._scope_borrows: list[list[int]] = [[]]
 
     # -- sembol/slot ---------------------------------------------------------
     def push_scope(self) -> None:
         self._scopes.append({})
+        self._scope_borrows.append([])
 
     def pop_scope(self) -> None:
+        # Blok çıkışı: borrow release → scope kayıtları kapanır
+        # (tree-walker close() sırasının borrow ayağı).
+        for slot in reversed(self._scope_borrows.pop()):
+            self.emit("BORROW_END", slot)
         self._scopes.pop()
 
     def declare(self, name: str, node: A.Node, mode: int = MODE_TEMP) -> int:
@@ -141,6 +156,18 @@ class _FnBuilder:
         name = f"$tmp{self._next_tmp}"
         self._next_tmp += 1
         return self.declare(name, node)
+
+    def register_borrow(self, slot: int) -> None:
+        """BORROW slotunu bulunduğu scope'un çıkış listesine ekle."""
+        self._scope_borrows[-1].append(slot)
+
+    def new_borrow_tmp(self, node: A.Node) -> int:
+        """Çakışmayan geçici BORROW slot'u (allowlist saf native argümanı)."""
+        name = f"$brw{self._next_tmp}"
+        self._next_tmp += 1
+        slot = self.declare(name, node, MODE_BORROW)
+        self.register_borrow(slot)
+        return slot
 
     # -- emisyon -------------------------------------------------------------
     def new_label(self) -> _Label:
@@ -259,7 +286,10 @@ class Compiler:
         self._func_decls: list[A.FnDecl] = []
         self._const_index: dict[tuple[int, object], int] = {}
         self._builder: Optional[_FnBuilder] = None
-        self._loops: list[tuple[_Label, _Label]] = []  # (break, continue)
+        # (break, continue, base_depth): base_depth = döngü gövde scope'unun
+        # borrow kayıt indeksi; break/continue bu derinliğe kadar açık
+        # borrow'ları JUMP'tan önce release eder (bkz. _release_borrows_to).
+        self._loops: list[tuple[_Label, _Label, int]] = []
 
     # -- sabit havuzu --------------------------------------------------------
     def _const(self, tag: int, value: object) -> int:
@@ -355,6 +385,19 @@ class Compiler:
         if new_scope:
             b.pop_scope()
 
+    def _release_borrows_to(self, base: int) -> None:
+        """`base` derinliğine kadar açık tüm scope borrow'larını release et.
+
+        `continue`/`break`/`return` pop_scope'u atladığı için bu yollarda
+        borrow sayaçları sızardı; burada her scope'un borrow slotları için
+        pop_scope ile aynı ters bildirim sırasında BORROW_END üretilir.
+        Düzenli pop_scope yolundaki ikinci BORROW_END zararsızdır:
+        BorrowValue.release released borrow'da erken döner."""
+        b = self._builder
+        for i in range(len(b._scope_borrows) - 1, base - 1, -1):
+            for slot in reversed(b._scope_borrows[i]):
+                b.emit("BORROW_END", slot)
+
     def _compile_stmt(self, node: A.Node) -> None:
         b = self._builder
         if isinstance(node, A.VarDecl):
@@ -367,6 +410,10 @@ class Compiler:
             if node.mem_mode is not None:
                 raise CompileError(
                     f"@{node.mem_mode} is not supported in the VM prototype", node)
+            if isinstance(node.value, A.BorrowExpr):
+                # `let r = &x` / `let r = &mut x` → BORROW_SHARED/MUT.
+                self._compile_borrow_decl(node)
+                return
             if node.value is not None:
                 self._compile_expr(node.value)
             else:
@@ -391,7 +438,10 @@ class Compiler:
             b.mark(start)
             self._compile_expr(node.condition)
             b.emit("JUMP_IF_FALSE", end, node=node)
-            self._loops.append((end, start))
+            # Gövde scope'u açılmadan önceki derinlik = gövde scope indeksi;
+            # continue/break bu derinliğe kadar açık borrow'ları release eder.
+            base = len(b._scope_borrows)
+            self._loops.append((end, start, base))
             self._compile_block(node.body)
             self._loops.pop()
             b.emit("JUMP", start, node=node)
@@ -403,18 +453,23 @@ class Compiler:
                 self._compile_expr(node.value)
             else:
                 b.emit("CONST", self._const(TAG_NULL, None), node=node)
+            # RET pop_scope'u atlar: tüm açık scope borrow'larını release et
+            # (frame-exit kill istisna yolu için genel güvenlik ağı kalır).
+            self._release_borrows_to(0)
             b.emit("RET", node=node)
             return
 
         if isinstance(node, A.BreakStmt):
             if not self._loops:
                 raise CompileError("'break' outside loop", node)
+            self._release_borrows_to(self._loops[-1][2])
             b.emit("JUMP", self._loops[-1][0], node=node)
             return
 
         if isinstance(node, A.ContinueStmt):
             if not self._loops:
                 raise CompileError("'continue' outside loop", node)
+            self._release_borrows_to(self._loops[-1][2])
             b.emit("JUMP", self._loops[-1][1], node=node)
             return
 
@@ -487,12 +542,45 @@ class Compiler:
         slot = b.declare(node.name, node, MODE_OWN)
         b.emit("OWN_ALLOC", slot, node=node)
 
+    def _compile_borrow_decl(self, node: A.VarDecl) -> None:
+        """`let r = &x` / `let r = &mut x` → BORROW_SHARED/BORROW_MUT r, x.
+
+        Borrow block-lokaldir: slot MODE_BORROW'a düşer, bulunduğu scope'un
+        çıkış listesine yazılır ve pop_scope blok çıkışında BORROW_END
+        üretir (fonksiyon en dış bloğu frame çıkışı kill'e emanettir).
+        Varsayılan değer itilmez; slot BORROW_END'a kadar boş kalır."""
+        b = self._builder
+        src = self._borrow_source(node.value)
+        slot = b.declare(node.name, node, MODE_BORROW)
+        b.register_borrow(slot)
+        opcode = "BORROW_MUT" if node.value.mutable else "BORROW_SHARED"
+        b.emit(opcode, slot, src, node=node)
+
+    def _borrow_source(self, node: A.BorrowExpr) -> int:
+        """`&x` / `&mut x` operandını MODE_OWN slot'a çözümle.
+
+        v1: operand yalnızca Ident olabilir; hedef @own slot değilse
+        tree-walker ile aynı hata."""
+        b = self._builder
+        if not isinstance(node.operand, A.Ident):
+            raise CompileError("only @own values can be borrowed", node.operand)
+        slot = b.resolve(node.operand.name)
+        if slot is None:
+            raise CompileError(
+                f"undefined variable '{node.operand.name}'", node.operand)
+        if b.slot_mode(slot) != MODE_OWN:
+            raise CompileError("only @own values can be borrowed", node.operand)
+        return slot
+
     def _compile_own_source(self, value: Optional[A.Node],
                             node: A.Node, what: str) -> None:
         """@own kuruluş RHS'i: `to_own(expr)` → expr'i stack'e iter.
 
         OWN_ALLOC çağıran tarafından yayınlanır. Başka her RHS reddedilir;
         `to_own`'ın argümanı serbest ifade olabilir (to_own(f(x)))."""
+        if isinstance(value, A.BorrowExpr):
+            raise CompileError(
+                "borrowed references cannot cross function boundaries", value)
         if not (isinstance(value, A.CallExpr)
                 and isinstance(value.callee, A.Ident)
                 and value.callee.name == "to_own"):
@@ -582,6 +670,13 @@ class Compiler:
                 b.emit("LOAD_LOCAL", slot, node=node)
             return
 
+        if isinstance(node, A.BorrowExpr):
+            # BorrowExpr yalnız iki bağlamda derlenir: @own let başlatıcısı
+            # (`let r = &x`) ve allowlist saf native argümanı (len/keys/
+            # values). Diğer her bağlam fonksiyon sınırını ihlal eder.
+            raise CompileError(
+                "borrowed references cannot cross function boundaries", node)
+
         if isinstance(node, A.IndexExpr):
             self._compile_index(node)
             return
@@ -607,6 +702,12 @@ class Compiler:
                 raise CompileError(
                     f"compound assignment '{node.op}' is not supported in the VM prototype",
                     node)
+            if isinstance(node.value, A.BorrowExpr):
+                # `r = &x` yeniden ataması v1'de yok: borrow taze let
+                # bildirimiyle açılır (scope çıkışı BORROW_END'i kesin
+                # bilir; yeniden atama release zamanını belirsizleştirir).
+                raise CompileError(
+                    "borrow expressions need a fresh let binding (v1)", node)
             if isinstance(node.target, A.Ident):
                 slot = b.resolve(node.target.name)
                 if slot is None:
@@ -755,19 +856,40 @@ class Compiler:
             raise CompileError(
                 f"'{name}' is a variable, not a callable function", node)
 
+        # Borrow argüman kuralı (checker visit_CallExpr ile aynı): yalnız
+        # gölgelemesiz allowlist saf native'ler (len/keys/values) &arg
+        # kabul eder; kullanıcı fonksiyonu dahil her şeyde borrow fonksiyon
+        # sınırını geçemez.
+        allow_borrow = (name in ("len", "keys", "values")
+                        and name not in self._func_index)
+        borrow_temps: list[int] = []
         for arg in node.args:
-            self._compile_expr(arg)
+            if isinstance(arg, A.BorrowExpr):
+                if not allow_borrow:
+                    raise CompileError(
+                        "borrowed references cannot cross function "
+                        "boundaries", arg)
+                # `len(&xs)`: taze BORROW temp aç, borrow'u kur, temp'i
+                # yığına it; çağrıdan hemen sonra BORROW_END ile release.
+                src = self._borrow_source(arg)
+                tmp = b.new_borrow_tmp(arg)
+                b.emit("BORROW_MUT" if arg.mutable else "BORROW_SHARED",
+                       tmp, src, node=arg)
+                b.emit("LOAD_LOCAL", tmp, node=arg)
+                borrow_temps.append(tmp)
+            else:
+                self._compile_expr(arg)
 
         # İsim çözümleme: kullanıcı fonksiyonu ÖNCE, native SONRA.
         if name in self._func_index:
             b.emit("CALL", self._func_index[name], len(node.args), node=node)
-            return
-        if name in _NATIVE_INDEX:
+        elif name in _NATIVE_INDEX:
             b.emit("CALL_PURE_NATIVE", _NATIVE_INDEX[name], len(node.args),
                    node=node)
-            return
-
-        raise CompileError(f"undefined function '{name}'", node)
+        else:
+            raise CompileError(f"undefined function '{name}'", node)
+        for tmp in borrow_temps:
+            b.emit("BORROW_END", tmp, node=node)
 
     def _compile_own_move_call(self, node: A.CallExpr, name: str) -> None:
         """`to_gc(x)` / `free(x)` — x @own slot olmalı; OWN_MOVE/OWN_FREE.
@@ -790,9 +912,9 @@ class Compiler:
             raise CompileError(
                 f"{name} requires an @own variable; '{arg.name}' is not @own",
                 arg)
-        # TODO(Phase B): açık borrow varsa move/free reddedilecek
-        # ((shared > 0 || mut_borrowed > 0) → hata). Phase A'da borrow
-        # opcode'ları derlenmediği için bu denetim no-op'tur.
+        # Borrow çakışması runtime'da OWN_MOVE/OWN_FREE içinde denetlenir:
+        # owner sayaçları (shared/mut_borrowed) 0'dan fazlaysa
+        # "cannot move/free '<slot>' while borrowed" hatası (Phase B).
         b.emit("OWN_MOVE" if name == "to_gc" else "OWN_FREE", slot, node=node)
         if name == "free":
             # İfade bağlamı (ExprStmt POP'u, let, return) için null.
