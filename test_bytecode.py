@@ -23,6 +23,7 @@ Kapsam:
 
 import io
 import struct
+import subprocess
 import sys
 import contextlib
 from pathlib import Path
@@ -579,6 +580,101 @@ fn main():
               f"wrong error {type(e).__name__}: {e}")
     else:
         check("max_call_depth=0 reddedilir", False, "accepted invalid limit")
+
+
+def test_tree_call_depth():
+    section("Çağrı derinliği sınırı — tree-walker + CLI")
+    from interpreter import Interpreter
+
+    deep = """
+fn down(n: int) -> int:
+    if n == 0:
+        return 0
+    return down(n - 1)
+
+fn main():
+    print(down(%d))
+"""
+    # main kök autocalli de bir düzey sayar (VM run() → call(entry) ile aynı).
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ok = Interpreter().interpret(parse(deep % 5000))
+    out = buf.getvalue()
+    check("tree varsayılan 256 derin özyinelemeyi konumlu hata ile yakalar",
+          ok is False and "call depth limit exceeded (256)" in out
+          and "Runtime Error at line" in out, f"ok={ok} out={out!r}")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ok = Interpreter().interpret(parse(deep % 100))
+    check("tree makul derinlik varsayılan sınır altında çalışır",
+          ok is True and buf.getvalue() == "0\n", f"out={buf.getvalue()!r}")
+
+    # main kökü sayılmadığında düzey sayısı net olsun diye üst-düzey çağrı:
+    # down(2) → 3 iç içe çağrı (sınır tam 3 → geçer), down(4) → 5 (aşar).
+    toplevel = """
+fn down(n: int) -> int:
+    if n == 0:
+        return 0
+    return down(n - 1)
+
+down(%d)
+"""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        Interpreter(max_call_depth=3).interpret(parse(toplevel % 4))
+    err_out = buf.getvalue()
+    check("Interpreter(max_call_depth=3) depth-4 özyinelemeyi yakalar",
+          "call depth limit exceeded (3)" in err_out,
+          f"out={err_out!r}")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ok = Interpreter(max_call_depth=3).interpret(parse(toplevel % 2))
+    check("Interpreter(max_call_depth=3) depth-2 çalışır",
+          ok is True, f"ok={ok} out={buf.getvalue()!r}")
+
+    # Mesaj metni VM ile aynı (substring parity; konum tree'de FnDecl'dir).
+    check("tree hata metni VM ile aynı ('call depth limit')",
+          "call depth limit exceeded" in err_out)
+
+    # CLI: geçersiz değer → exit 2 + stderr mesajı
+    root = Path(__file__).resolve().parent
+    proc = subprocess.run(
+        [sys.executable, "main.py", "--max-call-depth", "abc", "x.nex"],
+        capture_output=True, text=True, cwd=str(root))
+    check("CLI --max-call-depth abc → exit 2",
+          proc.returncode == 2
+          and "positive integer expected" in proc.stderr,
+          f"rc={proc.returncode} err={proc.stderr!r}")
+
+    proc = subprocess.run(
+        [sys.executable, "main.py", "--max-call-depth", "0", "x.nex"],
+        capture_output=True, text=True, cwd=str(root))
+    check("CLI --max-call-depth 0 → exit 2",
+          proc.returncode == 2
+          and "positive integer expected" in proc.stderr,
+          f"rc={proc.returncode} err={proc.stderr!r}")
+
+    # CLI: tree backend limit uygular → exit 1 + 'call depth limit'
+    proc = subprocess.run(
+        [sys.executable, "main.py", "--max-call-depth", "2",
+         "examples/vm_basics.nex"],
+        capture_output=True, text=True, cwd=str(root))
+    streams = proc.stdout + proc.stderr
+    check("CLI --max-call-depth 2 tree'de exit 1 + limit mesajı",
+          proc.returncode == 1 and "call depth limit exceeded (2)" in streams,
+          f"rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}")
+
+    # CLI: VM backend parity (mesaj aynı, konum stderr'de)
+    proc = subprocess.run(
+        [sys.executable, "main.py", "--max-call-depth", "2", "--vm",
+         "examples/vm_basics.nex"],
+        capture_output=True, text=True, cwd=str(root))
+    check("CLI --max-call-depth 2 VM'de exit 1 + limit mesajı",
+          proc.returncode == 1
+          and "call depth limit exceeded (2)" in proc.stderr,
+          f"rc={proc.returncode} err={proc.stderr!r}")
 
 
 def test_and_or():
@@ -2792,6 +2888,7 @@ def main() -> None:
     test_control_flow()
     test_functions()
     test_call_depth()
+    test_tree_call_depth()
     test_and_or()
     test_stack_vm()
     test_own_vm()

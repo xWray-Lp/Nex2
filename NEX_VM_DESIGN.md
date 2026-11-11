@@ -249,6 +249,11 @@ backend=vm        main.py --vm program.nex -> stdout, exit, diagnostics
   `CALL` hedefi → çağrı derinliği sınırı (konumlu `VMError`, varsayılan 256);
   (b) bozulmuş `JUMP` döngüsü → sonlanma verifier'ın garanti edemeyeceği
   sınıf; güvenilmeyen bytecode için adım bütçesi Faz 2 işi.
+- **Çağrı derinliği sınırı (güncelleme):** tree-walker artık VM'in aynen
+  256 varsayılanını uygular; iki backend de yapılandırılabilir —
+  `Interpreter(max_call_depth=...)` / `run_module(..., max_call_depth=...)`
+  veya CLI `--max-call-depth N`. Hata konumludur:
+  `Runtime Error at line L:C — call depth limit exceeded (N)`.
 
 ---
 

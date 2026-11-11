@@ -7,6 +7,7 @@ Visitor pattern + environment stack.
 from __future__ import annotations
 
 import copy
+import sys
 from typing import Any, Callable, Dict, List, Optional
 
 from ast_nodes import *
@@ -520,6 +521,21 @@ class Function:
 
     def call(self, interpreter: Interpreter, args: list) -> Any:
         """Fonksiyonu çalıştır."""
+        # Çağrı derinliği sınırı (VM ile aynı semantik, varsayılan 256):
+        # patolojik özyinelemede çıplak RecursionError yerine konumlu
+        # NexRuntimeError üretilir. Sayaç finally'de azalır — gövdeden
+        # exception kaçsa bile sayaç doğru kalır.
+        if interpreter._call_depth >= interpreter.max_call_depth:
+            raise NexRuntimeError(
+                f"call depth limit exceeded ({interpreter.max_call_depth})",
+                self.decl)
+        interpreter._call_depth += 1
+        try:
+            return self._call(interpreter, args)
+        finally:
+            interpreter._call_depth -= 1
+
+    def _call(self, interpreter: Interpreter, args: list) -> Any:
         func_env = Environment(self.closure, f"fn:{self.name}")
 
         # Constructor (init.call(self, [self_val] + args)) ve bound method
@@ -647,7 +663,20 @@ class BoundMethod:
 class Interpreter:
     """Ana interpreter sınıfı. AST'yi çalıştırır."""
 
-    def __init__(self):
+    #: Bir Nex çağrı düzeyi başına host Python frame maliyeti (ölçüm ~7.5;
+    #: güvenli payla 8). max_call_depth sınırının host RecursionError'dan
+    #: ÖNCE ulaşılabilsin diye host özyineleme limiti sadece yukarı doğru
+    #: bu değere göre yükseltilir (normal programların davranışı değişmez).
+    _FRAMES_PER_NEX_CALL = 8
+
+    def __init__(self, max_call_depth: int = 256):
+        # VM.MAX_CALL_DEPTH ile aynı varsayılan; main.py --max-call-depth
+        # ile yapılandırılabilir. Patolojik özyinelemede konumlu hata verir.
+        self.max_call_depth = max_call_depth
+        self._call_depth = 0
+        needed = max_call_depth * self._FRAMES_PER_NEX_CALL + 300
+        if sys.getrecursionlimit() < needed:
+            sys.setrecursionlimit(needed)
         self.global_env = Environment(name="global")
         self.current_env = self.global_env
         self.setup_builtins()

@@ -26,7 +26,8 @@ DIM    = "\033[2m"
 
 
 def run_source(source: str, filename: str = "<stdin>", check_only: bool = False,
-               backend: str = "tree", disasm: bool = False) -> bool:
+               backend: str = "tree", disasm: bool = False,
+               max_call_depth: int | None = None) -> bool:
     """Kaynak kodu çalıştır. Hata varsa False döner."""
     try:
         tokens = Lexer(source).tokenize()
@@ -58,13 +59,16 @@ def run_source(source: str, filename: str = "<stdin>", check_only: bool = False,
         return False
 
     if backend == "vm":
-        return _run_vm(tree, filename, disasm=disasm)
+        return _run_vm(tree, filename, disasm=disasm,
+                       max_call_depth=max_call_depth)
 
-    interp = Interpreter()
+    interp = Interpreter(max_call_depth=256 if max_call_depth is None
+                         else max_call_depth)
     return bool(interp.interpret(tree))
 
 
-def _run_vm(tree, filename: str, disasm: bool = False) -> bool:
+def _run_vm(tree, filename: str, disasm: bool = False,
+            max_call_depth: int | None = None) -> bool:
     """AST'yi bytecode'a derleyip VM'de çalıştır (prototip)."""
     try:
         module = compile_program(tree, filename)
@@ -85,7 +89,7 @@ def _run_vm(tree, filename: str, disasm: bool = False) -> bool:
         print(disassemble(module))
 
     try:
-        run_module(module)
+        run_module(module, max_call_depth=max_call_depth)
     except VMError as e:
         # Spec §8: hata metni tree-walker ile aynı biçimde olmalı.
         if e.line:
@@ -101,7 +105,8 @@ def _run_vm(tree, filename: str, disasm: bool = False) -> bool:
 
 
 def run_file(path: str, check_only: bool = False,
-             backend: str = "tree", disasm: bool = False) -> None:
+             backend: str = "tree", disasm: bool = False,
+             max_call_depth: int | None = None) -> None:
     """Dosyayı oku ve çalıştır."""
     if not os.path.exists(path):
         print(f"{RED}Error:{RESET} File not found: {path}", file=sys.stderr)
@@ -114,7 +119,8 @@ def run_file(path: str, check_only: bool = False,
         return
 
     success = run_source(source, path, check_only=check_only,
-                         backend=backend, disasm=disasm)
+                         backend=backend, disasm=disasm,
+                         max_call_depth=max_call_depth)
     if not success:
         sys.exit(1)
 
@@ -202,6 +208,7 @@ def main() -> None:
     check_only = False
     backend = "tree"
     disasm = False
+    max_call_depth: int | None = None
     files = []
 
     i = 0
@@ -214,11 +221,24 @@ def main() -> None:
         elif arg in ("--disasm",):
             backend = "vm"
             disasm = True
+        elif arg in ("--max-call-depth",):
+            i += 1
+            try:
+                max_call_depth = int(args[i])
+            except (IndexError, ValueError):
+                max_call_depth = None
+            if max_call_depth is None or max_call_depth < 1:
+                print(f"{RED}main.py --max-call-depth: "
+                      f"positive integer expected{RESET}", file=sys.stderr)
+                sys.exit(2)
         elif arg in ("--help", "-h"):
             print("Usage:")
             print("  main.py [file.nex]          — dosya çalıştır (tree-walker)")
             print("  main.py --vm [file.nex]     — bytecode derle + VM'de çalıştır")
             print("  main.py --disasm [file.nex] — --vm + disassembly dökümü")
+            print("  main.py --max-call-depth N [file.nex]")
+            print("                              — çağrı derinliği sınırı "
+                  "(varsayılan 256, her iki backend)")
             print("  main.py                     — REPL başlat")
             print("  main.py --check [file.nex]  — sadece tip kontrolü")
             return
@@ -235,7 +255,8 @@ def main() -> None:
         return
 
     for path in files:
-        run_file(path, check_only=check_only, backend=backend, disasm=disasm)
+        run_file(path, check_only=check_only, backend=backend, disasm=disasm,
+                 max_call_depth=max_call_depth)
 
 
 if __name__ == "__main__":
