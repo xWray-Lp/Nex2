@@ -822,13 +822,13 @@ class Interpreter:
             if main_fn is not None and not main_was_called_explicitly:
                 result = main_fn.call(self, [])
 
-            return result
+            return True
         except NexRuntimeError as e:
             print(f"Runtime Error at line {e.line}:{e.col} — {e}")
-            return None
+            return False
         except Exception as e:
             print(f"Internal Error: {e}")
-            return None
+            return False
 
     # ── Literal Değerlendirmeleri ─────────────────────────────────────────────
 

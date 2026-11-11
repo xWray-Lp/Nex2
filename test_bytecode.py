@@ -2230,6 +2230,65 @@ fn main():
           ok and buf.getvalue() == "42\n", buf.getvalue())
 
 
+def test_exit_codes():
+    section("CLI — çıkış kodları (run_source başarı bayrağı)")
+    import main as nexmain
+
+    # (a) runtime hatası: tree backend False döner
+    buf_err = io.StringIO()
+    buf_out = io.StringIO()
+    with contextlib.redirect_stdout(buf_out), \
+            contextlib.redirect_stderr(buf_err):
+        ok = nexmain.run_source("let x = 1 / 0", "<test>")
+    check("tree backend runtime hatasında False",
+          ok is False and "Runtime Error" in buf_out.getvalue(),
+          f"ok={ok} out={buf_out.getvalue()!r}")
+
+    # (a) runtime hatası: VM backend de False döner
+    buf_err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(buf_err):
+        ok = nexmain.run_source("let x = 1 / 0", "<test>", backend="vm")
+    check("VM backend runtime hatasında False",
+          ok is False and "Runtime Error" in buf_err.getvalue(),
+          f"ok={ok} err={buf_err.getvalue()!r}")
+
+    # (b) --check: tip hatasında False döner
+    buf_err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(buf_err):
+        ok = nexmain.run_source('let x: int = "s"', "<test>", check_only=True)
+    check("--check tip hatasında False",
+          ok is False and "Type Errors" in buf_err.getvalue(),
+          f"ok={ok} err={buf_err.getvalue()!r}")
+
+    # (b) --check: hatasız kaynak True döner
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), \
+            contextlib.redirect_stderr(io.StringIO()):
+        ok = nexmain.run_source("let x = 1", "<test>", check_only=True)
+    check("--check hatasız kaynakta True", ok is True, f"ok={ok}")
+
+    # (c) hatasız kaynak: her iki backend de True döner
+    src = """
+fn main():
+    print(str(40 + 2))
+"""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), \
+            contextlib.redirect_stderr(io.StringIO()):
+        ok = nexmain.run_source(src, "<test>")
+    check("tree backend hatasız kaynakta True",
+          ok is True and buf.getvalue() == "42\n", f"ok={ok}")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), \
+            contextlib.redirect_stderr(io.StringIO()):
+        ok = nexmain.run_source(src, "<test>", backend="vm")
+    check("VM backend hatasız kaynakta True",
+          ok is True and buf.getvalue() == "42\n", f"ok={ok}")
+
+
 def test_parity():
     section("Tree-walker ↔ VM parity")
     programs = {
@@ -2744,6 +2803,7 @@ def main() -> None:
     test_verifier_negatives()
     test_unimplemented_opcodes()
     test_vm_cli()
+    test_exit_codes()
     test_parity()
     test_top_level_vm()
     test_metadata()

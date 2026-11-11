@@ -61,8 +61,7 @@ def run_source(source: str, filename: str = "<stdin>", check_only: bool = False,
         return _run_vm(tree, filename, disasm=disasm)
 
     interp = Interpreter()
-    interp.interpret(tree)
-    return True
+    return bool(interp.interpret(tree))
 
 
 def _run_vm(tree, filename: str, disasm: bool = False) -> bool:
@@ -116,7 +115,7 @@ def run_file(path: str, check_only: bool = False,
 
     success = run_source(source, path, check_only=check_only,
                          backend=backend, disasm=disasm)
-    if not success and not check_only:
+    if not success:
         sys.exit(1)
 
 
@@ -126,6 +125,7 @@ def repl() -> None:
     print()
 
     interp = Interpreter()
+    tc = TypeChecker(filename="<repl>")
     buffer = []
     indent_level = 0
 
@@ -178,9 +178,9 @@ def repl() -> None:
         try:
             tokens = Lexer(source).tokenize()
             tree = Parser(tokens).parse()
-            tc = TypeChecker(filename="<repl>")
+            existing = len(tc.diagnostics)
             if not tc.check(tree):
-                for diag in tc.errors:
+                for diag in tc.diagnostics[existing:]:
                     print(f"  {diag}")
                 continue
             interp.interpret(tree)
