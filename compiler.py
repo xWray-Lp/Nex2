@@ -5,12 +5,21 @@ Kapsam (v0.1 prototip): int/float/str/bool/null, print/str/int/float/len
 native'leri, aritmetik/karşılaştırma, let/atama, if/elif/else, while,
 break/continue, fonksiyon tanımı + çağrı, return, and/or (eager semantik),
 `@stack` sabit boyutlu diziler (STACK_ALLOC/STACK_MATERIALIZE, indeks
-okuma/yazma, kaçışta derin heap kopyası).
+okuma/yazma, kaçışta derin heap kopyası) ve `@own` sahipliği
+(OWN_ALLOC/OWN_MOVE/OWN_FREE; borrow yok).
 
-Kapsam dışı (bilinçli): @own/@raw ve borrow opcode'ları, nested @stack,
-`str` elemanlı stack dizi, list/dict/tuple, sınıflar, match, for, import,
-lambda, f-string, pipe. Bunlar açık CompileError üretir — sessizce yanlış
-kod üretilmez.
+Kapsam dışı (bilinçli): borrow (`&x` / `&mut x` / BORROW_*), @raw, nested
+@stack, `str` elemanlı stack dizi, list/dict/tuple, sınıflar, match, for,
+import, lambda, f-string, pipe. Bunlar açık CompileError üretir — sessizce
+yanlış kod üretilmez.
+
+`@own` kuralları (tree-walker parity, borrow hariç):
+- `@own let x = to_own(expr)` ve mevcut @own değişkene `x = to_own(expr)`
+  tek meşru kuruluş yollarıdır; OWN_ALLOC derin kopya üretir.
+- `to_gc(x)` / `free(x)` yalnızca @own değişken adı alır → OWN_MOVE /
+  OWN_FREE. `free` ifade bağlamı için null bırakır (tree-walker None).
+- @own değer ifade olarak okunamaz (LOAD_LOCAL yasak): `cannot copy @own
+  value` hatası. Fonksiyon sınırı, print, return, list/dict depolama yok.
 
 Sözleşme: NEX_BYTECODE_SPEC.md. İsim çözümleme kuralı (shadowing):
 önce kullanıcı fonksiyonları, sonra native tablo → `fn len` tanımlıysa
@@ -25,7 +34,7 @@ from typing import Optional
 import ast_nodes as A
 from bytecode import (
     FunctionCode, Instr, Module, NativeInfo, OPCODES,
-    NAT_PURE, NAT_STRUCTURAL, MODE_TEMP, MODE_STACK,
+    NAT_PURE, NAT_STRUCTURAL, MODE_TEMP, MODE_STACK, MODE_OWN,
     TAG_FLOAT, TAG_INT, TAG_NAME, TAG_NULL, TAG_BOOL, TAG_STR, TAG_TYPE,
     TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE, TYPE_KIND_BOOL,
     stack_effect,
@@ -67,6 +76,10 @@ _STACK_ELEM_KINDS = {
     "byte":  TYPE_KIND_BYTE,
     "bool":  TYPE_KIND_BOOL,
 }
+
+#: Sahiplik builtin'leri. Bunlar yalnız özel call konumlarında geçerlidir
+#: (`@own` başlatıcısı, to_gc/free move'u); başka her kullanım CompileError.
+_OWN_BUILTINS = ("to_own", "to_gc", "free")
 
 
 # ─── Emisyon yardımcıları ────────────────────────────────────────────────────
@@ -346,6 +359,9 @@ class Compiler:
             if node.mem_mode == "stack":
                 self._compile_stack_decl(node)
                 return
+            if node.mem_mode == "own":
+                self._compile_own_decl(node)
+                return
             if node.mem_mode is not None:
                 raise CompileError(
                     f"@{node.mem_mode} is not supported in the VM prototype", node)
@@ -457,6 +473,37 @@ class Compiler:
                 self._compile_expr(element)
                 b.emit("SET_INDEX", node=element)
 
+    def _compile_own_decl(self, node: A.VarDecl) -> None:
+        """`@own let x = to_own(expr)` → expr; OWN_ALLOC x.
+
+        Yalnız to_own(...) başlatıcısı kabul edilir (tree-walker: `@own`
+        bildirimi to_own sonucu olmalı). OWN_ALLOC derin kopyayı VM'de
+        yapar; burada varsayılan değer üretilmez."""
+        b = self._builder
+        self._compile_own_source(node.value, node,
+                                 f"declaration '{node.name}'")
+        slot = b.declare(node.name, node, MODE_OWN)
+        b.emit("OWN_ALLOC", slot, node=node)
+
+    def _compile_own_source(self, value: Optional[A.Node],
+                            node: A.Node, what: str) -> None:
+        """@own kuruluş RHS'i: `to_own(expr)` → expr'i stack'e iter.
+
+        OWN_ALLOC çağıran tarafından yayınlanır. Başka her RHS reddedilir;
+        `to_own`'ın argümanı serbest ifade olabilir (to_own(f(x)))."""
+        if not (isinstance(value, A.CallExpr)
+                and isinstance(value.callee, A.Ident)
+                and value.callee.name == "to_own"):
+            raise CompileError(
+                f"@own {what} can only be initialized from to_own(...)", node)
+        if value.type_args:
+            raise CompileError("to_own does not take type arguments", value)
+        if len(value.args) != 1:
+            raise CompileError("to_own requires exactly 1 argument", value)
+        # Argüman @own bir değişkense _compile_expr "cannot copy @own value"
+        # üretir — to_own(zaten-own) tree-walker'da da hatadır.
+        self._compile_expr(value.args[0])
+
     def _compile_if(self, node: A.IfStmt) -> None:
         b = self._builder
         end = b.new_label()
@@ -495,9 +542,18 @@ class Compiler:
             return
 
         if isinstance(node, A.Ident):
+            if node.name in _OWN_BUILTINS:
+                raise CompileError(
+                    f"'{node.name}' is an @own builtin and can only be called "
+                    f"directly", node)
             slot = b.resolve(node.name)
             if slot is None:
                 raise CompileError(f"undefined variable '{node.name}'", node)
+            if b.slot_mode(slot) == MODE_OWN:
+                # OWN slotu okunamaz: kopyalama sahipliği ikiye böler.
+                raise CompileError(
+                    f"cannot copy @own value '{node.name}' "
+                    f"(move it with to_gc(x))", node)
             if b.slot_mode(slot) == MODE_STACK:
                 # Kaçış kuralı: stack değeri ifade bağlamında bağımsız heap
                 # kopyasıdır. STACK_MATERIALIZE slotu okur, stack'e list iter.
@@ -536,6 +592,20 @@ class Compiler:
                 if slot is None:
                     raise CompileError(
                         f"undefined variable '{node.target.name}'", node)
+                if b.slot_mode(slot) == MODE_OWN:
+                    if node.op != "ASSIGN":
+                        raise CompileError(
+                            f"compound assignment is not supported on @own "
+                            f"variable '{node.target.name}'", node)
+                    # Yeniden atama: eski yük ölür, yeni to_own derin kopyası
+                    # OWN_ALLOC ile slota yazılır. İfade değeri olarak null
+                    # bırakılır (tree-walker own wrapper döner; okunamaz).
+                    self._compile_own_source(
+                        node.value, node.target,
+                        f"variable '{node.target.name}'")
+                    b.emit("OWN_ALLOC", slot, node=node)
+                    b.emit("CONST", self._const(TAG_NULL, None), node=node)
+                    return
                 if b.slot_mode(slot) == MODE_STACK:
                     raise CompileError(
                         "whole stack array reassignment is not supported in the "
@@ -616,6 +686,13 @@ class Compiler:
         b = self._builder
         target = node.target
         assert isinstance(target, A.IndexExpr)
+        if isinstance(target.obj, A.Ident):
+            slot = b.resolve(target.obj.name)
+            if slot is not None and b.slot_mode(slot) == MODE_OWN:
+                raise CompileError(
+                    f"index assignment through @own value '{target.obj.name}' "
+                    f"is not supported in the VM prototype "
+                    f"(move it with to_gc(x) first)", node)
         tmp = b.new_tmp(node)
         self._compile_expr(node.value)          # [v]
         b.emit("DUP", node=node)                # [v, v]
@@ -642,6 +719,16 @@ class Compiler:
             raise CompileError("call-site type args are not supported in VM", node)
         name = node.callee.name
 
+        # Sahiplik builtin'leri isimle çözülür (tree-walker/checker gibi):
+        # yerel gölgeleme bu çağrıları native fonksiyona düşürmez.
+        if name == "to_own":
+            raise CompileError(
+                "to_own(...) is only allowed as the initializer of an @own "
+                "declaration or assignment", node)
+        if name in ("to_gc", "free"):
+            self._compile_own_move_call(node, name)
+            return
+
         # Yerel değişken aynı adı gölgeliyorsa çağrılamaz: aksi hâlde
         # `let len = 5; len(1)` sessizce native'e düşerdi.
         if b.resolve(name) is not None:
@@ -661,6 +748,35 @@ class Compiler:
             return
 
         raise CompileError(f"undefined function '{name}'", node)
+
+    def _compile_own_move_call(self, node: A.CallExpr, name: str) -> None:
+        """`to_gc(x)` / `free(x)` — x @own slot olmalı; OWN_MOVE/OWN_FREE.
+
+        Borrow denetimi Faz B'de gelecek; Phase A'da açık borrow yok.
+        `free` ifade bağlamında null bırakır (tree-walker `free` → None)."""
+        b = self._builder
+        if node.type_args:
+            raise CompileError(f"{name} does not take type arguments", node)
+        if len(node.args) != 1:
+            raise CompileError(f"{name} requires exactly 1 argument", node)
+        arg = node.args[0]
+        if not isinstance(arg, A.Ident):
+            raise CompileError(
+                f"{name} requires a variable reference", arg)
+        slot = b.resolve(arg.name)
+        if slot is None:
+            raise CompileError(f"undefined variable '{arg.name}'", arg)
+        if b.slot_mode(slot) != MODE_OWN:
+            raise CompileError(
+                f"{name} requires an @own variable; '{arg.name}' is not @own",
+                arg)
+        # TODO(Phase B): açık borrow varsa move/free reddedilecek
+        # ((shared > 0 || mut_borrowed > 0) → hata). Phase A'da borrow
+        # opcode'ları derlenmediği için bu denetim no-op'tur.
+        b.emit("OWN_MOVE" if name == "to_gc" else "OWN_FREE", slot, node=node)
+        if name == "free":
+            # İfade bağlamı (ExprStmt POP'u, let, return) için null.
+            b.emit("CONST", self._const(TAG_NULL, None), node=node)
 
 
 # ─── Kolaylık API ────────────────────────────────────────────────────────────

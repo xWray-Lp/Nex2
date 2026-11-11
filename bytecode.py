@@ -578,6 +578,14 @@ def _verify_function(m: Module, f: FunctionCode) -> list[str]:
                 # STACK slotları yalnız STACK_ALLOC ile kurulur; ham atama
                 # stack değerinin ömrünü/kaçış kuralını bozar.
                 errs.append(f"STORE_LOCAL into STACK slot {a[0]}")
+            elif (a[0] < len(f.slot_modes)
+                  and f.slot_modes[a[0]] == MODE_OWN):
+                # OWN slotları okunamaz/yazılamaz: tek kuruluş yolu
+                # OWN_ALLOC, tek tüketim yolu OWN_MOVE/OWN_FREE. LOAD/STORE
+                # wrapper'ı kopyalar veya sahipliği sessizce kaybettirirdi.
+                errs.append(
+                    f"{ins.name} on OWN slot {a[0]} "
+                    f"(OWN values are not readable/writable directly)")
         elif ins.name == "CALL":
             if a[0] >= len(m.functions):
                 errs.append(f"function index {a[0]} out of range")

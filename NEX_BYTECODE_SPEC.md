@@ -218,6 +218,12 @@ BORROW modlu bir değer `GET_INDEX`/`GET_MEMBER` operandı olabilir (per-access
 
 ### 6.6 Mod opcode'ları
 
+> **Phase notu:** `@own` (0x40–0x42) v0.1 prototipinde **Phase A** olarak
+> uygulandı (derin kopya, move/free, frame sonu kill, OWN slotuna LOAD/STORE
+> yasağı). Borrow opcode'ları (0x50–0x53) **Phase B**'dir; `slot_epochs`
+> nesli ve `frame_id` Phase B için rezerve edildi, `BORROW_END` bayat
+> epoch'ta sayacı düşürmez.
+
 | Hex | Mnemonic | Operandlar | Etki | Not |
 |---|---|---|---|---|
 | 0x40 | `OWN_ALLOC` | `u32 si` | `(v -- )` | derin kopya + OWN slot. Not: her `to_own` derin kopyadır; büyük yapılarda maliyetlidir — Faz 2'de "sahipliğe terfi" (move-in) optimizasyonu ayrı tur (bkz. §12). |

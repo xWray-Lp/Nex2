@@ -274,11 +274,10 @@ ve gerçek evinin Faz 2 olduğunu netleştirir.
 3. VM döngüsü + Frame + host arayüzü (Faz 1).
    **Durum:** 2-3 v0.1 prototipinde tamam (control-flow alt kümesi).
 4. Mod/borrow opcode'ları + mevcut own/stack süitlerinin parity'si.
-   **Durum:** `@stack` ilk alt küme tamam (STACK_ALLOC/STACK_MATERIALIZE,
-   indeks okuma/yazma, kaçışta derin kopya, frame ömrü, verifier kuralları,
-   tree-walker parity). Nested stack/`str` eleman/`for`/`.length` ve
-   blok-erken kill sonraki turlara ertelendi. `@own` + borrow
-   `(frame, slot, epoch)` takibi sıradaki adım.
+   **Durum:** `@stack` ilk alt küme tamam. `@own` **Phase A** tamam
+   (OWN_ALLOC/MOVE/FREE, frame sonu kill, verifier OWN yasağı, parity).
+   Sırada: `&`/`&mut` borrow — `(frame, slot, epoch)` UAF takibi,
+   BORROW_END kapsam çıkışı; sonra `@own`/borrow parity matrisi.
 5. Differential harness + CI matrisi.
 6. Ancak bundan sonra: register machine / GC ailesi / Rust port
    alternatiflerinin karşılaştırması (bu iskeletin içinde).

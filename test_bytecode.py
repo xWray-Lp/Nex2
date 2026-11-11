@@ -33,7 +33,7 @@ from bytecode import (
     TAG_NULL, TAG_INT,
     encode_module, decode_module, decode_code, disassemble, verify_module,
 )
-from vm import VM, VMError, run_module, StackArrayValue
+from vm import VM, VMError, run_module, StackArrayValue, OwnValueValue
 
 GREEN  = "\033[92m"
 RED    = "\033[91m"
@@ -946,6 +946,278 @@ fn main():
               "expected VMError, got success")
 
 
+def test_own_vm():
+    section("`@own` — OWN_ALLOC / OWN_MOVE / OWN_FREE")
+
+    # ── Geçerli programlar (tree-walker parity) ─────────────────────────
+    expect_output("own decl + to_gc + print", """
+fn main():
+    @own let p = to_own(5)
+    let n = to_gc(p)
+    print(str(n + 1))
+""", ["6"])
+
+    expect_parity("own decl + to_gc + print (parity)", """
+fn main():
+    @own let p = to_own("abc")
+    let s = to_gc(p)
+    print(s + "!")
+""")
+
+    expect_output("free sonrası devam (değişken okunmaz)", """
+fn main():
+    @own let p = to_own(41)
+    free(p)
+    print("done")
+""", ["done"])
+
+    expect_parity("free ifade bağlamında null bırakır", """
+fn main():
+    @own let p = to_own(1)
+    let r = free(p)
+    print(str(r))
+""")
+
+    expect_output("reassign @own via to_own", """
+fn main():
+    @own let p = to_own(1)
+    p = to_own(7)
+    let g = to_gc(p)
+    print(str(g))
+""", ["7"])
+
+    expect_output("to_gc ifade olarak atılır (OWN_MOVE + POP)", """
+fn main():
+    @own let p = to_own(3)
+    to_gc(p)
+    print("moved")
+""", ["moved"])
+
+    expect_output("moved-out değere eleman yazma (GC alias)", """
+fn main():
+    @stack let buf: [int; 2] = [1, 2]
+    @own let p = to_own(buf)
+    let g = to_gc(p)
+    g[0] = 9
+    print(str(g[0]))
+    print(str(g[1]))
+""", ["9", "2"])
+
+    expect_output("to_own derin kopya: stack snapshot izole", """
+fn main():
+    @stack let buf: [int; 2] = [7, 8]
+    @own let p = to_own(buf)
+    buf[0] = 99
+    let g = to_gc(p)
+    print(str(g[0]))
+    print(str(buf[0]))
+""", ["7", "99"])
+
+    # Frame çıkışında canlı @own ölür; gözlemlenebilir tek sonuç temiz
+    # çıkıştır (sahiplik fonksiyon sınırını geçemez).
+    expect_output("frame sonu @own kill (exit 0)", """
+fn main():
+    @own let p = to_own(1)
+    print("alive")
+""", ["alive"])
+
+    # ── @own slot metadata ─────────────────────────────────────────────
+    m = compile_source("""
+fn main():
+    @own let p = to_own(5)
+    let g = to_gc(p)
+    print(str(g))
+""")
+    f = m.functions[0]
+    d = disassemble(m)
+    check("@own slotu MODE_OWN", MODE_OWN in list(f.slot_modes),
+          f"slot_modes={list(f.slot_modes)}")
+    check("OWN_ALLOC / OWN_MOVE disasm'da", "OWN_ALLOC" in d
+          and "OWN_MOVE" in d, d)
+    check("@own slotunda LOAD/STORE_LOCAL yok",
+          not any(i.name in ("LOAD_LOCAL", "STORE_LOCAL")
+                  and f.slot_modes[i.args[0]] == MODE_OWN
+                  for i in decode_code(f.code)),
+          d)
+
+    # ── Derleme zamanı reddi ───────────────────────────────────────────
+    expect_compile_error("@own init to_own olmalı", """
+fn main():
+    @own let x = 1
+""", "to_own")
+    expect_compile_error("@own değer ifade olarak okunamaz", """
+fn main():
+    @own let x = to_own(1)
+    print(x)
+""", "cannot copy @own value")
+    expect_compile_error("@own değer başka değişkene atanamaz", """
+fn main():
+    @own let x = to_own(1)
+    let y = x
+""", "cannot copy @own value")
+    expect_compile_error("own indeks okuma reddedilir", """
+fn main():
+    @own let x = to_own(1)
+    print(str(x[0]))
+""", "cannot copy @own value")
+    expect_compile_error("own indeks yazma reddedilir", """
+fn main():
+    @own let x = to_own(1)
+    x[0] = 5
+""", "@own")
+    expect_compile_error("@own reassign to_own olmalı", """
+fn main():
+    @own let x = to_own(1)
+    x = 5
+""", "to_own")
+    expect_compile_error("@own reassign to_gc ile yapılamaz", """
+fn main():
+    @own let x = to_own(1)
+    x = to_gc(x)
+""", "to_own")
+    expect_compile_error("to_own zaten-own değere uygulanamaz", """
+fn main():
+    @own let x = to_own(1)
+    @own let y = to_own(x)
+""", "cannot copy @own value")
+    expect_compile_error("to_own yalnız @own başlatıcısında", """
+fn main():
+    to_own(1)
+""", "only allowed")
+    expect_compile_error("let y = to_own reddedilir", """
+fn main():
+    let y = to_own(1)
+""", "only allowed")
+    expect_compile_error("to_own çağrı hedefi olarak reddedilir", """
+fn main():
+    let f = to_own(1)(2)
+""", "direct function calls")
+    expect_compile_error("to_own 0 argüman", """
+fn main():
+    @own let x = to_own()
+""", "exactly 1")
+    expect_compile_error("to_own 2 argüman", """
+fn main():
+    @own let x = to_own(1, 2)
+""", "exactly 1")
+    expect_compile_error("to_gc 0 argüman", """
+fn main():
+    @own let x = to_own(1)
+    to_gc()
+""", "exactly 1")
+    expect_compile_error("to_gc değişken referansı ister", """
+fn main():
+    to_gc(1)
+""", "variable reference")
+    expect_compile_error("to_gc @own olmayan değişkeni reddeder", """
+fn main():
+    let g = 1
+    to_gc(g)
+""", "not @own")
+    expect_compile_error("free @own olmayan değişkeni reddeder", """
+fn main():
+    let g = 1
+    free(g)
+""", "not @own")
+    expect_compile_error("free değişken referansı ister", """
+fn main():
+    free(1)
+""", "variable reference")
+    expect_compile_error("sahiplik builtin'i değer olarak kullanılamaz", """
+fn main():
+    let f = to_gc
+""", "builtin")
+
+    # ── Verifier negatifleri ───────────────────────────────────────────
+    own_null = [(TAG_INT, 1), (TAG_NULL, None)]
+
+    m = mk_module(fn_bytes(("LOAD_LOCAL", 0), ("POP",), ("CONST", 1),
+                           ("RET",)),
+                  consts=own_null, n_locals=1,
+                  slot_modes=bytes([MODE_OWN]), max_stack=2)
+    expect_verify_error("LOAD_LOCAL OWN slotta yasak", m, "OWN slot")
+
+    m = mk_module(fn_bytes(("CONST", 0), ("STORE_LOCAL", 0), ("CONST", 1),
+                           ("RET",)),
+                  consts=own_null, n_locals=1,
+                  slot_modes=bytes([MODE_OWN]), max_stack=2)
+    expect_verify_error("STORE_LOCAL OWN slotta yasak", m, "OWN slot")
+
+    m = mk_module(fn_bytes(("CONST", 0), ("OWN_ALLOC", 0), ("OWN_FREE", 0),
+                           ("CONST", 1), ("RET",)),
+                  consts=own_null, n_locals=1,
+                  slot_modes=bytes([MODE_OWN]), max_stack=2)
+    check("geçerli OWN_ALLOC/OWN_FREE verify'dan geçer",
+          verify_module(m) is None)
+
+    m = mk_module(fn_bytes(("OWN_FREE", 0), ("CONST", 1), ("RET",)),
+                  consts=own_null, n_locals=1,
+                  slot_modes=bytes([MODE_TEMP]), max_stack=2)
+    expect_verify_error("OWN_FREE non-OWN slotta", m, "non-OWN")
+
+    # OWN_ALLOC non-OWN zaten test_verifier_negatives'te; OWN_MOVE de öyle.
+
+    # ── Çalışma zamanı negatifleri (elle yazılmış modül) ───────────────
+    m = mk_module(
+        fn_bytes(("CONST", 0), ("OWN_ALLOC", 0), ("OWN_MOVE", 0),
+                 ("POP",), ("OWN_MOVE", 0), ("POP",), ("CONST", 1),
+                 ("RET",)),
+        consts=own_null, n_locals=1, slot_modes=bytes([MODE_OWN]),
+        max_stack=2)
+    try:
+        run_module(m)
+    except VMError as e:
+        check("moved own tekrar OWN_MOVE → use-after-free",
+              "use-after-free" in str(e), f"msg={e}")
+    except Exception as e:  # noqa: BLE001
+        check("moved own tekrar OWN_MOVE → use-after-free", False,
+              f"wrong error {type(e).__name__}: {e}")
+    else:
+        check("moved own tekrar OWN_MOVE → use-after-free", False,
+              "expected VMError, got success")
+
+    m = mk_module(
+        fn_bytes(("CONST", 0), ("OWN_ALLOC", 0), ("OWN_FREE", 0),
+                 ("OWN_MOVE", 0), ("POP",), ("CONST", 1), ("RET",)),
+        consts=own_null, n_locals=1, slot_modes=bytes([MODE_OWN]),
+        max_stack=2)
+    try:
+        run_module(m)
+    except VMError as e:
+        check("free sonrası OWN_MOVE → use-after-free",
+              "use-after-free" in str(e), f"msg={e}")
+    except Exception as e:  # noqa: BLE001
+        check("free sonrası OWN_MOVE → use-after-free", False,
+              f"wrong error {type(e).__name__}: {e}")
+    else:
+        check("free sonrası OWN_MOVE → use-after-free", False,
+              "expected VMError, got success")
+
+    # ── Encode/decode roundtrip (OWN_ALLOC) ────────────────────────────
+    m_rt = compile_source("""
+fn main():
+    @own let p = to_own(9)
+    let g = to_gc(p)
+    print(str(g))
+""")
+    blob = encode_module(m_rt)
+    m_rt2 = decode_module(blob)
+    verify_module(m_rt2)
+    check("OWN_ALLOC encode → decode → encode byte eşitliği",
+          encode_module(m_rt2) == blob)
+    buf_rt = io.StringIO()
+    with contextlib.redirect_stdout(buf_rt):
+        run_module(m_rt2)
+    check("decode edilen OWN_ALLOC modülü çalışır",
+          buf_rt.getvalue().splitlines() == ["9"], buf_rt.getvalue())
+
+    # OwnValueValue repr tree-walker metinleriyle aynı.
+    ov = OwnValueValue(5, name="x")
+    check("OwnValueValue repr canlı", repr(ov) == "<own 'x'>", repr(ov))
+    ov.kill()
+    check("OwnValueValue repr ölü", repr(ov) == "<freed own 'x'>", repr(ov))
+
+
 def test_errors():
     section("Hatalar ve konum bilgisi")
     expect_vm_error("sıfıra bölme VMError", """
@@ -1361,6 +1633,43 @@ fn main():
     @stack let b: [bool; 2] = [true, false]
     print(str(b))
 """,
+        "@own: decl + to_gc + print": """
+fn main():
+    @own let p = to_own(5)
+    let n = to_gc(p)
+    print(str(n + 1))
+""",
+        "@own: free sonrası devam": """
+fn main():
+    @own let p = to_own(41)
+    free(p)
+    print("done")
+""",
+        "@own: yeniden atama": """
+fn main():
+    @own let p = to_own(1)
+    p = to_own(7)
+    let g = to_gc(p)
+    print(str(g))
+""",
+        "@own: stack snapshot derin kopya": """
+fn main():
+    @stack let buf: [int; 2] = [7, 8]
+    @own let p = to_own(buf)
+    buf[0] = 99
+    let g = to_gc(p)
+    print(str(g[0]))
+    print(str(buf[0]))
+""",
+        "@own: moved-out değere eleman yazma": """
+fn main():
+    @stack let buf: [int; 2] = [1, 2]
+    @own let p = to_own(buf)
+    let g = to_gc(p)
+    g[0] = 9
+    print(str(g[0]))
+    print(str(g[1]))
+""",
     }
     for name, src in programs.items():
         expect_parity(name, src)
@@ -1404,6 +1713,7 @@ def main() -> None:
     test_call_depth()
     test_and_or()
     test_stack_vm()
+    test_own_vm()
     test_errors()
     test_verifier_negatives()
     test_vm_cli()

@@ -2,8 +2,10 @@
 Nex VM — stack tabanlı yürütücü (prototip alt kümesi).
 
 Bytecode sözleşmesi: NEX_BYTECODE_SPEC.md. Bu VM modsuz alt kümenin yanında
-`@stack` (STACK_ALLOC/STACK_MATERIALIZE, index erişimi, frame ömrü) desteği
-taşır; OWN/RAW/BORROW opcode'ları geldiğinde buraya eklenecek.
+`@stack` (STACK_ALLOC/STACK_MATERIALIZE, index erişimi, frame ömrü) ve
+`@own` (OWN_ALLOC/OWN_MOVE/OWN_FREE; derin kopya, move/free, frame sonu
+kill) desteği taşır. Borrow (BORROW_*) ve RAW opcode'ları Phase B'de
+eklenecek.
 
 Faz 1 hedefi semantik doğrulamadır; performans değil. Değerler host Python
 nesneleridir (int/float/str/bool/None) — Faz 1'in "host GC" kararı gereği.
@@ -11,12 +13,12 @@ nesneleridir (int/float/str/bool/None) — Faz 1'in "host GC" kararı gereği.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from bytecode import (
     FunctionCode, Instr, Module, decode_code, verify_module,
-    MODE_STACK, TAG_TYPE, MAX_STACK_ELEMS,
+    MODE_STACK, MODE_OWN, TAG_TYPE, MAX_STACK_ELEMS,
     TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE,
     TYPE_KIND_BOOL, TYPE_KIND_PTR, TYPE_KIND_NAMES,
 )
@@ -84,13 +86,48 @@ class StackArrayValue:
 
 
 def _deep_copy(v: Any) -> Any:
+    if isinstance(v, OwnValueValue):
+        raise VMError("cannot deep-copy an @own value (own values are moved, "
+                      "not copied)")
     if isinstance(v, StackArrayValue):
-        return _deep_copy(v.items)
+        # to_list() zaten derin kopyadır; yeniden sararak kopyalamaya gerek yok.
+        return v.to_list()
     if isinstance(v, list):
         return [_deep_copy(x) for x in v]
     if isinstance(v, dict):
         return {k: _deep_copy(x) for k, x in v.items()}
     return v
+
+
+class OwnValueValue:
+    """`@own` sahiplik wrapper'ı (tree-walker OwnValue ile aynı semantik).
+
+    Slotta tam olarak bir canlı wrapper bulunur; OWN_MOVE/OWN_FREE/scope
+    sonu onu öldürür (alive=False, _value=None). `shared`/`mut_borrowed`
+    Phase B borrow sayaçlarıdır — Phase A'da her zaman 0, ama move/free
+    denetimleri bugünden hazırdır. `epoch` Phase B slot nesli içindir;
+    şimdilik yalnız taşınır."""
+
+    __slots__ = ("_value", "alive", "shared", "mut_borrowed", "epoch", "name")
+
+    def __init__(self, value: Any, name: str = "<own>"):
+        self._value = value
+        self.alive = True
+        self.shared = 0
+        self.mut_borrowed = 0
+        self.epoch = 0
+        self.name = name
+
+    def kill(self) -> None:
+        self.alive = False
+        self._value = None
+
+    def __repr__(self) -> str:
+        if not self.alive:
+            return f"<freed own '{self.name}'>"
+        return f"<own '{self.name}'>"
+
+    __str__ = __repr__
 
 
 def _nex_str(v: Any) -> str:
@@ -104,6 +141,10 @@ def _nex_str(v: Any) -> str:
 def _nex_len(v: Any) -> int:
     if isinstance(v, StackArrayValue):
         return len(v)
+    if isinstance(v, OwnValueValue):
+        raise TypeError(
+            "len() expects a list, dict or string, got @own value "
+            "(move it with to_gc(x) first)")
     if isinstance(v, (str, list, dict)):
         return len(v)
     raise TypeError(
@@ -128,6 +169,10 @@ class _Frame:
     decoded: list[Instr]
     pc_to_index: dict[int, int]
     last_pc: int = 0
+    #: Phase B slot nesli: her OWN kuruluşu/move/free/frame-kill'inde artar.
+    slot_epochs: list[int] = field(default_factory=list)
+    #: Bu frame'in global kimliği (Phase B borrow kayıtları için).
+    frame_id: int = 0
 
 
 class VM:
@@ -146,6 +191,7 @@ class VM:
         if self.max_call_depth < 1:
             raise ValueError("max_call_depth must be >= 1")
         self._depth = 0
+        self._next_frame_id = 0
         self._decoded: list[list[Instr]] = []
         self._pc_maps: list[dict[int, int]] = []
         for fn in module.functions:
@@ -175,25 +221,33 @@ class VM:
             raise VMError(
                 f"function '{fn.name}' expects {fn.arity} args, got {len(args)}")
         for i, a in enumerate(args):
-            # Compiler kaçışta STACK_MATERIALIZE üretir; buraya canlı bir
-            # stack tamponu ulaşması ham bytecode işaretidir.
+            # Compiler kaçışta STACK_MATERIALIZE / to_gc üretir; buraya canlı
+            # bir stack/own değeri ulaşması ham bytecode işaretidir.
             if isinstance(a, StackArrayValue):
                 raise VMError(
                     f"argument {i + 1} of '{fn.name}' is a live stack array "
                     f"(materialize it first)")
+            if isinstance(a, OwnValueValue):
+                raise VMError(
+                    f"cannot pass @own value as argument {i + 1} of "
+                    f"'{fn.name}'; move it with to_gc(x) first")
         slots: list[Any] = [None] * fn.n_locals
         for i, a in enumerate(args):
             slots[i] = a
         frame = _Frame(
             fn=fn, slots=slots, stack=[],
             pc=0, decoded=self._decoded[fi], pc_to_index=self._pc_maps[fi],
+            slot_epochs=[0] * fn.n_locals,
+            frame_id=self._next_frame_id,
         )
+        self._next_frame_id += 1
         self._depth += 1
         try:
             return self._execute(frame)
         finally:
             self._depth -= 1
             self._kill_stack_slots(fn, slots)
+            self._kill_own_slots(fn, frame)
 
     @staticmethod
     def _kill_stack_slots(fn: FunctionCode, slots: list[Any]) -> None:
@@ -207,6 +261,22 @@ class VM:
                 if isinstance(v, StackArrayValue):
                     v.alive = False
                     v.items = []
+
+    @staticmethod
+    def _kill_own_slots(fn: FunctionCode, frame: _Frame) -> None:
+        """Frame çıkışında canlı @own yüklerini öldür, slot neslini artır.
+
+        Tree-walker'ın scope sonu `OwnValue.kill()` davranışı; sahiplik
+        fonksiyon sınırını geçemediği için kaçan canlı yük olmamalı, yine de
+        ham bytecode'a karşı güvenlik ağıdır."""
+        for i, mode in enumerate(fn.slot_modes):
+            if mode != MODE_OWN or i >= len(frame.slots):
+                continue
+            v = frame.slots[i]
+            if isinstance(v, OwnValueValue):
+                v.kill()
+            if i < len(frame.slot_epochs):
+                frame.slot_epochs[i] += 1
 
     # -- ana döngü -----------------------------------------------------------
     def _execute(self, fr: _Frame) -> Any:
@@ -275,6 +345,46 @@ class VM:
                     st.append(v.to_list())
                 except VMError as e:
                     raise VMError(e.message, *loc) from None
+
+            elif name == "OWN_ALLOC":
+                si = a[0]
+                loc = fr.fn.line_of(ins.pc)
+                v = st.pop()
+                try:
+                    copied = _deep_copy(v)
+                except VMError as e:
+                    raise VMError(e.message, *loc) from None
+                # Aynı slot yeniden kuruluyorsa eski yük ölür (döngü
+                # gövdesindeki bildirim / yeniden atama).
+                prev = fr.slots[si]
+                if isinstance(prev, OwnValueValue):
+                    prev.kill()
+                fr.slots[si] = OwnValueValue(copied, name=f"slot{si}")
+                fr.slot_epochs[si] += 1
+
+            elif name in ("OWN_MOVE", "OWN_FREE"):
+                si = a[0]
+                loc = fr.fn.line_of(ins.pc)
+                v = fr.slots[si]
+                if not isinstance(v, OwnValueValue):
+                    raise VMError(
+                        f"{name} on non-own slot {si}", *loc)
+                if not v.alive:
+                    raise VMError(
+                        f"@own value '{v.name}' used after free/scope end "
+                        f"(use-after-free)", *loc)
+                # Phase A'da borrow opcode'u yok; yine de move/free denetimi
+                # hazır tutulur (Phase B borrow sayaçları).
+                if v.shared > 0 or v.mut_borrowed > 0:
+                    raise VMError(
+                        f"cannot move/free '{v.name}' while borrowed", *loc)
+                inner = v._value
+                v.kill()                 # slot ölü wrapper tutar (moved)
+                fr.slot_epochs[si] += 1
+                if name == "OWN_MOVE":
+                    st.append(inner)
+                # OWN_FREE yığına bir şey bırakmaz; derleyici ifade bağlamı
+                # için ayrıca CONST null üretir.
 
             elif name == "GET_INDEX":
                 idx = st.pop()
@@ -451,6 +561,9 @@ class VM:
             return v
         if isinstance(v, (int, float)):
             return v != 0
+        if isinstance(v, OwnValueValue):
+            # Tree-walker is_truthy wrapper'ı açmaz (son `return True`).
+            return True
         if isinstance(v, StackArrayValue):
             return v.alive and v.size > 0
         if isinstance(v, (str, list, dict)):
