@@ -1829,8 +1829,11 @@ fn main():
                          "not supported")
     expect_compile_error("@own VM prototipinde desteklenmez",
                          "fn main():\n    @own let x = 1\n", "@own")
-    expect_compile_error("top-level statement reddedilir",
-                         "print(1)\n", "top-level")
+    # Üst seviye statement'lar artık sentetik <script> girişine derlenir
+    # (3a): `print(1)` tek başına başarılı derlenir, giriş <script>.
+    m_script = compile_source("print(1)\n")
+    check("top-level statement derlenir (<script> girişi)",
+          m_script.functions[m_script.entry].name == "<script>")
     expect_compile_error("main zorunlu",
                          "fn foo():\n    return 1\n", "main")
     expect_compile_error("iç içe fn reddedilir", """
@@ -2334,6 +2337,91 @@ fn main():
         expect_parity(name, src)
 
 
+def test_top_level_vm():
+    section("Top-level statements → synthetic <script> entry")
+
+    # Yalnız üst seviye statement'lar (hiç fn yok): sentetik <script>
+    # girişi dosya sırasıyla çalışır, tree-walker çıktısıyla aynı.
+    expect_parity(
+        "top-level only: let/aritmetik/print (fn yok)",
+        """
+print("a")
+let x = 3 * (2 + 4)
+let y = x - 10
+print(y)
+print(str(x) + "!")
+""")
+
+    # Kullanıcı fonksiyonu üst seviyeden çağrılır (hoisted).
+    expect_parity(
+        "top-level calls user fn",
+        """
+fn greet(name: str) -> str:
+    return "hi " + name
+
+print(greet("x"))
+print(len(greet("xy")))
+""")
+
+    # `fn main` tanımlıysa ikisi de yaşar: girişsentetik <script>,
+    # üst seviyeden main() çağrılabilir.
+    expect_parity(
+        "fn main + top-level coexist",
+        """
+fn main():
+    print("main")
+
+let n = 2
+print(n + 1)
+main()
+""")
+
+    # Üst seviye if/else.
+    expect_parity(
+        "top-level if/else",
+        """
+let v = 7
+if v > 5:
+    print("big")
+else:
+    print("small")
+print("end")
+""")
+
+    # Fonksiyon tablosu sırası ve giriş indeksi: kullanıcı fonksiyonları
+    # önce, <script> en sonda; entry = <script> indeksi.
+    m = compile_source("""
+fn f() -> int:
+    return 1
+
+fn g() -> int:
+    return 2
+
+print(f() + g())
+""")
+    names = [fn.name for fn in m.functions]
+    check("functions: user fns first, <script> last",
+          names == ["f", "g", "<script>"], f"names={names!r}")
+    check("entry = index of <script> (last)", m.entry == 2,
+          f"entry={m.entry}")
+    check("<script> arity 0", m.functions[m.entry].arity == 0)
+
+    # Üst seviye statement yoksa eski davranış: entry = fn main (zorunlu).
+    m2 = compile_source(SAMPLE)
+    check("no top-level stmts: entry = fn main index", m2.entry == 2,
+          f"entry={m2.entry}, names={[f.name for f in m2.functions]!r}")
+    expect_compile_error(
+        "no main + no top-level stmts still requires 'main'",
+        "fn f() -> int:\n    return 1\n",
+        "requires a 'main' function")
+
+    # Boş dosya (0 fn, 0 statement): eski 'no functions to compile' hatası
+    # bilinçli olarak korunur — sentetik girişin gövdesi boş üretilemez.
+    expect_compile_error(
+        "empty file: no functions to compile (kept)", "",
+        "no functions to compile")
+
+
 def test_metadata():
     section("Meta — max_stack / line table / slot modu")
     m = compile_source(SAMPLE)
@@ -2381,6 +2469,7 @@ def main() -> None:
     test_unimplemented_opcodes()
     test_vm_cli()
     test_parity()
+    test_top_level_vm()
     test_metadata()
 
     total = passed + failed

@@ -30,27 +30,30 @@ ROOT = Path(__file__).resolve().parent
 MATRIX = {
     # examples/vm_basics.nex: designed for the VM; tree output matches exactly.
     "examples/vm_basics.nex": ("SUPPORTED", None),
-    # examples/hello.nex: top-level statements not supported in VM (Compile Error).
+    # examples/hello.nex: VM compiles top-level statements into a synthetic
+    # <script> entry, but fails at the first `for` (line 17) — no loops yet.
     "examples/hello.nex": ("KNOWN_VM_UNSUPPORTED",
-                           "top-level statements are not supported in the VM prototype"),
-    # examples/fizzbuzz.nex: top-level statements not supported in VM (Compile Error).
+                           "ForStmt is not supported in the VM prototype"),
+    # examples/fizzbuzz.nex: top-level `for` (line 1) — no loops in VM yet.
     "examples/fizzbuzz.nex": ("KNOWN_VM_UNSUPPORTED",
-                              "top-level statements are not supported in the VM prototype"),
-    # examples/stack.nex: top-level statements not supported in VM (Compile Error).
+                              "ForStmt is not supported in the VM prototype"),
+    # examples/stack.nex: top-level `for` (line 10) — no loops in VM yet.
     "examples/stack.nex": ("KNOWN_VM_UNSUPPORTED",
-                           "top-level statements are not supported in the VM prototype"),
-    # examples/data_pipeline.nex: top-level statements not supported in VM (Compile Error).
+                           "ForStmt is not supported in the VM prototype"),
+    # examples/data_pipeline.nex: top-level `for` (line 22) — no loops yet.
     "examples/data_pipeline.nex": ("KNOWN_VM_UNSUPPORTED",
-                                   "top-level statements are not supported in the VM prototype"),
-    # examples/buffer_econ.nex: top-level statements not supported in VM (Compile Error).
+                                   "ForStmt is not supported in the VM prototype"),
+    # examples/buffer_econ.nex: top-level `@raw` (line 19) — @raw not in VM.
     "examples/buffer_econ.nex": ("KNOWN_VM_UNSUPPORTED",
-                                 "top-level statements are not supported in the VM prototype"),
+                                 "@raw is not supported in the VM prototype"),
     # examples/tree_own.nex: classes not supported in VM (ClassDecl).
     "examples/tree_own.nex": ("KNOWN_VM_UNSUPPORTED",
                               "ClassDecl is not supported in the VM prototype"),
-    # test_features.nex: top-level statements not supported in VM (Compile Error).
+    # test_features.nex: top-level statements now compile (synthetic <script>
+    # entry), but the script calls `println` which is not in the VM's native
+    # table (tree-walker has it as a builtin; line 6).
     "test_features.nex": ("KNOWN_VM_UNSUPPORTED",
-                          "top-level statements are not supported in the VM prototype"),
+                          "undefined function 'println'"),
 }
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")

@@ -306,6 +306,7 @@ class Compiler:
 
     # -- giriş ---------------------------------------------------------------
     def compile(self) -> Module:
+        script_stmts: list[A.Node] = []
         for stmt in self.tree.stmts:
             if isinstance(stmt, A.FnDecl):
                 if stmt.name in self._func_index:
@@ -324,14 +325,26 @@ class Compiler:
                     f"{type(stmt).__name__} is not supported in the VM prototype",
                     stmt)
             else:
-                raise CompileError(
-                    "top-level statements are not supported in the VM prototype "
-                    "(put code in fn main)", stmt)
+                # Üst seviye statement: sentetik `<script>` girişine taşınır
+                # (aşağıda). Ad `<script>` geçerli bir tanımlayıcı olmadığı
+                # için kullanıcı fonksiyonlarıyla çakışamaz.
+                script_stmts.append(stmt)
 
-        if not self._func_decls:
+        if not self._func_decls and not script_stmts:
             raise CompileError("no functions to compile")
-        if "main" not in self._func_index:
-            raise CompileError("VM prototype requires a 'main' function")
+
+        # Üst seviye statement'lar varsa sentetik giriş fonksiyonu: dosya
+        # sırasıyla gövdeye konur, kullanıcı fonksiyonları serbestçe
+        # çağrılabilir (tree-walker semantiği). `fn main` tanımlıysa ikisi
+        # de yaşar; VM girişi sentetik `<script>`'tir. Statement yoksa
+        # eski davranış korunur: giriş `fn main` (zorunlu).
+        script_decl: Optional[A.FnDecl] = None
+        if script_stmts:
+            first = script_stmts[0]
+            script_decl = A.FnDecl(
+                name="<script>", type_params=[], params=[], return_type=None,
+                body=A.Block(stmts=script_stmts, line=first.line, col=first.col),
+                line=first.line, col=first.col)
 
         # Native tablo
         self.module.natives = list(NATIVES)
@@ -342,11 +355,25 @@ class Compiler:
         # (encode_module function tablosu addan const indeksi yazar).
         for decl in self._func_decls:
             self._name_const(decl.name)
+        if script_decl is not None:
+            self._name_const(script_decl.name)
 
         for decl in self._func_decls:
             self.module.functions.append(self._compile_function(decl))
 
-        self.module.entry = self._func_index["main"]
+        if script_decl is not None:
+            # Sentetik giriş en sona: arşiv sırası kullanıcı fonksiyonları
+            # önce, `<script>` sonra. Gövde fn main gövdesiyle aynı yolla
+            # derlenir (return → RET script'i bitirir; sonda düşen akış
+            # null döner). Params boş olduğundan _compile_function'daki
+            # param denetimleri tetiklenmez; null-body reddi yalnız yukarıdaki
+            # toplama döngüsünde olduğundan sentetik node oraya girmez.
+            self.module.functions.append(self._compile_function(script_decl))
+            self.module.entry = len(self.module.functions) - 1
+        else:
+            if "main" not in self._func_index:
+                raise CompileError("VM prototype requires a 'main' function")
+            self.module.entry = self._func_index["main"]
         return self.module
 
     # -- fonksiyon -----------------------------------------------------------
