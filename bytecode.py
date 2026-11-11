@@ -90,6 +90,22 @@ OPCODES: dict[str, tuple[int, int]] = {
 
 OP_BY_CODE: dict[int, tuple[str, int]] = {code: (name, n) for name, (code, n) in OPCODES.items()}
 
+# ─── VM'in henüz YÜRÜTMEDİĞİ opcode'lar (yükleme anında reddedilir) ──────────
+# Bu liste vm.py `_execute` dispatch'inin GERÇEK kapsamına denk gelir;
+# check_opcodes.py (CI gate) iki dosya arasındaki drift'i yakalar:
+#   - burada olup VM'e eklenen opcode → listeden ÇIKARILMALI (gate exit 1),
+#   - OPCODES'ta olup burada da VM'de de olmayan opcode → buraya EKLENMELİ.
+# Amaç: elle yazılmış modül verify'dan geçip runtime'da "opcode X is not
+# implemented" ile çökmesin (spec §7: sözleşme yükleme anında zorunlu).
+# BORROW_CHECK listede DEĞİL: Phase B'de VM'de uygulanmıştır (yanlış anıldı).
+UNIMPLEMENTED_OPCODES: frozenset[str] = frozenset({
+    "LOAD_GLOBAL", "STORE_GLOBAL",   # global slot: module sistemi v1'de yok
+    "NEW_TUPLE",                     # tuple literal derleyicide kapsam dışı
+    "GET_MEMBER", "SET_MEMBER",      # MemberExpr v1'de desteklenmiyor
+    "RAW_MAKE",                      # @raw modu sonraki turda
+    "BLOCK_ENTER", "BLOCK_EXIT",     # kapsam stübleri; VM dispatch'i yok
+})
+
 # Slot modları
 MODE_GC, MODE_OWN, MODE_STACK, MODE_RAW, MODE_BORROW, MODE_TEMP = range(6)
 
@@ -536,6 +552,16 @@ def _verify_function(m: Module, f: FunctionCode) -> list[str]:
 
     if not instrs:
         return ["empty function code"]
+
+    # Yükleme anı reddi (spec §7): VM'in yürütmediği opcode'lar burada
+    # yakalanır; aksi hâlde modül verify'dan geçip runtime'da "opcode X is
+    # not implemented in the prototype VM" ile çökerdi. Yapısal/akış
+    # kontrolleri yine de çalışır — ek tanı mesajları zarar vermez.
+    for ins in instrs:
+        if ins.name in UNIMPLEMENTED_OPCODES:
+            errs.append(
+                f"opcode '{ins.name}' is not implemented in the prototype VM "
+                f"(load-time rejection)")
 
     by_pc = {i.pc: i for i in instrs}
     starts = set(by_pc)

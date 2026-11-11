@@ -24,13 +24,15 @@ import io
 import struct
 import sys
 import contextlib
+from pathlib import Path
 
 from lexer import Lexer
 from parser import Parser
 from compiler import compile_program, CompileError
 from bytecode import (
     BytecodeError, VerifyError, Module, FunctionCode, NativeInfo,
-    OPCODES, MODE_TEMP, MODE_OWN, MODE_STACK, MODE_BORROW,
+    OPCODES, UNIMPLEMENTED_OPCODES, MODE_TEMP, MODE_OWN, MODE_STACK,
+    MODE_BORROW,
     NAT_PURE, NAT_RETAINS_REF, TAG_FUNC_REF, TAG_NATIVE_REF, TAG_TYPE,
     TAG_NULL, TAG_INT,
     encode_module, decode_module, decode_code, disassemble, verify_module,
@@ -2088,6 +2090,89 @@ fn main():
               "invalid module executed")
 
 
+def test_unimplemented_opcodes():
+    """Yükleme anı reddi: VM'in yürütmediği opcode verify'da yakalanmalı.
+
+    Kök neden: verifier kabul edip runtime'da çökme sözleşme kırılmasıydı
+    (BLOCK_ENTER olayı). Her unimplemented opcode için minimal, başkaca
+    hiçbir ihlali olmayan elle yazılmış modül: VerifyError + opcode adı.
+    Ayrıca opcode kapsama gate'i (check_opcodes.py) drift'e karşı koşulur.
+    """
+    section("Verifier — unimplemented opcode yükleme anı reddi")
+
+    # Her opcode için stack dengesi tutan minimal modül (tek ihlal: opcode
+    # unimplemented). CONST 0 → TAG_NULL sabiti (existing negatives aynı).
+    minimal_args = {
+        "LOAD_GLOBAL":   (0,),                       # (0,1) → POP ile dengelenir
+        "STORE_GLOBAL":  (0,),                       # (1,0)
+        "NEW_TUPLE":     (0,),                       # (0,1) → POP ile dengelenir
+        "GET_MEMBER":    (0,),                       # (1,1) → POP ile dengelenir
+        "SET_MEMBER":    (0,),                       # (2,0)
+        "RAW_MAKE":      (0,),                       # (1,0)
+        "BLOCK_ENTER":   (),                         # (0,0)
+        "BLOCK_EXIT":    (),                         # (0,0)
+    }
+
+    for name in sorted(UNIMPLEMENTED_OPCODES):
+        args = minimal_args[name]
+        body = [fn_bytes((name, *args))]
+        if name in ("LOAD_GLOBAL", "NEW_TUPLE", "GET_MEMBER"):
+            body.append(fn_bytes(("POP",)))
+        code = b"".join(body) + fn_bytes(("CONST", 0), ("RET",))
+        m = mk_module(code, consts=[(TAG_NULL, None)], max_stack=2)
+        expect_verify_error(
+            f"unimplemented opcode '{name}' yükleme anında reddedilir", m,
+            f"opcode '{name}' is not implemented")
+
+    # Edge: modülün TEK yasa dışı şeyi unimplemented opcode olmalı — mesaj
+    # temiz VerifyError olmalı (kısmi başarı ya da başka istisna değil).
+    m = mk_module(fn_bytes(("BLOCK_ENTER",), ("CONST", 0), ("RET",)),
+                  consts=[(TAG_NULL, None)], max_stack=2)
+    try:
+        verify_module(m)
+    except VerifyError as e:
+        check("tek ihlal: temiz VerifyError mesajı",
+              "BLOCK_ENTER" in str(e) and "not implemented" in str(e),
+              f"msg={e}")
+    except Exception as e:  # noqa: BLE001
+        check("tek ihlal: temiz VerifyError mesajı", False,
+              f"wrong error {type(e).__name__}: {e}")
+    else:
+        check("tek ihlal: temiz VerifyError mesajı", False,
+              "expected VerifyError, got success")
+
+    # Opcode kapsama gate'i: VM dispatch ↔ UNIMPLEMENTED_OPCODES drift'i
+    try:
+        import check_opcodes
+    except Exception as e:  # noqa: BLE001
+        check("check_opcodes import edilir", False,
+              f"{type(e).__name__}: {e}")
+    else:
+        try:
+            rc = check_opcodes.main()
+        except SystemExit as e:
+            rc = e.code
+        check("check_opcodes gate'i drift bildirmez", rc == 0,
+              f"exit={rc} (yukarıdaki DRIFT çıktısına bakın)")
+
+    # Listede olmayan hiçbir opcode'un, VM'in gerçekten yürüttüğü setle
+    # çakışmaması (dağılım = OPCODES'in tam bölünmesi).
+    try:
+        import vm as _vmmod
+    except Exception as e:  # noqa: BLE001
+        check("vm import edilir", False, f"{type(e).__name__}: {e}")
+    else:
+        from check_opcodes import collect_vm_handled
+        handled = collect_vm_handled(
+            Path(__file__).resolve().parent / "vm.py")
+        check("UNIMPLEMENTED ∩ VM-dispatch boş",
+              not (UNIMPLEMENTED_OPCODES & handled),
+              str(sorted(UNIMPLEMENTED_OPCODES & handled)))
+        check("her OPCODES girişi handled/unimplemented ayrımına düşer",
+              handled | UNIMPLEMENTED_OPCODES >= set(OPCODES),
+              str(sorted(set(OPCODES) - handled - UNIMPLEMENTED_OPCODES)))
+
+
 def test_vm_cli():
     section("CLI — --vm / --disasm")
     import main as nexmain
@@ -2293,6 +2378,7 @@ def main() -> None:
     test_list_dict_vm()
     test_errors()
     test_verifier_negatives()
+    test_unimplemented_opcodes()
     test_vm_cli()
     test_parity()
     test_metadata()

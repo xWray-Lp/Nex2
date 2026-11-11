@@ -26,6 +26,9 @@ jobs:
       - name: AST field coverage gate
         run: python check_ast_coverage.py
 
+      - name: Opcode coverage gate
+        run: python check_opcodes.py
+
       - name: Run type checker tests
         run: python test_typechecker.py
 
