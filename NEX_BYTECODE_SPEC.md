@@ -135,6 +135,18 @@ checker'daki kimlik karşılaştırmasının VM karşılığıdır; prototipte
 disassembly üzerinden test edilir (shadowing varsa `CALL`, yoksa
 `CALL_PURE_NATIVE`).
 
+| Native | argc | flags | Not |
+|---|---:|---|---|
+| `print` | variadic | pure | `join(str)` + yazdır, `None` döner |
+| `str` | 1 | pure | `str(x)` |
+| `int` | 1 | pure | `int(x)` |
+| `float` | 1 | pure | `float(x)` |
+| `len` | 1 | pure, structural | uzunluk; borrow allowlist |
+| `keys` | 1 | pure, structural | dict anahtarları; borrow allowlist |
+| `values` | 1 | pure, structural | dict değerleri; borrow allowlist |
+| `push` | 2 | — | `list.push(v)` mutasyonu |
+| `println` | variadic | pure | `print` ile aynı join-str + print semantiği (ikisi de trailing newline koyar) |
+
 ---
 
 ## 6. Opcode tablosu

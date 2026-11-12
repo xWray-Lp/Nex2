@@ -1516,7 +1516,8 @@ fn main():
           and "BORROW_END" in d, d)
     check("allowlist native'ler tabloda",
           [n.name for n in m.natives] ==
-          ["print", "str", "int", "float", "len", "keys", "values", "push"],
+          ["print", "str", "int", "float", "len", "keys", "values",
+           "push", "println"],
           str([n.name for n in m.natives]))
 
     # ── Handwritten bytecode: BORROW_END released işaretler ─────────────
@@ -3140,6 +3141,47 @@ fn main():
                         "RAW_MAKE on non-RAW slot")
 
 
+def test_println_fstring_vm() -> None:
+    section("println + f-string (VM parity)")
+
+    # println parity cases
+    expect_parity("println parity: single string",
+                  'fn main():\n    println("a")\n\nmain()\n')
+    expect_parity("println parity: empty",
+                  'fn main():\n    println()\n\nmain()\n')
+    expect_parity("println parity: mixed args",
+                  'fn main():\n    println(1, "x")\n\nmain()\n')
+
+    # f-string parity cases
+    expect_parity("f-string parity: single expr",
+                  'fn main():\n    let x = 7\n    println(f"{x}")\n\nmain()\n')
+    expect_parity("f-string parity: multiple exprs",
+                  'fn main():\n    let name = "Nex"\n    let v = 2\n'
+                  '    println(f"hi {name} v{v}!")\n\nmain()\n')
+    expect_parity("f-string parity: no interpolation",
+                  'fn main():\n    println(f"plain")\n\nmain()\n')
+    expect_parity("f-string parity: expr with call",
+                  'fn main():\n    let xs = [1, 2, 3]\n'
+                  '    println(f"n={len(xs)}")\n\nmain()\n')
+    expect_parity("f-string parity: len of f-string",
+                  'fn main():\n    let x = 5\n'
+                  '    print(str(len(f"a{x}")))\n\nmain()\n')
+
+    # Disasm/emit: at least one CALL_PURE_NATIVE str per interpolation
+    m = compile_source(
+        'fn main():\n    let x = 1\n    let y = 2\n'
+        '    println(f"a{x}b{y}")\n\nmain()\n')
+    d = disassemble(m)
+    # two interpolations -> two str native calls
+    n_str = d.count("CALL_PURE_NATIVE")
+    # println is also a CALL_PURE_NATIVE; count str calls specifically by name comment
+    str_calls = [line for line in d.splitlines() if "CALL_PURE_NATIVE" in line and "; str" in line]
+    check("f-string emits CALL_PURE_NATIVE str per interpolation",
+          len(str_calls) >= 2, f"str_calls={len(str_calls)} disasm=\n{d}")
+    check("f-string+println disasm contains println native",
+          "; println" in d, d)
+
+
 def main() -> None:
     test_encoding()
     test_disassembler()
@@ -3158,6 +3200,7 @@ def main() -> None:
     test_int_semantics()
     test_internal_bug_diagnostics()
     test_raw_vm()
+    test_println_fstring_vm()
     test_errors()
     test_verifier_negatives()
     test_unimplemented_opcodes()

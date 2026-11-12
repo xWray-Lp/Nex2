@@ -278,6 +278,7 @@ def _nex_push(lst: Any, val: Any) -> None:
 
 NATIVE_FUNCS = {
     "print": lambda *args: print(" ".join(str(a) for a in args)),
+    "println": lambda *args: print(" ".join(str(a) for a in args)),
     "str":   _nex_str,
     "int":   int,
     "float": float,

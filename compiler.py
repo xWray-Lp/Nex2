@@ -1,22 +1,21 @@
 """
 Nex Compiler — AST → bytecode (prototip alt kümesi).
 
-Kapsam (v0.1 prototip): int/float/str/bool/null, print/str/int/float/len
+Kapsam (v0.1 prototip): int/float/str/bool/null, print/println/str/int/float/len
 native'leri, aritmetik/karşılaştırma, let/atama, if/elif/else, while,
 break/continue, for (A.ForStmt: range → while-style tamsayı döngüsü,
 list/str/@stack → indeksle yineleme; destructuring hedef reddedilir),
 fonksiyon tanımı + çağrı, return, and/or (eager semantik), `@stack`
 sabit boyutlu diziler (STACK_ALLOC/STACK_MATERIALIZE, indeks okuma/yazma,
 kaçışta derin heap kopyası), `@own` sahipliği (OWN_ALLOC/OWN_MOVE/
-OWN_FREE; borrow yok) ve genel list/dict literalleri (NEW_LIST/NEW_DICT +
-GET_INDEX/SET_INDEX). `list.push` metodu CALL_NATIVE push ile desteklenir;
-diğer metot çağrıları `.X` kapsam dışıdır.
+OWN_FREE; borrow yok), genel list/dict literalleri (NEW_LIST/NEW_DICT +
+GET_INDEX/SET_INDEX) ve f-string (`FStringExpr`). `list.push` metodu
+CALL_NATIVE push ile desteklenir; diğer metot çağrıları `.X` kapsam dışıdır.
 
 Kapsam dışı (bilinçli): @raw, nested @stack, `str` elemanlı stack dizi,
-tuple, sınıflar, match, for'da destructuring, import, lambda, f-string,
-pipe; ayrıca list/dict üzerinde compound atama ve diğer metotlar
-(`.length`, `.pop`, ...). Bunlar açık CompileError üretir — sessizce
-yanlış kod üretilmez.
+tuple, sınıflar, match, for'da destructuring, import, lambda, pipe; ayrıca
+list/dict üzerinde compound atama ve diğer metotlar (`.length`, `.pop`,
+...). Bunlar açık CompileError üretir — sessizce yanlış kod üretilmez.
 
 `@own` kuralları (tree-walker parity) ve borrow (Phase B, v1 alt kümesi):
 - `@own let x = to_own(expr)` ve mevcut @own değişkene `x = to_own(expr)`
@@ -82,6 +81,8 @@ NATIVES: list[NativeInfo] = [
     # push: impure (list'i mutasyona uğratır) → NAT_PURE yok; derleyici
     # bunu CALL_NATIVE ile kodlar (CALL_PURE_NATIVE verifier'da reddedilir).
     NativeInfo("push", 2, 0),
+    # println: print ile aynı (variadic, saf; ikisi de trailing newline koyar).
+    NativeInfo("println", 0xFFFFFFFF, NAT_PURE),
 ]
 _NATIVE_INDEX = {n.name: i for i, n in enumerate(NATIVES)}
 
@@ -796,6 +797,22 @@ class Compiler:
                 b.emit("STACK_MATERIALIZE", slot, node=node)
             else:
                 b.emit("LOAD_LOCAL", slot, node=node)
+            return
+
+        if isinstance(node, A.FStringExpr):
+            # f-string: parçaları soldan sağa birleştir. Literal parça → CONST STR;
+            # ifade parçası → expr + CALL_PURE_NATIVE str 1. Parça yoksa "".
+            if not node.parts:
+                b.emit("CONST", self._const(TAG_STR, ""), node=node)
+                return
+            for i, part in enumerate(node.parts):
+                if isinstance(part, str):
+                    b.emit("CONST", self._const(TAG_STR, part), node=node)
+                else:
+                    self._compile_expr(part)
+                    b.emit("CALL_PURE_NATIVE", _NATIVE_INDEX["str"], 1, node=node)
+                if i > 0:
+                    b.emit("ADD", node=node)
             return
 
         if isinstance(node, A.BorrowExpr):

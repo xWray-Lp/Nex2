@@ -51,11 +51,8 @@ MATRIX = {
     # examples/tree_own.nex: classes not supported in VM (ClassDecl).
     "examples/tree_own.nex": ("KNOWN_VM_UNSUPPORTED",
                               "ClassDecl is not supported in the VM prototype"),
-    # test_features.nex: top-level statements now compile (synthetic <script>
-    # entry), but the script calls `println` which is not in the VM's native
-    # table (tree-walker has it as a builtin; line 6).
-    "test_features.nex": ("KNOWN_VM_UNSUPPORTED",
-                          "undefined function 'println'"),
+    # test_features.nex: println + f-string + for-range — VM/tree byte-equal.
+    "test_features.nex": ("SUPPORTED", None),
 }
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
