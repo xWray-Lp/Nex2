@@ -3004,6 +3004,44 @@ fn main():
 """)
 
 
+def test_internal_bug_diagnostics():
+    section("Internal bug diagnostics contract")
+    from interpreter import Interpreter
+
+    # Non-NexRuntimeError path: inject sentinel node with no eval method.
+    # evaluate() raises NotImplementedError for unknown node type; interpret()
+    # catches non-Nex exceptions and reports as INTERNAL BUG to stderr.
+    tree = parse("fn main():\n    return 0\n")
+    tree.stmts.append(object())
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        ok = Interpreter().interpret(tree)
+    out = out_buf.getvalue()
+    err = err_buf.getvalue()
+    check("internal bug returns False", ok is False, f"ok={ok!r}")
+    check("internal bug goes to stderr with INTERNAL BUG prefix",
+          "⚠ INTERNAL BUG (please report):" in err, f"stderr={err!r}")
+    check("internal bug has no old 'Internal Error' prefix",
+          "Internal Error" not in err, f"stderr={err!r}")
+    check("internal bug emits no Runtime Error on stdout",
+          "Runtime Error" not in out, f"stdout={out!r}")
+
+    # NexRuntimeError diagnostics must still go to stdout with same prefix.
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        ok = Interpreter().interpret(parse("fn main():\n    print(1 / 0)\n"))
+    out = out_buf.getvalue()
+    err = err_buf.getvalue()
+    check("NexRuntimeError returns False", ok is False, f"ok={ok!r}")
+    check("NexRuntimeError goes to stdout with Runtime Error prefix",
+          "Runtime Error at line" in out, f"stdout={out!r}")
+    check("NexRuntimeError not reported as INTERNAL BUG",
+          "⚠ INTERNAL BUG" not in err and "⚠ INTERNAL BUG" not in out,
+          f"stdout={out!r} stderr={err!r}")
+
+
 def main() -> None:
     test_encoding()
     test_disassembler()
@@ -3020,6 +3058,7 @@ def main() -> None:
     test_for_vm()
     test_list_dict_vm()
     test_int_semantics()
+    test_internal_bug_diagnostics()
     test_errors()
     test_verifier_negatives()
     test_unimplemented_opcodes()

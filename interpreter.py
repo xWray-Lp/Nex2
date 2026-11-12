@@ -7,7 +7,9 @@ Visitor pattern + environment stack.
 from __future__ import annotations
 
 import copy
+import os
 import sys
+import traceback
 from typing import Any, Callable, Dict, List, Optional
 
 from ast_nodes import *
@@ -916,7 +918,12 @@ class Interpreter:
             print(f"Runtime Error at line {e.line}:{e.col} — {e}")
             return False
         except Exception as e:
-            print(f"Internal Error: {e}")
+            # Non-Nex exceptions indicate interpreter/Nex implementation bugs,
+            # not user program errors. Report to stderr with a distinct prefix;
+            # opt-in traceback via NEX_DEBUG keeps normal output stable.
+            print(f"⚠ INTERNAL BUG (please report): {e}", file=sys.stderr)
+            if os.environ.get("NEX_DEBUG") == "1":
+                traceback.print_exc()
             return False
 
     # ── Literal Değerlendirmeleri ─────────────────────────────────────────────
