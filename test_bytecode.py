@@ -604,6 +604,18 @@ fn main():
           ok is False and "call depth limit exceeded (256)" in out
           and "Runtime Error at line" in out, f"ok={ok} out={out!r}")
 
+    # Regresyon: varsayılan ayarlarda host recursion limit'i Nex sayacından
+    # önce devreye girmemeli; Internal Error/RecursionError görülmemeli.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ok = Interpreter().interpret(parse(deep % 5000))
+    out = buf.getvalue()
+    check("tree varsayılan ayar: call depth 256 (host RecursionError yok)",
+          ok is False and "call depth limit exceeded (256)" in out
+          and "Internal Error" not in out
+          and "maximum recursion depth" not in out,
+          f"ok={ok} out={out!r}")
+
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         ok = Interpreter().interpret(parse(deep % 100))

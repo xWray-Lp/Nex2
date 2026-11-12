@@ -722,11 +722,12 @@ class BoundMethod:
 class Interpreter:
     """Ana interpreter sınıfı. AST'yi çalıştırır."""
 
-    #: Bir Nex çağrı düzeyi başına host Python frame maliyeti (ölçüm ~7.5;
-    #: güvenli payla 8). max_call_depth sınırının host RecursionError'dan
-    #: ÖNCE ulaşılabilsin diye host özyineleme limiti sadece yukarı doğru
-    #: bu değere göre yükseltilir (normal programların davranışı değişmez).
-    _FRAMES_PER_NEX_CALL = 8
+    #: Bir Nex çağrı düzeyi başına host Python frame maliyeti; measured ~12-14
+    #: under nested expressions, 20 is headroom for both default (256) and
+    #: `--max-call-depth` paths. max_call_depth sınırının host
+    #: RecursionError'dan ÖNCE ulaşılabilsin diye host özyineleme limiti bu
+    #: değere göre yükseltilir.
+    _FRAMES_PER_NEX_CALL = 20
 
     def __init__(self, max_call_depth: int = 256):
         # VM.MAX_CALL_DEPTH ile aynı varsayılan; main.py --max-call-depth

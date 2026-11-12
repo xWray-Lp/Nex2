@@ -308,3 +308,9 @@ register machine'e geçiş ölçütü, generic/monster temsili, modül sistemi.
   README'ye alınamaz, burada açık uç olarak tutulur.
 - **Tamsayı semantiği:** i64 taşması trap eder (debug-safe), her iki backend
   eşleşir; ayrıntı ve kapsam [`NEX_INT_SEMANTICS.md`](./NEX_INT_SEMANTICS.md).
+- **`--max-call-depth` ve host frame bütçesi:** opting into a large
+  `--max-call-depth` raises the host Python frame ceiling linearly; e.g.
+  `--max-call-depth 5000` reserves ~10300 Python frames for Nex recursion and,
+  with F stack depths, can in principle hit C-stack limits on small-stack
+  platforms; the default 256 is sized safely; operators choosing larger limits
+  do so knowingly.
