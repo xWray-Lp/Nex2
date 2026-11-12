@@ -46,9 +46,8 @@ MATRIX = {
     # examples/data_pipeline.nex: for over list params + `out.push(...)`
     # (CALL_NATIVE push); full parity with the tree backend.
     "examples/data_pipeline.nex": ("SUPPORTED", None),
-    # examples/buffer_econ.nex: top-level `@raw` (line 19) — @raw not in VM.
-    "examples/buffer_econ.nex": ("KNOWN_VM_UNSUPPORTED",
-                                 "@raw is not supported in the VM prototype"),
+    # examples/buffer_econ.nex: @raw Phase C — tree/VM byte-equal stdout.
+    "examples/buffer_econ.nex": ("SUPPORTED", None),
     # examples/tree_own.nex: classes not supported in VM (ClassDecl).
     "examples/tree_own.nex": ("KNOWN_VM_UNSUPPORTED",
                               "ClassDecl is not supported in the VM prototype"),

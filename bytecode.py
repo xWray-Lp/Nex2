@@ -98,11 +98,11 @@ OP_BY_CODE: dict[int, tuple[str, int]] = {code: (name, n) for name, (code, n) in
 # Amaç: elle yazılmış modül verify'dan geçip runtime'da "opcode X is not
 # implemented" ile çökmesin (spec §7: sözleşme yükleme anında zorunlu).
 # BORROW_CHECK listede DEĞİL: Phase B'de VM'de uygulanmıştır (yanlış anıldı).
+# RAW_MAKE Phase C'de uygulandı (@raw flat-value v1).
 UNIMPLEMENTED_OPCODES: frozenset[str] = frozenset({
     "LOAD_GLOBAL", "STORE_GLOBAL",   # global slot: module sistemi v1'de yok
     "NEW_TUPLE",                     # tuple literal derleyicide kapsam dışı
     "GET_MEMBER", "SET_MEMBER",      # MemberExpr v1'de desteklenmiyor
-    "RAW_MAKE",                      # @raw modu sonraki turda
     "BLOCK_ENTER", "BLOCK_EXIT",     # kapsam stübleri; VM dispatch'i yok
 })
 

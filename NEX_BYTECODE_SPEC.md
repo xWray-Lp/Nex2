@@ -220,9 +220,11 @@ BORROW modlu bir değer `GET_INDEX`/`GET_MEMBER` operandı olabilir (per-access
 
 > **Phase notu:** `@own` (0x40–0x42) **Phase A** olarak uygulandı (derin
 > kopya, move/free, frame sonu kill, OWN slotuna LOAD/STORE yasağı);
-> borrow opcode'ları (0x50–0x52) **Phase B** olarak uygulandı — **@own
-> Phase A + borrow Phase B uygulandı.** `slot_epochs` nesli ve `frame_id`
-> devrede; `BORROW_END` bayat epoch'ta sayacı düşürmez.
+> borrow opcode'ları (0x50–0x52) **Phase B** olarak uygulandı;
+> `RAW_MAKE` (0x45, `@raw` flat-value v1) **Phase C** olarak uygulandı —
+> **@own Phase A + borrow Phase B + @raw Phase C (flat v1) uygulandı.**
+> `slot_epochs` nesli ve `frame_id` devrede; `BORROW_END` bayat epoch'ta
+> sayacı düşürmez.
 
 | Hex | Mnemonic | Operandlar | Etki | Not |
 |---|---|---|---|---|

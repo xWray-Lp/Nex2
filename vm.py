@@ -545,6 +545,10 @@ class VM:
                 fr.slots[si] = OwnValueValue(copied, name=f"slot{si}")
                 fr.slot_epochs[si] += 1
 
+            elif name == "RAW_MAKE":
+                si = a[0]
+                fr.slots[si] = st.pop()
+
             elif name in ("OWN_MOVE", "OWN_FREE"):
                 si = a[0]
                 loc = fr.fn.line_of(ins.pc)

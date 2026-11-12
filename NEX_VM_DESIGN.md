@@ -281,8 +281,9 @@ ve gerçek evinin Faz 2 olduğunu netleştirir.
 4. Mod/borrow opcode'ları + mevcut own/stack süitlerinin parity'si.
    **Durum:** `@stack` ilk alt küme tamam. `@own` **Phase A** tamam
    (OWN_ALLOC/MOVE/FREE, frame sonu kill, verifier OWN yasağı, parity).
-   Sırada: `&`/`&mut` borrow — `(frame, slot, epoch)` UAF takibi,
-   BORROW_END kapsam çıkışı; sonra `@own`/borrow parity matrisi.
+   Borrow **Phase B** tamam (`(frame, slot, epoch)` UAF takibi,
+   BORROW_END kapsam çıkışı, parity). `@raw` **Phase C** tamam
+   (RAW_MAKE flat-value v1, MODE_RAW slot, parity; buffer_econ byte-equal).
 5. Differential harness + CI matrisi.
 6. Ancak bundan sonra: register machine / GC ailesi / Rust port
    alternatiflerinin karşılaştırması (bu iskeletin içinde).

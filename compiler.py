@@ -45,6 +45,7 @@ import ast_nodes as A
 from bytecode import (
     FunctionCode, Instr, Module, NativeInfo, OPCODES,
     NAT_PURE, NAT_STRUCTURAL, MODE_TEMP, MODE_STACK, MODE_OWN, MODE_BORROW,
+    MODE_RAW,
     TAG_FLOAT, TAG_INT, TAG_NAME, TAG_NULL, TAG_BOOL, TAG_STR, TAG_TYPE,
     TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE, TYPE_KIND_BOOL,
     stack_effect,
@@ -440,6 +441,14 @@ class Compiler:
                 return
             if node.mem_mode == "own":
                 self._compile_own_decl(node)
+                return
+            if node.mem_mode == "raw":
+                if node.value is None:
+                    raise CompileError(
+                        f"@raw variable '{node.name}' requires an initializer", node)
+                slot = b.declare(node.name, node, MODE_RAW)
+                self._compile_expr(node.value)
+                b.emit("RAW_MAKE", slot, node=node)
                 return
             if node.mem_mode is not None:
                 raise CompileError(

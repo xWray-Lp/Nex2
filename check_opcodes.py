@@ -7,8 +7,9 @@ ediyor; elle yazılmış modül `verify_module`'dan geçip runtime'da
 Bilinen olaylar:
   BLOCK_ENTER / BLOCK_EXIT  (0x58/0x59: kapsam stübü, dispatch yok)
   GET_MEMBER / SET_MEMBER   (MemberExpr v1'de yok)
-  NEW_TUPLE / RAW_MAKE      (sonraki tur)
+  NEW_TUPLE                 (tuple literal derleyicide kapsam dışı)
   LOAD_GLOBAL / STORE_GLOBAL (module sistemi yok)
+  (RAW_MAKE Phase C'de uygulandı; artık listede değil)
 
 Bu script vm.py metnini AST ile tarar, `_execute` dispatch'inin gerçekten
 ele aldığı isimleri (name == "X" / name in ("A", "B") karşılaştırmaları)

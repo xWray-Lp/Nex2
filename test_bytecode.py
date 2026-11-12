@@ -34,7 +34,7 @@ from compiler import compile_program, CompileError
 from bytecode import (
     BytecodeError, VerifyError, Module, FunctionCode, NativeInfo,
     OPCODES, UNIMPLEMENTED_OPCODES, MODE_TEMP, MODE_OWN, MODE_STACK,
-    MODE_BORROW,
+    MODE_BORROW, MODE_RAW,
     NAT_PURE, NAT_RETAINS_REF, TAG_FUNC_REF, TAG_NATIVE_REF, TAG_TYPE,
     TAG_NULL, TAG_INT,
     encode_module, decode_module, decode_code, disassemble, verify_module,
@@ -2122,12 +2122,12 @@ fn main():
                   consts=[(TAG_NATIVE_REF, 5)], max_stack=2)
     expect_verify_error("NATIVE_REF sabiti geçersiz", m, "NATIVE_REF")
 
-    # RAW_MAKE non-RAW slotta (underflow da raporlanabilir; mesaj aranır)
+    # RAW_MAKE non-RAW slotta (OWN slotu) — ownership namespace separation
     m = mk_module(fn_bytes(("CONST", 0), ("RAW_MAKE", 0), ("CONST", 0),
                            ("RET",)),
                   consts=[(9, None)], n_locals=1,
                   slot_modes=bytes([MODE_OWN]), max_stack=2)
-    expect_verify_error("RAW_MAKE non-RAW slotta", m, "non-RAW")
+    expect_verify_error("RAW_MAKE on OWN slot (non-RAW)", m, "non-RAW")
 
     # Boş fonksiyon
     m = mk_module(b"")
@@ -2221,7 +2221,6 @@ def test_unimplemented_opcodes():
         "NEW_TUPLE":     (0,),                       # (0,1) → POP ile dengelenir
         "GET_MEMBER":    (0,),                       # (1,1) → POP ile dengelenir
         "SET_MEMBER":    (0,),                       # (2,0)
-        "RAW_MAKE":      (0,),                       # (1,0)
         "BLOCK_ENTER":   (),                         # (0,0)
         "BLOCK_EXIT":    (),                         # (0,0)
     }
@@ -2500,6 +2499,31 @@ fn main():
     g[0] = 9
     print(str(g[0]))
     print(str(g[1]))
+""",
+        "@raw: arithmetic + stack index": """
+fn main():
+    @stack let ring: [int; 3] = [0, 0, 0]
+    @raw let head = 0
+    @raw let count = 0
+    let vals = [4, 5, 6]
+    for x in vals:
+        ring[head] = x
+        head = head + 1
+        count = count + 1
+    @raw let i = 0
+    @raw let total = 0
+    while i < count:
+        total = total + ring[i]
+        i = i + 1
+    print(str(total))
+""",
+        "@raw: stack escape materialize copy": """
+fn main():
+    @stack let buf: [int; 2] = [7, 8]
+    @raw let snap = buf
+    buf[0] = 99
+    print(str(buf[0]))
+    print(str(snap[0]))
 """,
     }
     for name, src in programs.items():
@@ -3042,6 +3066,80 @@ def test_internal_bug_diagnostics():
           f"stdout={out!r} stderr={err!r}")
 
 
+def test_raw_vm():
+    section("`@raw` — RAW_MAKE flat storage (Phase C)")
+
+    # head/count pattern: arithmetic + stack index (mirror buffer_econ, tiny)
+    src = """
+fn main():
+    @stack let ring: [int; 3] = [0, 0, 0]
+    @raw let head = 0
+    @raw let count = 0
+    let vals = [5, 9, 3]
+    for x in vals:
+        ring[head] = x
+        head = head + 1
+        count = count + 1
+    @raw let i = 0
+    @raw let total = 0
+    while i < count:
+        total = total + ring[i]
+        i = i + 1
+    print(str(total))
+    print(str(head))
+"""
+    expect_output("@raw head/count arithmetic + stack index", src, ["17", "3"])
+    expect_parity("@raw head/count parity", src)
+
+    # Escape path: @raw let buf2 = buf where buf is @stack -> materialize copy
+    escape_src = """
+fn main():
+    @stack let buf: [int; 3] = [1, 2, 3]
+    @raw let buf2 = buf
+    buf[0] = 99
+    print(str(buf[0]))
+    print(str(buf2[0]))
+"""
+    expect_output("@raw escape copies @stack (materialize)", escape_src,
+                  ["99", "1"])
+    expect_parity("@raw escape copy parity", escape_src)
+
+    # @raw without initializer -> CompileError
+    expect_compile_error("@raw without initializer", """
+fn main():
+    @raw let x
+""", "requires an initializer")
+
+    # Disasm: RAW_MAKE present; slot mode MODE_RAW
+    m = compile_source("""
+fn main():
+    @raw let head = 0
+    head = head + 1
+    print(str(head))
+""")
+    d = disassemble(m)
+    f = m.functions[0]
+    check("RAW_MAKE present in disasm", "RAW_MAKE" in d, d)
+    check("@raw slot mode is MODE_RAW", MODE_RAW in list(f.slot_modes),
+          f"slot_modes={list(f.slot_modes)}")
+
+    # Verifier negative: handwritten RAW_MAKE on a non-RAW slot (TEMP)
+    m = mk_module(fn_bytes(("CONST", 0), ("RAW_MAKE", 0), ("CONST", 0),
+                           ("RET",)),
+                  consts=[(9, None)], n_locals=1,
+                  slot_modes=bytes([MODE_TEMP]), max_stack=2)
+    expect_verify_error("RAW_MAKE on non-RAW (TEMP) slot", m,
+                        "RAW_MAKE on non-RAW slot")
+
+    # Verifier negative: RAW_MAKE on OWN slot (ownership namespace separation)
+    m = mk_module(fn_bytes(("CONST", 0), ("RAW_MAKE", 0), ("CONST", 0),
+                           ("RET",)),
+                  consts=[(9, None)], n_locals=1,
+                  slot_modes=bytes([MODE_OWN]), max_stack=2)
+    expect_verify_error("RAW_MAKE on OWN slot", m,
+                        "RAW_MAKE on non-RAW slot")
+
+
 def main() -> None:
     test_encoding()
     test_disassembler()
@@ -3059,6 +3157,7 @@ def main() -> None:
     test_list_dict_vm()
     test_int_semantics()
     test_internal_bug_diagnostics()
+    test_raw_vm()
     test_errors()
     test_verifier_negatives()
     test_unimplemented_opcodes()
