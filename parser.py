@@ -739,6 +739,7 @@ class Parser:
                 TT.MINUS_EQ,
                 TT.STAR_EQ,
                 TT.SLASH_EQ,
+                TT.PERCENT_EQ,
             ):
                 op = self.advance().type.name
                 right = self.parse_expr(0)
@@ -793,6 +794,7 @@ class Parser:
             TT.MINUS_EQ: (1, "right"),
             TT.STAR_EQ: (1, "right"),
             TT.SLASH_EQ: (1, "right"),
+            TT.PERCENT_EQ: (1, "right"),
             TT.NULL_COAL: (2, "left"),
             TT.PIPE: (2, "left"),  # |>  (low, left-assoc)
             TT.OR: (3, "left"),

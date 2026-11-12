@@ -416,6 +416,9 @@ karşılaştırması yapabilsin.
   `1_000_000` ile sınırlıdır (host belleği koruması). Verifier sonlanmayı
   garanti edemez; dışarıdan gelen güvenilmeyen bytecode için adım
   (instruction) bütçesi Faz 2'ye ertelendi.
+- **Tamsayı taşması:** `int` = i64 aritmetiği taşmada konumlu `integer overflow`
+  ile trap eder (her iki backend eşleşir). Ayrıntı ve kapsam:
+  [`NEX_INT_SEMANTICS.md`](./NEX_INT_SEMANTICS.md).
 - **`**` (STARSTAR): lexer/parser önceliği ve sağdan birleşmesi doğru,
   ancak ne tree-walker runtime'ında ne de VM opcode tablosunda karşılığı
   var. Operatörün semantiği (int/float, negatif taban önceliği) v0.2'de

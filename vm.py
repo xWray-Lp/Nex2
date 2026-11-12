@@ -23,6 +23,26 @@ from bytecode import (
     TYPE_KIND_BOOL, TYPE_KIND_PTR, TYPE_KIND_NAMES,
 )
 
+# ─── i64 Taşma Denetimi (NEX_INT_SEMANTICS.md) ─────────────────────────────────
+INT_MIN = -(2 ** 63)
+INT_MAX = 2 ** 63 - 1
+
+
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _checked_int(v: Any, loc: tuple[int, int] = (0, 0)) -> Any:
+    if _is_int(v) and (v < INT_MIN or v > INT_MAX):
+        raise VMError("integer overflow", loc[0], loc[1])
+    return v
+
+
+def _int_divmod_overflow(left: Any, right: Any,
+                         loc: tuple[int, int]) -> None:
+    if _is_int(left) and _is_int(right) and left == INT_MIN and right == -1:
+        raise VMError("integer overflow", loc[0], loc[1])
+
 
 class VMError(Exception):
     """Çalışma zamanı hatası (konumlu)."""
@@ -644,7 +664,8 @@ class VM:
                 st.append(self._binary(name, left, right, fr, ins))
 
             elif name == "NEG":
-                st.append(-st.pop())
+                loc = fr.fn.line_of(ins.pc)
+                st.append(_checked_int(-st.pop(), loc))
             elif name == "NOT":
                 st.append(not st.pop())
 
@@ -773,23 +794,35 @@ class VM:
 
     def _binary(self, name: str, left: Any, right: Any,
                 fr: _Frame, ins: Instr) -> Any:
+        loc = fr.fn.line_of(ins.pc)
         try:
             if name == "ADD":
                 if isinstance(left, str) or isinstance(right, str):
                     return str(left) + str(right)
-                return left + right
+                result = left + right
+                if _is_int(left) and _is_int(right):
+                    return _checked_int(result, loc)
+                return result
             if name == "SUB":
-                return left - right
+                result = left - right
+                if _is_int(left) and _is_int(right):
+                    return _checked_int(result, loc)
+                return result
             if name == "MUL":
-                return left * right
+                result = left * right
+                if _is_int(left) and _is_int(right):
+                    return _checked_int(result, loc)
+                return result
             if name == "DIV":
                 if right == 0:
-                    raise VMError("Division by zero", *fr.fn.line_of(ins.pc))
+                    raise VMError("Division by zero", *loc)
+                _int_divmod_overflow(left, right, loc)
                 return left / right
             if name == "MOD":
                 if right == 0:
-                    raise VMError("Division by zero", *fr.fn.line_of(ins.pc))
-                return left % right
+                    raise VMError("Division by zero", *loc)
+                _int_divmod_overflow(left, right, loc)
+                return _checked_int(left % right, loc)
             if name == "EQ":
                 return left == right
             if name == "NE":
@@ -805,8 +838,8 @@ class VM:
         except VMError:
             raise
         except Exception as e:
-            raise VMError(str(e), *fr.fn.line_of(ins.pc))
-        raise VMError(f"unknown binary op {name}", *fr.fn.line_of(ins.pc))
+            raise VMError(str(e), *loc)
+        raise VMError(f"unknown binary op {name}", *loc)
 
     def _native_call(self, idx: int, args: list[Any],
                      fr: _Frame, ins: Instr) -> Any:

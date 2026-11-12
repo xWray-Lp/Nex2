@@ -12,7 +12,10 @@ geliştirilen bir programlama dili.
 Bu proje aktif geliştirme aşamasında, "proof of concept" niteliğinde.
 Mimari notlar: [`NEX_MEMORY_MODEL.md`](./NEX_MEMORY_MODEL.md) (bellek modeli),
 [`NEX_VM_DESIGN.md`](./NEX_VM_DESIGN.md) (bytecode VM iskeleti),
-[`NEX_BYTECODE_SPEC.md`](./NEX_BYTECODE_SPEC.md) (opcode/encoding sözleşmesi).
+[`NEX_BYTECODE_SPEC.md`](./NEX_BYTECODE_SPEC.md) (opcode/encoding sözleşmesi),
+[`NEX_INT_SEMANTICS.md`](./NEX_INT_SEMANTICS.md) (i64 taşma semantiği).
+
+> Uzun vadeli hedef: Rust VM (bkz. [NEX_VM_DESIGN.md](./NEX_VM_DESIGN.md)).
 
 ## Hızlı örnek
 

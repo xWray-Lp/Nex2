@@ -2881,6 +2881,117 @@ fn main():
 
 # ─── Çalıştır ────────────────────────────────────────────────────────────────
 
+def test_int_semantics():
+    section("i64 taşma semantiği — trap (NEX_INT_SEMANTICS.md)")
+    IMAX = "9223372036854775807"
+    IMIN = "-9223372036854775808"
+
+    def expect_int_overflow_tree(name, source):
+        try:
+            out = run_tree(source)
+        except Exception as e:  # noqa: BLE001
+            check(name, False, f"{type(e).__name__}: {e}")
+            return
+        joined = "\n".join(out)
+        check(name, "integer overflow" in joined, f"out={out!r}")
+
+    traps = [
+        ("9223372036854775807 + 1 trap", f"""
+fn main():
+    print({IMAX} + 1)
+"""),
+        ("unary neg of INT_MIN trap", f"""
+fn main():
+    let x = {IMIN}
+    print(0 - x)
+"""),
+        ("9223372036854775807 * 2 trap", f"""
+fn main():
+    print({IMAX} * 2)
+"""),
+        ("let + add overflow trap", f"""
+fn main():
+    let x = {IMAX}
+    print(x + 1)
+"""),
+        ("INT_MIN / -1 trap", f"""
+fn main():
+    let m = {IMIN}
+    print(m / -1)
+"""),
+        ("INT_MIN % -1 trap", f"""
+fn main():
+    let m = {IMIN}
+    print(m % -1)
+"""),
+    ]
+    for name, src in traps:
+        expect_vm_error(name + " (VM)", src, "integer overflow")
+        expect_int_overflow_tree(name + " (tree)", src)
+
+    expect_output("sınır ok: INT_MAX prints unchanged", f"""
+fn main():
+    print({IMAX})
+""", [IMAX])
+    expect_output("sınır ok: INT_MAX - 0", f"""
+fn main():
+    print({IMAX} - 0)
+""", [IMAX])
+    expect_output("sınır ok: INT_MIN + 1", f"""
+fn main():
+    print({IMIN} + 1)
+""", [str(-(2 ** 63) + 1)])
+
+    # F1/F6: sıfıra bölme/mod — tree-walker konumlu "Division by zero"
+    for name, src in [
+        ("5 % 0 trap (tree)", """
+fn main():
+    print(5 % 0)
+"""),
+        ("x /= 0 trap (tree)", """
+fn main():
+    let x = 5
+    x /= 0
+"""),
+        ("y %= 0 trap (tree)", """
+fn main():
+    let y = 7
+    y %= 0
+"""),
+    ]:
+        try:
+            out = run_tree(src)
+        except Exception as e:  # noqa: BLE001
+            check(name, False, f"{type(e).__name__}: {e}")
+            continue
+        joined = "\n".join(out)
+        check(name, "Division by zero" in joined, f"out={out!r}")
+
+    try:
+        out = run_tree("""
+fn main():
+    let b = true
+    b += 1
+    print(b)
+""")
+        check("bool compound assign no trap (tree)", out == ["2"], f"out={out!r}")
+    except Exception as e:  # noqa: BLE001
+        check("bool compound assign no trap (tree)", False, f"{type(e).__name__}: {e}")
+
+    expect_parity("parity: i64-boundary arithmetic", f"""
+fn main():
+    print({IMAX} - 1)
+    print({IMIN} + 1)
+    print(-9223372036854775807)
+""")
+    expect_parity("parity: bool-int mix (no overflow accounting)", """
+fn main():
+    print(true + 0)
+    print(false * 5)
+    print(3 + true)
+""")
+
+
 def main() -> None:
     test_encoding()
     test_disassembler()
@@ -2896,6 +3007,7 @@ def main() -> None:
     test_borrow_escape_paths()
     test_for_vm()
     test_list_dict_vm()
+    test_int_semantics()
     test_errors()
     test_verifier_negatives()
     test_unimplemented_opcodes()

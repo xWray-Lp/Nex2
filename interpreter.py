@@ -488,6 +488,65 @@ class OwnPanic(NexRuntimeError):
     pass
 
 
+# ─── i64 Taşma Denetimi (NEX_INT_SEMANTICS.md) ─────────────────────────────────
+
+INT_MIN = -(2 ** 63)
+INT_MAX = 2 ** 63 - 1
+
+
+def _is_int(v: Any) -> bool:
+    """i64 sayılacak int mi? Python'ta bool, int'in alt sınıfıdır — sayılmaz."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _checked_int(v: Any, node: Optional[Node] = None) -> Any:
+    """i64 aralık denetimi: taşma → konumlu NexRuntimeError.
+
+    Int = i64 [-2^63, 2^63-1]. Bool bu denetime dahil değildir; float/str ve
+    diğer değerler olduğu gibi döner."""
+    if _is_int(v) and (v < INT_MIN or v > INT_MAX):
+        raise NexRuntimeError("integer overflow", node)
+    return v
+
+
+def _int_divmod_overflow(left: Any, right: Any,
+                         node: Optional[Node]) -> None:
+    """DIV/MOD için INT_MIN / -1 denetimi (sıfır ayrıca denetlenir)."""
+    if _is_int(left) and _is_int(right) and left == INT_MIN and right == -1:
+        raise NexRuntimeError("integer overflow", node)
+
+
+def _compound_assign(current: Any, value: Any, op: str,
+                     node: Optional[Node]) -> Any:
+    """Bileşik atama sonucu (+=, -=, *=, /=, %=) — i64 taşma denetimiyle.
+
+    Bileşik atamalar aynı operatörlere route olur; bool operandlar denetimden
+    hariçtir; `/=` ve `%=` yalnız INT_MIN / -1'de taşar."""
+    if op == "SLASH_EQ":
+        if value == 0:
+            raise NexRuntimeError("Division by zero", node)
+        _int_divmod_overflow(current, value, node)
+        return current / value
+    if op == "PERCENT_EQ":
+        if value == 0:
+            raise NexRuntimeError("Division by zero", node)
+        _int_divmod_overflow(current, value, node)
+        if _is_int(current) and _is_int(value):
+            return _checked_int(current % value, node)
+        return current % value
+    if op == "PLUS_EQ":
+        result = current + value
+    elif op == "MINUS_EQ":
+        result = current - value
+    elif op == "STAR_EQ":
+        result = current * value
+    else:
+        return current  # bilinmeyen op: davranış değişmez
+    if _is_int(current) and _is_int(value):
+        return _checked_int(result, node)
+    return result
+
+
 class ReturnException(Exception):
     """Return statement'i için özel exception."""
 
@@ -920,21 +979,35 @@ class Interpreter:
         if node.op == "+":
             if isinstance(left, str) or isinstance(right, str):
                 return str(left) + str(right)
-            return left + right
+            result = left + right
+            if _is_int(left) and _is_int(right):
+                return _checked_int(result, node)
+            return result
         elif node.op == "-":
-            return left - right
+            result = left - right
+            if _is_int(left) and _is_int(right):
+                return _checked_int(result, node)
+            return result
         elif node.op == "*":
-            return left * right
+            result = left * right
+            if _is_int(left) and _is_int(right):
+                return _checked_int(result, node)
+            return result
         elif node.op == "/":
             if right == 0:
                 self.error("Division by zero", node)
+            _int_divmod_overflow(left, right, node)
             return left / right
         elif node.op == "//":
             if right == 0:
                 self.error("Division by zero", node)
-            return int(left // right)
+            _int_divmod_overflow(left, right, node)
+            return _checked_int(int(left // right), node)
         elif node.op == "%":
-            return left % right
+            if right == 0:
+                self.error("Division by zero", node)
+            _int_divmod_overflow(left, right, node)
+            return _checked_int(left % right, node)
         elif node.op == "==":
             return left == right
         elif node.op == "!=":
@@ -960,7 +1033,7 @@ class Interpreter:
         operand = self.evaluate(node.operand)
 
         if node.op == "-":
-            return -operand
+            return _checked_int(-operand, node)
         elif node.op == "not":
             return not operand
         else:
@@ -1377,14 +1450,7 @@ class Interpreter:
                     raise OwnPanic(
                         f"compound assignment is not supported on @own variable '{name}'",
                         node)
-                if op == "PLUS_EQ":
-                    value = current + value
-                elif op == "MINUS_EQ":
-                    value = current - value
-                elif op == "STAR_EQ":
-                    value = current * value
-                elif op == "SLASH_EQ":
-                    value = current / value
+                value = _compound_assign(current, value, op, node)
                 self._env_set(name, value, node)
             return value
         elif isinstance(node.target, IndexExpr):
@@ -1414,15 +1480,7 @@ class Interpreter:
                 if op == "ASSIGN":
                     obj[idx] = value
                 else:
-                    current = obj[idx]
-                    if op == "PLUS_EQ":
-                        obj[idx] = current + value
-                    elif op == "MINUS_EQ":
-                        obj[idx] = current - value
-                    elif op == "STAR_EQ":
-                        obj[idx] = current * value
-                    elif op == "SLASH_EQ":
-                        obj[idx] = current / value
+                    obj[idx] = _compound_assign(obj[idx], value, op, node)
                 return value
             if not (isinstance(obj, dict) or isinstance(obj, list)):
                 self.error(
@@ -1439,27 +1497,12 @@ class Interpreter:
                         f"Dictionary key must be hashable, got unhashable "
                         f"'{type(idx).__name__}' (list/dict/set cannot be "
                         f"dict keys)", node)
-                if op == "PLUS_EQ":
-                    obj[idx] = current + value
-                elif op == "MINUS_EQ":
-                    obj[idx] = current - value
-                elif op == "STAR_EQ":
-                    obj[idx] = current * value
-                elif op == "SLASH_EQ":
-                    obj[idx] = current / value
+                obj[idx] = _compound_assign(current, value, op, node)
                 return value
             if op == "ASSIGN":
                 obj[idx] = value
             else:
-                current = obj[idx]
-                if op == "PLUS_EQ":
-                    obj[idx] = current + value
-                elif op == "MINUS_EQ":
-                    obj[idx] = current - value
-                elif op == "STAR_EQ":
-                    obj[idx] = current * value
-                elif op == "SLASH_EQ":
-                    obj[idx] = current / value
+                obj[idx] = _compound_assign(obj[idx], value, op, node)
             return value
         elif isinstance(node.target, MemberExpr):
             obj = self.evaluate(node.target.obj)
@@ -1478,27 +1521,14 @@ class Interpreter:
                     obj.set_attr(attr, value)
                 else:
                     current = obj.get_attr(attr)
-                    if op == "PLUS_EQ":
-                        obj.set_attr(attr, current + value)
-                    elif op == "MINUS_EQ":
-                        obj.set_attr(attr, current - value)
-                    elif op == "STAR_EQ":
-                        obj.set_attr(attr, current * value)
-                    elif op == "SLASH_EQ":
-                        obj.set_attr(attr, current / value)
+                    obj.set_attr(
+                        attr, _compound_assign(current, value, op, node))
             elif isinstance(obj, dict):
                 if op == "ASSIGN":
                     obj[attr] = value
                 else:
                     current = obj.get(attr, 0)
-                    if op == "PLUS_EQ":
-                        obj[attr] = current + value
-                    elif op == "MINUS_EQ":
-                        obj[attr] = current - value
-                    elif op == "STAR_EQ":
-                        obj[attr] = current * value
-                    elif op == "SLASH_EQ":
-                        obj[attr] = current / value
+                    obj[attr] = _compound_assign(current, value, op, node)
             return value
         else:
             self.error("Invalid assignment target", node)

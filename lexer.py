@@ -67,6 +67,7 @@ class TT(Enum):
     MINUS_EQ = auto()
     STAR_EQ = auto()
     SLASH_EQ = auto()
+    PERCENT_EQ = auto()
     PLUS = auto()
     MINUS = auto()
     MUL = auto()
@@ -373,6 +374,10 @@ class Lexer:
             elif ch == '/' and self.peek(1) == '=':
                 self.advance(); self.advance()
                 self.tokens.append(Token(TT.SLASH_EQ, '/=', start_line, start_col))
+                continue
+            elif ch == '%' and self.peek(1) == '=':
+                self.advance(); self.advance()
+                self.tokens.append(Token(TT.PERCENT_EQ, '%=', start_line, start_col))
                 continue
             elif ch == '/' and self.peek(1) == '/':
                 self.advance(); self.advance()

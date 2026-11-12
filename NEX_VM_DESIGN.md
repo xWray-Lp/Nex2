@@ -304,3 +304,7 @@ ve gerçek evinin Faz 2 olduğunu netleştirir.
 
 **Açık kalanlar:** GC detayları (mark-sweep vs. başka), compact encoding,
 register machine'e geçiş ölçütü, generic/monster temsili, modül sistemi.
+- **C++'ın olası rolü (LLVM binding için) — henüz bir karar değil;**
+  README'ye alınamaz, burada açık uç olarak tutulur.
+- **Tamsayı semantiği:** i64 taşması trap eder (debug-safe), her iki backend
+  eşleşir; ayrıntı ve kapsam [`NEX_INT_SEMANTICS.md`](./NEX_INT_SEMANTICS.md).
