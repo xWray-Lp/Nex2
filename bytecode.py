@@ -71,6 +71,8 @@ OPCODES: dict[str, tuple[int, int]] = {
     "SET_INDEX":       (0x34, 0),
     "GET_MEMBER":      (0x35, 1),
     "SET_MEMBER":      (0x36, 1),
+    "NEW_INSTANCE":    (0x37, 1),
+    "CALL_BOUND":      (0x38, 2),
     # mod
     "OWN_ALLOC":       (0x40, 1),
     "OWN_MOVE":        (0x41, 1),
@@ -102,7 +104,6 @@ OP_BY_CODE: dict[int, tuple[str, int]] = {code: (name, n) for name, (code, n) in
 UNIMPLEMENTED_OPCODES: frozenset[str] = frozenset({
     "LOAD_GLOBAL", "STORE_GLOBAL",   # global slot: module sistemi v1'de yok
     "NEW_TUPLE",                     # tuple literal derleyicide kapsam dışı
-    "GET_MEMBER", "SET_MEMBER",      # MemberExpr v1'de desteklenmiyor
     "BLOCK_ENTER", "BLOCK_EXIT",     # kapsam stübleri; VM dispatch'i yok
 })
 
@@ -115,8 +116,11 @@ NAT_PURE        = 1 << 1
 NAT_STRUCTURAL  = 1 << 2
 
 MAGIC = b"NEXB"
-VERSION = 1
-HEADER_SIZE = 52
+VERSION = 2
+VERSION_V1 = 1
+HEADER_SIZE_V1 = 52
+HEADER_SIZE_V2 = 60
+HEADER_SIZE = HEADER_SIZE_V2
 FUNC_INFO_SIZE = 40
 NATIVE_INFO_SIZE = 12
 
@@ -124,6 +128,7 @@ NATIVE_INFO_SIZE = 12
 TAG_INT, TAG_FLOAT, TAG_STR = 0x01, 0x02, 0x03
 TAG_FUNC_REF, TAG_NATIVE_REF, TAG_TYPE = 0x04, 0x05, 0x06
 TAG_NAME, TAG_BOOL, TAG_NULL = 0x07, 0x08, 0x09
+TAG_CLASS_REF = 0x0A
 
 # TYPE sabiti kind kodları (spec §3)
 TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE = 0x01, 0x02, 0x03
@@ -161,6 +166,14 @@ class NativeInfo:
 
 
 @dataclass
+class ClassInfo:
+    name_idx: int
+    field_count: int
+    field_name_idxs: list[int]
+    methods: list[tuple[int, int]]  # (method_name const idx, func const idx)
+
+
+@dataclass
 class FunctionCode:
     name:       str
     arity:      int
@@ -185,6 +198,7 @@ class Module:
     consts:    list[tuple[int, object]] = field(default_factory=list)
     functions: list[FunctionCode] = field(default_factory=list)
     natives:   list[NativeInfo] = field(default_factory=list)
+    classes:   list[ClassInfo] = field(default_factory=list)
     entry:     Optional[int] = None
 
     def const_value(self, idx: int) -> object:
@@ -202,6 +216,11 @@ class Module:
             raise BytecodeError(f"native index out of range: {idx}")
         return self.natives[idx].name
 
+    def class_name(self, idx: int) -> str:
+        if idx < 0 or idx >= len(self.classes):
+            raise BytecodeError(f"class index out of range: {idx}")
+        return str(self.const_value(self.classes[idx].name_idx))
+
 
 # ─── Yardımcı: sabit kodlama ─────────────────────────────────────────────────
 
@@ -213,7 +232,7 @@ def _enc_const(tag: int, value: object) -> bytes:
     if tag in (TAG_STR, TAG_NAME):
         data = str(value).encode("utf-8")
         return bytes([tag]) + struct.pack("<I", len(data)) + data
-    if tag in (TAG_FUNC_REF, TAG_NATIVE_REF):
+    if tag in (TAG_FUNC_REF, TAG_NATIVE_REF, TAG_CLASS_REF):
         return bytes([tag]) + struct.pack("<I", int(value))
     if tag == TAG_TYPE:
         kind, size = value  # type: ignore[misc]
@@ -254,7 +273,7 @@ def _dec_const(data: bytes, pos: int) -> tuple[tuple[int, object], int]:
         except UnicodeDecodeError as e:
             raise BytecodeError(f"invalid UTF-8 in string constant: {e}")
         return (tag, text), pos + n
-    if tag in (TAG_FUNC_REF, TAG_NATIVE_REF):
+    if tag in (TAG_FUNC_REF, TAG_NATIVE_REF, TAG_CLASS_REF):
         need(4)
         (v,) = struct.unpack_from("<I", data, pos)
         return (tag, v), pos + 4
@@ -269,6 +288,47 @@ def _dec_const(data: bytes, pos: int) -> tuple[tuple[int, object], int]:
     if tag == TAG_NULL:
         return (tag, None), pos
     raise BytecodeError(f"unknown constant tag: {tag}")
+
+
+def _enc_class_table(classes: list[ClassInfo]) -> bytes:
+    out = [struct.pack("<I", len(classes))]
+    for c in classes:
+        out.append(struct.pack("<II", c.name_idx, c.field_count))
+        for fn in c.field_name_idxs:
+            out.append(struct.pack("<I", fn))
+        out.append(struct.pack("<I", len(c.methods)))
+        for mname, fidx in c.methods:
+            out.append(struct.pack("<II", mname, fidx))
+    return b"".join(out)
+
+
+def _dec_class_table(data: bytes, off: int) -> tuple[list[ClassInfo], int]:
+    if off + 4 > len(data):
+        raise BytecodeError("class table exceeds file size")
+    (count,) = struct.unpack_from("<I", data, off)
+    pos = off + 4
+    out: list[ClassInfo] = []
+    for _ in range(count):
+        if pos + 8 > len(data):
+            raise BytecodeError("truncated class table")
+        name_idx, field_count = struct.unpack_from("<II", data, pos)
+        pos += 8
+        if pos + 4 * field_count + 4 > len(data):
+            raise BytecodeError("truncated class table")
+        field_name_idxs = list(struct.unpack_from("<" + "I" * field_count, data, pos)) if field_count else []
+        pos += 4 * field_count
+        (method_count,) = struct.unpack_from("<I", data, pos)
+        pos += 4
+        methods: list[tuple[int, int]] = []
+        for _ in range(method_count):
+            if pos + 8 > len(data):
+                raise BytecodeError("truncated class table")
+            mname, fidx = struct.unpack_from("<II", data, pos)
+            methods.append((mname, fidx))
+            pos += 8
+        out.append(ClassInfo(name_idx=name_idx, field_count=field_count,
+                             field_name_idxs=field_name_idxs, methods=methods))
+    return out, pos
 
 
 def _enc_line_table(entries: list[tuple[int, int, int]]) -> bytes:
@@ -299,13 +359,16 @@ def _dec_line_table(data: bytes, off: int, length: int) -> list[tuple[int, int, 
 # ─── Encode ──────────────────────────────────────────────────────────────────
 
 def encode_module(m: Module) -> bytes:
-    """Modülü spec'teki ikili biçime çevir."""
+    """Modülü spec'teki ikili biçime çevir (v2; v1 decode desteklenir)."""
     const_bytes = b"".join(_enc_const(tag, val) for tag, val in m.consts)
 
     func_table_size = FUNC_INFO_SIZE * len(m.functions)
     native_table_size = NATIVE_INFO_SIZE * len(m.natives)
+    class_bytes = _enc_class_table(m.classes)
 
-    slotmodes_off = HEADER_SIZE + len(const_bytes) + func_table_size + native_table_size
+    header_size = HEADER_SIZE_V2
+    class_off = header_size + len(const_bytes) + func_table_size + native_table_size
+    slotmodes_off = class_off + len(class_bytes)
     code_off = slotmodes_off + sum(len(f.slot_modes) for f in m.functions)
     debug_off = code_off + sum(len(f.code) for f in m.functions)
 
@@ -353,46 +416,63 @@ def encode_module(m: Module) -> bytes:
     header = (
         struct.pack("<4sHH", MAGIC, VERSION, 0)
         + struct.pack(
-            "<11I",
+            "<13I",
             entry,
-            len(m.consts), HEADER_SIZE,
-            len(m.functions), HEADER_SIZE + len(const_bytes),
+            len(m.consts), header_size,
+            len(m.functions), header_size + len(const_bytes),
             len(m.natives),
-            HEADER_SIZE + len(const_bytes) + func_table_size,
+            header_size + len(const_bytes) + func_table_size,
             sum(len(f.code) for f in m.functions), code_off,
             len(debug_bytes), debug_off,
+            len(m.classes), class_off,
         )
     )
-    assert len(header) == HEADER_SIZE
+    assert len(header) == HEADER_SIZE_V2
 
     slotmodes_bytes = b"".join(f.slot_modes for f in m.functions)
     code_bytes = b"".join(f.code for f in m.functions)
     return b"".join([
         header, const_bytes, b"".join(func_infos), b"".join(native_infos),
-        slotmodes_bytes, code_bytes, debug_bytes,
+        class_bytes, slotmodes_bytes, code_bytes, debug_bytes,
     ])
 
 
 # ─── Decode ──────────────────────────────────────────────────────────────────
 
 def decode_module(data: bytes) -> Module:
-    if len(data) < HEADER_SIZE:
+    if len(data) < HEADER_SIZE_V1:
         raise BytecodeError("file too short for header")
     magic, version, flags = struct.unpack_from("<4sHH", data, 0)
     if magic != MAGIC:
         raise BytecodeError("bad magic (not a Nex bytecode module)")
-    if version != VERSION:
+    if version not in (VERSION_V1, VERSION):
         raise BytecodeError(f"unsupported bytecode version: {version}")
     if flags != 0:
         raise BytecodeError(f"unsupported header flags: {flags}")
 
-    (entry, const_count, const_off,
-     func_count, func_off,
-     native_count, native_off,
-     code_len, code_off,
-     debug_len, debug_off) = struct.unpack_from("<11I", data, 8)
+    if version == VERSION_V1:
+        if len(data) < HEADER_SIZE_V1:
+            raise BytecodeError("file too short for header")
+        (entry, const_count, const_off,
+         func_count, func_off,
+         native_count, native_off,
+         code_len, code_off,
+         debug_len, debug_off) = struct.unpack_from("<11I", data, 8)
+        header_size = HEADER_SIZE_V1
+        class_count = 0
+        class_off = None
+    else:
+        if len(data) < HEADER_SIZE_V2:
+            raise BytecodeError("file too short for header")
+        (entry, const_count, const_off,
+         func_count, func_off,
+         native_count, native_off,
+         code_len, code_off,
+         debug_len, debug_off,
+         class_count, class_off) = struct.unpack_from("<13I", data, 8)
+        header_size = HEADER_SIZE_V2
 
-    if const_off < HEADER_SIZE:
+    if const_off < header_size:
         raise BytecodeError("constant pool offset overlaps header")
     if const_off > len(data):
         raise BytecodeError("constant pool offset exceeds file size")
@@ -445,6 +525,12 @@ def decode_module(data: bytes) -> Module:
         pos += NATIVE_INFO_SIZE
         m.natives.append(NativeInfo(name=name_of(name_idx), argc=argc,
                                     flags=nflags))
+
+    if version != VERSION_V1 and class_off is not None:
+        classes, _ = _dec_class_table(data, class_off)
+        m.classes = classes
+    else:
+        m.classes = []
 
     if code_off + code_len > len(data) or debug_off + debug_len > len(data):
         raise BytecodeError("section offsets exceed file size")
@@ -516,6 +602,10 @@ def stack_effect(name: str, args: tuple[int, ...]) -> tuple[int, int]:
         return (1, 1)
     if name == "SET_MEMBER":
         return (2, 0)
+    if name == "NEW_INSTANCE":
+        return (0, 1)
+    if name == "CALL_BOUND":
+        return (1 + args[1], 1)
     if name in ("OWN_ALLOC", "RAW_MAKE"):
         return (1, 0)
     if name in ("NOP", "JUMP", "TRAP", "OWN_FREE", "STACK_ALLOC",
@@ -537,6 +627,33 @@ def verify_module(m: Module) -> None:
             errors.append(f"const {i}: FUNC_REF index {val} out of range")
         if tag == TAG_NATIVE_REF and not (0 <= int(val) < len(m.natives)):
             errors.append(f"const {i}: NATIVE_REF index {val} out of range")
+        if tag == TAG_CLASS_REF and not (0 <= int(val) < len(m.classes)):
+            errors.append(f"const {i}: CLASS_REF index {val} out of range")
+    for ci, cls in enumerate(m.classes):
+        if not (0 <= cls.name_idx < len(m.consts)):
+            errors.append(f"class {ci}: name index out of range")
+        elif m.consts[cls.name_idx][0] not in (TAG_STR, TAG_NAME):
+            errors.append(f"class {ci}: name const must be STR/NAME")
+        if cls.field_count != len(cls.field_name_idxs):
+            errors.append(f"class {ci}: field_count mismatch")
+        for fni in cls.field_name_idxs:
+            if not (0 <= fni < len(m.consts)):
+                errors.append(f"class {ci}: field name index out of range")
+            elif m.consts[fni][0] not in (TAG_STR, TAG_NAME):
+                errors.append(f"class {ci}: field name const must be STR/NAME")
+        for mi, (mname, fidx) in enumerate(cls.methods):
+            if not (0 <= mname < len(m.consts)):
+                errors.append(f"class {ci}: method name index out of range")
+            elif m.consts[mname][0] not in (TAG_STR, TAG_NAME):
+                errors.append(f"class {ci}: method name const must be STR/NAME")
+            if not (0 <= fidx < len(m.consts)):
+                errors.append(f"class {ci}: method func index out of range")
+            elif m.consts[fidx][0] != TAG_FUNC_REF:
+                errors.append(f"class {ci}: method func must be FUNC_REF")
+            else:
+                fi = int(m.consts[fidx][1])
+                if not (0 <= fi < len(m.functions)):
+                    errors.append(f"class {ci}: method func index {fi} out of range")
     for f in m.functions:
         errors.extend(f"fn {f.name}: {e}" for e in _verify_function(m, f))
     if errors:
@@ -596,6 +713,19 @@ def _verify_function(m: Module, f: FunctionCode) -> list[str]:
         elif ins.name in ("CONST", "TRAP"):
             if a[0] >= len(m.consts):
                 errs.append(f"constant index {a[0]} out of range")
+        elif ins.name == "NEW_INSTANCE":
+            if a[0] >= len(m.consts):
+                errs.append(f"constant index {a[0]} out of range")
+            elif m.consts[a[0]][0] != TAG_CLASS_REF:
+                errs.append(f"NEW_INSTANCE const {a[0]} is not a CLASS_REF")
+        elif ins.name in ("GET_MEMBER", "SET_MEMBER"):
+            if a[0] >= len(m.consts):
+                errs.append(f"constant index {a[0]} out of range")
+            elif m.consts[a[0]][0] not in (TAG_STR, TAG_NAME):
+                errs.append(f"{ins.name} name const must be STR/NAME")
+        elif ins.name == "CALL_BOUND":
+            if a[1] < 0:
+                errs.append("CALL_BOUND argc must be >= 0")
         elif ins.name in ("LOAD_LOCAL", "STORE_LOCAL"):
             if a[0] >= f.n_locals:
                 errs.append(f"local slot {a[0]} out of range")
@@ -759,6 +889,13 @@ def _fmt_value(v: object) -> str:
 def disassemble(m: Module) -> str:
     """Deterministik metin disassembly (test/CLI için)."""
     lines: list[str] = []
+    for ci, cls in enumerate(m.classes):
+        cname = m.const_value(cls.name_idx)
+        fields = [m.const_value(i) for i in cls.field_name_idxs]
+        methods = [(m.const_value(mn), m.const_value(fi)) for mn, fi in cls.methods]
+        lines.append(f"; class {cname} fields={fields} methods={methods}")
+    if m.classes and m.functions:
+        lines.append("")
     for fi, f in enumerate(m.functions):
         tag = " [entry]" if m.entry == fi else ""
         lines.append(

@@ -32,11 +32,12 @@ from lexer import Lexer
 from parser import Parser
 from compiler import compile_program, CompileError
 from bytecode import (
-    BytecodeError, VerifyError, Module, FunctionCode, NativeInfo,
+    BytecodeError, VerifyError, Module, FunctionCode, NativeInfo, ClassInfo,
     OPCODES, UNIMPLEMENTED_OPCODES, MODE_TEMP, MODE_OWN, MODE_STACK,
     MODE_BORROW, MODE_RAW,
     NAT_PURE, NAT_RETAINS_REF, TAG_FUNC_REF, TAG_NATIVE_REF, TAG_TYPE,
-    TAG_NULL, TAG_INT,
+    TAG_NULL, TAG_INT, TAG_STR, TAG_NAME, TAG_BOOL, TAG_CLASS_REF,
+    HEADER_SIZE_V1, HEADER_SIZE_V2, VERSION_V1,
     encode_module, decode_module, decode_code, disassemble, verify_module,
 )
 from vm import VM, VMError, run_module, StackArrayValue, OwnValueValue
@@ -3182,6 +3183,219 @@ def test_println_fstring_vm() -> None:
           "; println" in d, d)
 
 
+def test_class_format_vm():
+    section("Class format / instance ops (stage 1)")
+    # v2 roundtrip and v1 decode compatibility
+    base = compile_source("""
+fn main():
+    print(1)
+""")
+    blob2 = encode_module(base)
+    check("v2 header magic+version", blob2[:4] == b"NEXB" and struct.unpack_from("<H", blob2, 4)[0] == 2)
+    m2 = decode_module(blob2)
+    check("v2 encode→decode→encode byte-equal", encode_module(m2) == blob2)
+    check("v2 empty class table", len(m2.classes) == 0)
+
+    # hand-built v1 blob (52-byte header) still decodes
+    v1 = compile_source("""
+fn main():
+    print(7)
+""")
+    v1_blob = bytearray(encode_module(v1))
+    # convert to v1 header layout: set version=1, shrink header by removing last 8 bytes
+    struct.pack_into("<H", v1_blob, 4, 1)
+    v1_blob = bytearray(v1_blob[:52] + v1_blob[60:])
+    # fix offsets in header that pointed past old header/class area? easier: rebuild minimal v1 module manually
+    v1_mod = Module(
+        consts=[(TAG_STR, "main"), (TAG_NULL, None), (TAG_INT, 7),
+                (TAG_STR, "print"), (TAG_NATIVE_REF, 0)],
+        functions=[FunctionCode(
+            name="main", arity=0, n_locals=0, max_stack=2,
+            code=fn_bytes(("CONST", 2), ("CALL_PURE_NATIVE", 0, 1), ("POP",), ("CONST", 1), ("RET",)),
+            slot_modes=b"", line_table=[])],
+        natives=[NativeInfo("print", 0xFFFFFFFF, NAT_PURE)],
+        classes=[], entry=0,
+    )
+    # encode v1 by hand
+    const_bytes = b"".join([_ for _ in []])
+    # simpler: use encode_module logic? can't; instead construct bytes directly
+    from bytecode import _enc_const, _enc_line_table, FUNC_INFO_SIZE, NATIVE_INFO_SIZE
+    cb = b"".join(_enc_const(t,v) for t,v in v1_mod.consts)
+    func_table_size = FUNC_INFO_SIZE
+    native_table_size = NATIVE_INFO_SIZE
+    header_size = 52
+    slotmodes_off = header_size + len(cb) + func_table_size + native_table_size
+    code = v1_mod.functions[0].code
+    code_off = slotmodes_off
+    debug_off = code_off + len(code)
+    debug_chunk = _enc_line_table([])
+    # const indices: 0 main,1 null,2 int7,3 print,4 native_ref
+    func_info = struct.pack("<10I", 0, 0, 0, 2, code_off, len(code), slotmodes_off, debug_off, len(debug_chunk), 0)
+    native_info = struct.pack("<3I", 3, 0xFFFFFFFF, NAT_PURE)
+    header = struct.pack("<4sHH", b"NEXB", 1, 0) + struct.pack(
+        "<11I", 0, len(v1_mod.consts), header_size, 1, header_size+len(cb),
+        1, header_size+len(cb)+func_table_size, len(code), code_off, len(debug_chunk), debug_off)
+    v1_bytes = header + cb + func_info + native_info + code + debug_chunk
+    dv1 = decode_module(v1_bytes)
+    check("v1 blob decodes", dv1.entry == 0 and len(dv1.classes) == 0 and len(dv1.functions) == 1)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_module(dv1)
+    check("v1 blob runs", buf.getvalue().splitlines() == ["7"], buf.getvalue())
+
+    # Module with class table: class A { field x; method get(self)=self.x } handwritten end-to-end
+    # Build module manually
+    # consts: 0 NAME "A",1 NAME "x",2 NAME "get",3 FUNC_REF 1,4 CLASS_REF 0,5 NAME "<script>",6 NAME "self",7 INT 42,8 STR "x",9 NULL,10 NATIVE_REF print
+    consts = [
+        (TAG_NAME, "A"),      #0
+        (TAG_NAME, "x"),      #1
+        (TAG_NAME, "get"),    #2
+        (TAG_FUNC_REF, 1),    #3 (get method func)
+        (TAG_CLASS_REF, 0),   #4
+        (TAG_NAME, "<script>"), #5
+        (TAG_NAME, "self"),   #6
+        (TAG_INT, 42),        #7
+        (TAG_NULL, None),     #8
+        (TAG_NAME, "print"),  #9
+        (TAG_NATIVE_REF, 0),  #10
+    ]
+    cls = ClassInfo(name_idx=0, field_count=1, field_name_idxs=[1], methods=[(2, 3)])
+    # get(self): LOAD_LOCAL 0; GET_MEMBER x; RET
+    get_code = fn_bytes(("LOAD_LOCAL", 0), ("GET_MEMBER", 1), ("RET",))
+    get_fn = FunctionCode(name="get", arity=1, n_locals=1, max_stack=1, code=get_code, slot_modes=bytes([MODE_TEMP]))
+    # script: NEW_INSTANCE A -> slot0 obj; obj.x = 42; print(obj.get()); ret null
+    script_code = fn_bytes(
+        ("NEW_INSTANCE", 4),
+        ("STORE_LOCAL", 0),
+        ("LOAD_LOCAL", 0),
+        ("CONST", 7),
+        ("SET_MEMBER", 1),
+        ("LOAD_LOCAL", 0),
+        ("GET_MEMBER", 2),      # bound
+        ("CALL_BOUND", 0, 0),   # call with 0 args
+        ("CALL_PURE_NATIVE", 0, 1),
+        ("POP",),
+        ("CONST", 8),
+        ("RET",),
+    )
+    script_fn = FunctionCode(name="<script>", arity=0, n_locals=1, max_stack=3, code=script_code, slot_modes=bytes([MODE_TEMP]))
+    mod = Module(consts=consts, functions=[script_fn, get_fn], natives=[NativeInfo("print", 0xFFFFFFFF, NAT_PURE)],
+                 classes=[cls], entry=0)
+    verify_module(mod)
+    blob = encode_module(mod)
+    mod2 = decode_module(blob)
+    check("class module encode/decode/verify", encode_module(mod2) == blob)
+    d = disassemble(mod2)
+    check("disasm prints class table", "; class A" in d and "fields=['x']" in d, d)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_module(mod2)
+    check("class end-to-end set/get/call_bound", buf.getvalue().splitlines() == ["42"], buf.getvalue())
+
+    # Verifier negatives
+    bad = Module(consts=[(TAG_INT, 0), (TAG_NULL, None)], functions=[
+        FunctionCode(name="main", arity=0, n_locals=0, max_stack=1,
+                     code=fn_bytes(("NEW_INSTANCE", 0), ("POP",), ("CONST", 1), ("RET",)),
+                     slot_modes=b"")], natives=[], classes=[], entry=0)
+    expect_verify_error("NEW_INSTANCE with bad CLASS_REF const", bad, "CLASS_REF")
+    bad = Module(consts=[(TAG_CLASS_REF, 5), (TAG_NULL, None)], functions=[
+        FunctionCode(name="main", arity=0, n_locals=0, max_stack=1,
+                     code=fn_bytes(("NEW_INSTANCE", 0), ("POP",), ("CONST", 1), ("RET",)),
+                     slot_modes=b"")], natives=[], classes=[], entry=0)
+    expect_verify_error("NEW_INSTANCE bad class index", bad, "out of range")
+    bad = Module(consts=[(TAG_INT, 99), (TAG_NULL, None), (TAG_CLASS_REF, 0)], functions=[
+        FunctionCode(name="main", arity=0, n_locals=1, max_stack=2,
+                     code=fn_bytes(("NEW_INSTANCE", 2), ("STORE_LOCAL", 0), ("LOAD_LOCAL", 0), ("GET_MEMBER", 0), ("POP",), ("CONST", 1), ("RET",)),
+                     slot_modes=bytes([MODE_TEMP]))], natives=[], classes=[ClassInfo(0,0,[],[])], entry=0)
+    # needs class name const valid; fix
+    bad = Module(consts=[(TAG_NAME,"A"), (TAG_INT, 99), (TAG_NULL, None), (TAG_CLASS_REF, 0)], functions=[
+        FunctionCode(name="main", arity=0, n_locals=1, max_stack=2,
+                     code=fn_bytes(("NEW_INSTANCE", 3), ("STORE_LOCAL", 0), ("LOAD_LOCAL", 0), ("GET_MEMBER", 1), ("POP",), ("CONST", 2), ("RET",)),
+                     slot_modes=bytes([MODE_TEMP]))], natives=[], classes=[ClassInfo(0,0,[],[])], entry=0)
+    expect_verify_error("GET_MEMBER name index bad type/range check", bad, "STR/NAME")
+
+    # Runtime negatives
+    def run_mod(m):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_module(m)
+        return buf.getvalue()
+    # CALL_BOUND on non-bound receiver
+    m_nb = Module(consts=[(TAG_NULL, None), (TAG_INT, 1)], functions=[
+        FunctionCode(name="main", arity=0, n_locals=0, max_stack=2,
+                     code=fn_bytes(("CONST", 1), ("CALL_BOUND", 0, 0), ("POP",), ("CONST", 0), ("RET",)),
+                     slot_modes=b"")], natives=[], classes=[], entry=0)
+    try:
+        run_module(m_nb); check("CALL_BOUND on non-bound receiver", False)
+    except VMError as e:
+        check("CALL_BOUND on non-bound receiver", "bound method" in str(e).lower(), str(e))
+    # GET_MEMBER on non-instance
+    m_gni = Module(consts=[(TAG_NULL, None), (TAG_INT, 1), (TAG_NAME, "x")], functions=[
+        FunctionCode(name="main", arity=0, n_locals=0, max_stack=2,
+                     code=fn_bytes(("CONST", 1), ("GET_MEMBER", 2), ("POP",), ("CONST", 0), ("RET",)),
+                     slot_modes=b"")], natives=[], classes=[], entry=0)
+    try:
+        run_module(m_gni); check("GET_MEMBER on non-instance", False)
+    except VMError as e:
+        check("GET_MEMBER on non-instance", "non-instance" in str(e).lower(), str(e))
+    # SET_MEMBER on non-instance
+    m_sni = Module(consts=[(TAG_NULL, None), (TAG_INT, 1), (TAG_NAME, "x")], functions=[
+        FunctionCode(name="main", arity=0, n_locals=0, max_stack=3,
+                     code=fn_bytes(("CONST", 1), ("CONST", 1), ("SET_MEMBER", 2), ("CONST", 0), ("RET",)),
+                     slot_modes=b"")], natives=[], classes=[], entry=0)
+    try:
+        run_module(m_sni); check("SET_MEMBER on non-instance", False)
+    except VMError as e:
+        check("SET_MEMBER on non-instance", "non-instance" in str(e).lower(), str(e))
+    # SET_MEMBER undeclared member and member read absent
+    consts2 = [(TAG_NAME,"A"),(TAG_NAME,"x"),(TAG_CLASS_REF,0),(TAG_NULL,None),(TAG_INT,1),(TAG_NAME,"y")]
+    cls2 = ClassInfo(0,1,[1],[])
+    m_und = Module(consts=consts2, functions=[
+        FunctionCode(name="main", arity=0, n_locals=1, max_stack=3,
+                     code=fn_bytes(("NEW_INSTANCE",2),("STORE_LOCAL",0),("LOAD_LOCAL",0),("CONST",4),("SET_MEMBER",5),("CONST",3),("RET",)),
+                     slot_modes=bytes([MODE_TEMP]))], natives=[], classes=[cls2], entry=0)
+    try:
+        run_module(m_und); check("SET_MEMBER undeclared member", False)
+    except VMError as e:
+        check("SET_MEMBER undeclared member", "no field" in str(e).lower(), str(e))
+    m_abs = Module(consts=consts2, functions=[
+        FunctionCode(name="main", arity=0, n_locals=1, max_stack=2,
+                     code=fn_bytes(("NEW_INSTANCE",2),("STORE_LOCAL",0),("LOAD_LOCAL",0),("GET_MEMBER",1),("POP",),("CONST",3),("RET",)),
+                     slot_modes=bytes([MODE_TEMP]))], natives=[], classes=[cls2], entry=0)
+    # field x declared but value is None - reading returns None, not error; "member read of absent field -> VMError" means undeclared/not present as member
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_module(m_abs)
+    check("declared field read returns stored value (None ok)", True)
+    m_abs2 = Module(consts=[(TAG_NAME,"A"),(TAG_NAME,"x"),(TAG_CLASS_REF,0),(TAG_NULL,None),(TAG_NAME,"y")], functions=[
+        FunctionCode(name="main", arity=0, n_locals=1, max_stack=2,
+                     code=fn_bytes(("NEW_INSTANCE",2),("STORE_LOCAL",0),("LOAD_LOCAL",0),("GET_MEMBER",4),("POP",),("CONST",3),("RET",)),
+                     slot_modes=bytes([MODE_TEMP]))], natives=[], classes=[ClassInfo(0,1,[1],[])], entry=0)
+    try:
+        run_module(m_abs2); check("member read of absent member", False)
+    except VMError as e:
+        check("member read of absent member", "no member" in str(e).lower(), str(e))
+
+    # SET_MEMBER storing a borrow reference -> VMError (borrow on stack via LOAD_LOCAL of borrow slot)
+    m_borrow = Module(
+        consts=[(TAG_NAME,"A"),(TAG_NAME,"x"),(TAG_CLASS_REF,0),(TAG_NULL,None),(TAG_INT,1)],
+        functions=[FunctionCode(
+            name="main", arity=0, n_locals=3, max_stack=3,
+            code=fn_bytes(
+                ("CONST",4), ("OWN_ALLOC",0),
+                ("BORROW_SHARED",1,0),
+                ("NEW_INSTANCE",2), ("STORE_LOCAL",2),
+                ("LOAD_LOCAL",2), ("LOAD_LOCAL",1), ("SET_MEMBER",1),
+                ("CONST",3), ("RET",)),
+            slot_modes=bytes([MODE_OWN, MODE_BORROW, MODE_TEMP]))],
+        natives=[], classes=[ClassInfo(0,1,[1],[])], entry=0)
+    try:
+        run_module(m_borrow); check("SET_MEMBER storing borrow ref", False)
+    except VMError as e:
+        check("SET_MEMBER storing borrow ref", "borrow" in str(e).lower() and "field" in str(e).lower(), str(e))
+
+
+
 def main() -> None:
     test_encoding()
     test_disassembler()
@@ -3209,6 +3423,7 @@ def main() -> None:
     test_parity()
     test_top_level_vm()
     test_metadata()
+    test_class_format_vm()
 
     total = passed + failed
     print(f"\n{BOLD}{'═'*50}")

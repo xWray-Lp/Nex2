@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from bytecode import (
     FunctionCode, Instr, Module, decode_code, verify_module,
-    MODE_STACK, MODE_OWN, MODE_BORROW, TAG_TYPE, MAX_STACK_ELEMS,
+    MODE_STACK, MODE_OWN, MODE_BORROW, TAG_TYPE, TAG_CLASS_REF, MAX_STACK_ELEMS,
     TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE,
     TYPE_KIND_BOOL, TYPE_KIND_PTR, TYPE_KIND_NAMES,
 )
@@ -109,6 +109,13 @@ def _deep_copy(v: Any) -> Any:
     if isinstance(v, OwnValueValue):
         raise VMError("cannot deep-copy an @own value (own values are moved, "
                       "not copied)")
+    if isinstance(v, BorrowValue):
+        raise VMError("cannot deepcopy a borrow reference")
+    if isinstance(v, BoundMethodValue):
+        raise VMError("cannot deepcopy a bound method")
+    if isinstance(v, NexInstanceValue):
+        return NexInstanceValue(v.klass_index,
+                                {k: _deep_copy(val) for k, val in v.fields.items()})
     if isinstance(v, StackArrayValue):
         # to_list() zaten derin kopyadır; yeniden sararak kopyalamaya gerek yok.
         return v.to_list()
@@ -217,6 +224,32 @@ class BorrowValue:
         kind = "&mut" if self.mutable else "&"
         state = " (released)" if self.released else ""
         return f"<borrow {kind} '{self.name}'{state}>"
+
+    __str__ = __repr__
+
+
+class NexInstanceValue:
+    __slots__ = ("klass_index", "fields")
+
+    def __init__(self, klass_index: int, fields: dict[str, Any]):
+        self.klass_index = klass_index
+        self.fields = fields
+
+    def __repr__(self) -> str:
+        return f"<instance class={self.klass_index}>"
+
+    __str__ = __repr__
+
+
+class BoundMethodValue:
+    __slots__ = ("instance", "fn_index")
+
+    def __init__(self, instance: NexInstanceValue, fn_index: int):
+        self.instance = instance
+        self.fn_index = fn_index
+
+    def __repr__(self) -> str:
+        return f"<bound method fn={self.fn_index}>"
 
     __str__ = __repr__
 
@@ -661,6 +694,88 @@ class VM:
                 idx = st.pop()
                 obj = st.pop()
                 self._set_index(obj, idx, val, fr, ins)
+
+            elif name == "NEW_INSTANCE":
+                loc = fr.fn.line_of(ins.pc)
+                ci = a[0]
+                if ci >= len(self.module.consts) or self.module.consts[ci][0] != TAG_CLASS_REF:
+                    raise VMError("NEW_INSTANCE expects a CLASS_REF constant", *loc)
+                cls_idx = int(self.module.consts[ci][1])
+                if cls_idx < 0 or cls_idx >= len(self.module.classes):
+                    raise VMError(f"class index {cls_idx} out of range", *loc)
+                cls = self.module.classes[cls_idx]
+                fields = {}
+                for fni in cls.field_name_idxs:
+                    fname = str(self.module.const_value(fni))
+                    fields[fname] = None
+                st.append(NexInstanceValue(cls_idx, fields))
+
+            elif name == "GET_MEMBER":
+                loc = fr.fn.line_of(ins.pc)
+                obj = st.pop()
+                if not isinstance(obj, NexInstanceValue):
+                    raise VMError("member access on non-instance value", *loc)
+                if a[0] >= len(self.module.consts):
+                    raise VMError(f"constant index {a[0]} out of range", *loc)
+                member = str(self.module.const_value(a[0]))
+                cls = self.module.classes[obj.klass_index]
+                cname = str(self.module.const_value(cls.name_idx))
+                if member in obj.fields:
+                    st.append(obj.fields[member])
+                else:
+                    method_fn = None
+                    for mname_idx, func_cidx in cls.methods:
+                        if str(self.module.const_value(mname_idx)) == member:
+                            tag, fref = self.module.consts[func_cidx]
+                            if tag != TAG_CLASS_REF and tag != 0x04:  # FUNC_REF
+                                # method stores func const idx; resolved below
+                                pass
+                            # func_cidx is const index of FUNC_REF
+                            if self.module.consts[func_cidx][0] == 0x04:
+                                method_fn = int(self.module.consts[func_cidx][1])
+                            else:
+                                method_fn = int(self.module.const_value(func_cidx))
+                            break
+                    if method_fn is not None:
+                        st.append(BoundMethodValue(obj, method_fn))
+                    else:
+                        raise VMError(f"'{cname}' has no member '{member}'", *loc)
+
+            elif name == "SET_MEMBER":
+                loc = fr.fn.line_of(ins.pc)
+                val = st.pop()
+                obj = st.pop()
+                if not isinstance(obj, NexInstanceValue):
+                    raise VMError("member access on non-instance value", *loc)
+                if a[0] >= len(self.module.consts):
+                    raise VMError(f"constant index {a[0]} out of range", *loc)
+                member = str(self.module.const_value(a[0]))
+                cls = self.module.classes[obj.klass_index]
+                cname = str(self.module.const_value(cls.name_idx))
+                declared = {str(self.module.const_value(fni)) for fni in cls.field_name_idxs}
+                if member not in declared:
+                    raise VMError(f"'{cname}' has no field '{member}'", *loc)
+                if isinstance(val, OwnValueValue):
+                    raise VMError("cannot store an @own value in a class field", *loc)
+                if isinstance(val, BorrowValue):
+                    raise VMError("cannot store a borrow reference in a class field", *loc)
+                obj.fields[member] = val
+
+            elif name == "CALL_BOUND":
+                argc = a[1]
+                if len(st) < argc + 1:
+                    raise VMError("stack underflow at call", *fr.fn.line_of(ins.pc))
+                call_args = [st.pop() for _ in range(argc)]
+                call_args.reverse()
+                bound = st.pop()
+                loc = fr.fn.line_of(ins.pc)
+                if not isinstance(bound, BoundMethodValue):
+                    raise VMError("CALL_BOUND expects a bound method", *loc)
+                if self._depth >= self.max_call_depth:
+                    raise VMError(
+                        f"call depth limit exceeded ({self.max_call_depth})", *loc)
+                result = self.call(bound.fn_index, [bound.instance] + call_args)
+                st.append(result)
 
             elif name in ("ADD", "SUB", "MUL", "DIV", "MOD",
                           "EQ", "NE", "LT", "LE", "GT", "GE"):

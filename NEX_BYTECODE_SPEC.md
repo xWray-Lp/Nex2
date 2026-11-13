@@ -16,8 +16,9 @@
   compact encoding ayrı optimizasyon turu).
 - **İsim uzayı:** string'ler, fonksiyonlar, native'ler ve tipler sabit
   havuzundaki indekslerle anılır; bytecode içinde çıplak pointer yok.
-- **Sürüm:** `version = 1`. Opcode/encoding değişirse artırılır; bilinmeyen
-  opcode veya sürüm → verifier hatası, program çalışmaz.
+- **Sürüm:** `version = 2` (v1 modüller okunur/desteklenir). Opcode/encoding
+  değişirse artırılır; bilinmeyen opcode veya sürüm → verifier hatası, program
+  çalışmaz.
 - **Değerler ISA'da etiketsizdir.** Tip bilgisi verifier'ın soyut yorumu ve
   slot mod tablosundan gelir; çalışma zamanı yalnız mod kurallarını denetler.
 
@@ -25,12 +26,14 @@
 
 ## 2. Modül yerleşimi
 
-Sabit 52 baytlık başlık, ardından bölümler:
+v1: sabit 52 baytlık başlık. v2: sabit 60 baytlık başlık (`class_count`,
+`class_off` eklenir). Decoder sürüme göre dal alır; v1 modüller desteklenir.
 
+v2 başlık:
 ```
 offset  size  alan
 0       4     magic = "NEXB"
-4       2     version (=1)
+4       2     version (=2)
 6       2     flags (rezerve, 0)
 8       4     entry_func (main fonksiyon indeksi; yoksa 0xFFFFFFFF)
 12      4     const_count
@@ -43,11 +46,16 @@ offset  size  alan
 40      4     code_off
 44      4     debug_len
 48      4     debug_off
+52      4     class_count
+56      4     class_off
 ```
 
 Tüm `*_off` değerleri modül başına göre **mutlak** bayt ofsetidir.
-Bölümler sırayla yazılır: const pool → func table → native table →
-slot mode tablosu → code → debug.
+v2 bölüm sırası: const pool → func table → native table → class table →
+slot mode tablosu → code → debug. ClassTable v2'de zorunludur (boş olabilir).
+
+ClassTable: `count: u32`, ardından her sınıf için
+`{ name_idx: u32, field_count: u32, field_name_idxs: field_count×u32, method_count: u32, methods: method_count×(u32 name_idx + u32 func_const_idx) }`.
 
 ---
 
@@ -68,6 +76,7 @@ tag 0x06 TYPE     : u8 kind + u32 size     // @stack eleman/boyut tanımı
 tag 0x07 NAME     : STR ile aynı; sembol/debug adı (opsiyonel ayrım)
 tag 0x08 BOOL     : u8 (0 = false, 1 = true)
 tag 0x09 NULL     : payload yok
+tag 0x0A CLASS_REF: u32 class_idx
 ```
 
 `TYPE.kind`: `0x01 INT`, `0x02 FLOAT`, `0x03 BYTE`, `0x04 BOOL`, `0x05 PTR`.
@@ -224,9 +233,17 @@ modu varsa runtime hatası (v1: sahiplik/borç fonksiyon sınırını geçemez).
 | 0x34 | `SET_INDEX` | — | `(obj idx v -- )` |
 | 0x35 | `GET_MEMBER` | `u32 ni` | `(obj -- v)` |
 | 0x36 | `SET_MEMBER` | `u32 ni` | `(obj v -- )` |
+| 0x37 | `NEW_INSTANCE` | `u32 cls_const` | `( -- obj)` |
+| 0x38 | `CALL_BOUND` | `u32 _r, u32 argc` | `(bound a1..an -- ret)` |
 
-BORROW modlu bir değer `GET_INDEX`/`GET_MEMBER` operandı olabilir (per-access
-çözümleme); heap konteynerine **yazılamaz** (runtime `_conv` karşılığı).
+`NEW_INSTANCE` sabiti `CLASS_REF` (0x0A) olmalıdır. `GET_MEMBER` alan önce,
+metot sonra çözülür (metot → bound). `SET_MEMBER` yalnız bildirilmiş instance
+alanlarına yazabilir. Borrow modlu bir değer `GET_INDEX` operandı olabilir
+(per-access çözümleme); heap konteynerine **yazılamaz** (runtime `_conv`
+karşılığı).
+
+VM prototipinde henüz yürütülmeyen opcode'lar: `LOAD_GLOBAL`, `STORE_GLOBAL`,
+`NEW_TUPLE`, `BLOCK_ENTER`, `BLOCK_EXIT`.
 
 ### 6.6 Mod opcode'ları
 
