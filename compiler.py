@@ -10,10 +10,20 @@ sabit boyutlu diziler (STACK_ALLOC/STACK_MATERIALIZE, indeks okuma/yazma,
 kaçışta derin heap kopyası), `@own` sahipliği (OWN_ALLOC/OWN_MOVE/
 OWN_FREE; borrow yok), genel list/dict literalleri (NEW_LIST/NEW_DICT +
 GET_INDEX/SET_INDEX) ve f-string (`FStringExpr`). `list.push` metodu
-CALL_NATIVE push ile desteklenir; diğer metot çağrıları `.X` kapsam dışıdır.
+CALL_NATIVE push ile desteklenir; sınıf metotları GET_MEMBER + CALL_BOUND
+ile çağrılır.
+
+Sınıflar (stage 2, NEX_CLASS_DESIGN.md): modül seviyesinde `class` kabul
+edilir. Metotlar gerçek fonksiyonlar olarak derlenir; `self` örtük ilk
+parametredir (CALL_BOUND `[instance]+args` ile eşleşir). Örnekleme:
+NEW_INSTANCE + alan varsayılanları + `init` çağrısı (init yoksa argümanlar
+değerlendirilip atılır). Alan okuma/yazma GET_MEMBER/SET_MEMBER, metot
+çağrısı GET_MEMBER + CALL_BOUND. Kapsam dışı (bilinçli): kalıtım, interface,
+generic sınıf/metot, `__init__` (yalnız `init`), dinamik alan ekleme,
+dict-benzeri instance API'si, karmaşık alan varsayılanları.
 
 Kapsam dışı (bilinçli): @raw, nested @stack, `str` elemanlı stack dizi,
-tuple, sınıflar, match, for'da destructuring, import, lambda, pipe; ayrıca
+tuple, match, for'da destructuring, import, lambda, pipe; ayrıca
 list/dict üzerinde compound atama ve diğer metotlar (`.length`, `.pop`,
 ...). Bunlar açık CompileError üretir — sessizce yanlış kod üretilmez.
 
@@ -42,10 +52,11 @@ from typing import Optional
 
 import ast_nodes as A
 from bytecode import (
-    FunctionCode, Instr, Module, NativeInfo, OPCODES,
+    ClassInfo, FunctionCode, Instr, Module, NativeInfo, OPCODES,
     NAT_PURE, NAT_STRUCTURAL, MODE_TEMP, MODE_STACK, MODE_OWN, MODE_BORROW,
     MODE_RAW,
     TAG_FLOAT, TAG_INT, TAG_NAME, TAG_NULL, TAG_BOOL, TAG_STR, TAG_TYPE,
+    TAG_CLASS_REF, TAG_FUNC_REF,
     TYPE_KIND_INT, TYPE_KIND_FLOAT, TYPE_KIND_BYTE, TYPE_KIND_BOOL,
     stack_effect,
 )
@@ -98,6 +109,17 @@ _STACK_ELEM_KINDS = {
 #: Sahiplik builtin'leri. Bunlar yalnız özel call konumlarında geçerlidir
 #: (`@own` başlatıcısı, to_gc/free move'u); başka her kullanım CompileError.
 _OWN_BUILTINS = ("to_own", "to_gc", "free")
+
+#: Sınıf alanı varsayılanı olarak kabul edilen basit literal biçimleri
+#: (NEX_CLASS_DESIGN.md §2 "alan varsayılanları"): int/float/str/bool/null
+#: literal'leri ve negatif sayılar (`-1`, `-2.5`). Karmaşık ifadeler
+#: (ör. `x + 1`, fonksiyon çağrısı, liste literal'i) CompileError üretir.
+def _is_simple_field_default(node: A.Node) -> bool:
+    if isinstance(node, (A.IntLit, A.FloatLit, A.StrLit, A.BoolLit, A.NullLit)):
+        return True
+    if isinstance(node, A.UnaryExpr) and node.op == "-":
+        return isinstance(node.operand, (A.IntLit, A.FloatLit))
+    return False
 
 
 # ─── Emisyon yardımcıları ────────────────────────────────────────────────────
@@ -293,6 +315,20 @@ class Compiler:
         self.module = Module()
         self._func_index: dict[str, int] = {}
         self._func_decls: list[A.FnDecl] = []
+        #: Sınıf adı → sınıf indeksi (bildirim sırası; ClassTable sırası).
+        self._class_index: dict[str, int] = {}
+        #: Sınıf adı → ClassDecl (alan sırası, metot listesi).
+        self._class_decls: dict[str, A.ClassDecl] = {}
+        #: Bildirim sırasına göre sınıflar (cls_index = pozisyon).
+        self._class_order: list[A.ClassDecl] = []
+        #: Sınıf adı → metot adı → fonksiyon indeksi.
+        self._class_methods: dict[str, dict[str, int]] = {}
+        #: Sınıf adı → 'init' metotu var mı.
+        self._class_init: dict[str, bool] = {}
+        #: Derlenen metot gövdesinin ait olduğu sınıf (None → normal fn).
+        self._current_class: Optional[str] = None
+        #: Slot → sınıf adı ipucu (instance tipi çıkarımı; push/bound ayrımı).
+        self._local_class: dict[int, str] = {}
         self._const_index: dict[tuple[int, object], int] = {}
         self._builder: Optional[_FnBuilder] = None
         # (break, continue, base_depth): base_depth = döngü gövde scope'unun
@@ -328,7 +364,11 @@ class Compiler:
                     raise CompileError("async functions are not supported in VM", stmt)
                 self._func_index[stmt.name] = len(self._func_decls)
                 self._func_decls.append(stmt)
-            elif isinstance(stmt, (A.ClassDecl, A.InterfaceDecl, A.ImportStmt,
+            elif isinstance(stmt, A.ClassDecl):
+                # Sınıf: iki geçişli toplama (forward ref parity — tree-walker
+                # Program'ı önce tüm ClassDecl'leri yürütür).
+                self._collect_class(stmt)
+            elif isinstance(stmt, (A.InterfaceDecl, A.ImportStmt,
                                    A.ModuleStmt)):
                 raise CompileError(
                     f"{type(stmt).__name__} is not supported in the VM prototype",
@@ -339,7 +379,7 @@ class Compiler:
                 # için kullanıcı fonksiyonlarıyla çakışamaz.
                 script_stmts.append(stmt)
 
-        if not self._func_decls and not script_stmts:
+        if not self._func_decls and not script_stmts and not self._class_order:
             raise CompileError("no functions to compile")
 
         # Üst seviye statement'lar varsa sentetik giriş fonksiyonu: dosya
@@ -370,6 +410,16 @@ class Compiler:
         for decl in self._func_decls:
             self.module.functions.append(self._compile_function(decl))
 
+        # Sınıf metotları: her metot gerçek bir fonksiyon olur (modül
+        # fonksiyon tablosunda ayrı giriş); `self` örtük ilk parametredir.
+        for cls_decl in self._class_order:
+            for m in cls_decl.methods:
+                self._name_const(m.name)
+                fn_index = len(self.module.functions)
+                self.module.functions.append(
+                    self._compile_method(cls_decl.name, m))
+                self._class_methods[cls_decl.name][m.name] = fn_index
+
         if script_decl is not None:
             # Sentetik giriş en sona: arşiv sırası kullanıcı fonksiyonları
             # önce, `<script>` sonra. Gövde fn main gövdesiyle aynı yolla
@@ -383,13 +433,111 @@ class Compiler:
             if "main" not in self._func_index:
                 raise CompileError("VM prototype requires a 'main' function")
             self.module.entry = self._func_index["main"]
+
+        # Sınıf tablosu (ClassTable): alan sırası = bildirim sırası,
+        # metot girdileri (ad const, FUNC_REF const).
+        self._build_class_table()
         return self.module
 
+    # -- sınıf toplama/tablolar ------------------------------------------------
+    def _collect_class(self, decl: A.ClassDecl) -> None:
+        """Sınıf bildirimini doğrula ve topla (iki geçişli derleme).
+
+        Sınıf adı → cls_index eşlemesi bildirim sırasına göre verilir
+        (ClassTable sırası). Desteklenmeyen sınıf özellikleri (kalıtım,
+        interface, generic, `__init__`, karmaşık alan varsayılanı) konumlu
+        CompileError üretir."""
+        if decl.name in self._class_index:
+            raise CompileError(f"duplicate class '{decl.name}'", decl)
+        if decl.name in self._func_index:
+            raise CompileError(
+                f"'{decl.name}' is declared both as a class and a function",
+                decl)
+        if decl.base is not None:
+            raise CompileError(
+                "class inheritance is not supported in the VM prototype", decl)
+        if decl.interfaces:
+            raise CompileError(
+                "class interfaces are not supported in the VM prototype", decl)
+        if decl.type_params:
+            raise CompileError(
+                "generic classes are not supported in the VM prototype", decl)
+        for f in decl.fields:
+            if f.default is not None and not _is_simple_field_default(f.default):
+                raise CompileError(
+                    "complex field default expressions are not supported in "
+                    "the VM prototype", f.default)
+        seen: set[str] = set()
+        for m in decl.methods:
+            if m.name == "__init__":
+                # Kilit karar: `init` tek kurucudur.
+                raise CompileError("__init__ is not supported; use 'init'", m)
+            if m.name in seen:
+                raise CompileError(f"duplicate method '{m.name}'", m)
+            seen.add(m.name)
+            if m.type_params:
+                raise CompileError(
+                    "generic methods are not supported in the VM prototype", m)
+            if m.is_async:
+                raise CompileError(
+                    "async methods are not supported in the VM prototype", m)
+            if m.body is None:
+                raise CompileError(f"method '{m.name}' has no body", m)
+            for p in m.params:
+                if p.name == "self":
+                    raise CompileError(
+                        "duplicate 'self' parameter: methods bind 'self' "
+                        "implicitly", p)
+        self._class_index[decl.name] = len(self._class_order)
+        self._class_order.append(decl)
+        self._class_decls[decl.name] = decl
+        self._class_methods[decl.name] = {}
+        self._class_init[decl.name] = any(m.name == "init" for m in decl.methods)
+
+    def _build_class_table(self) -> None:
+        """ClassInfo üret: ad const, alan listesi (sıralı), metot listesi."""
+        for cls_decl in self._class_order:
+            name_idx = self._name_const(cls_decl.name)
+            field_idxs = [self._name_const(f.name) for f in cls_decl.fields]
+            methods: list[tuple[int, int]] = []
+            for m in cls_decl.methods:
+                mname_idx = self._name_const(m.name)
+                fn_index = self._class_methods[cls_decl.name][m.name]
+                methods.append((mname_idx, self._const(TAG_FUNC_REF, fn_index)))
+            self.module.classes.append(ClassInfo(
+                name_idx=name_idx,
+                field_count=len(field_idxs),
+                field_name_idxs=field_idxs,
+                methods=methods,
+            ))
+
+    def _class_has_method(self, class_name: str, member: str) -> bool:
+        decl = self._class_decls.get(class_name)
+        if decl is None:
+            return False
+        return any(m.name == member for m in decl.methods)
+
     # -- fonksiyon -----------------------------------------------------------
-    def _compile_function(self, decl: A.FnDecl) -> FunctionCode:
-        b = _FnBuilder(decl.name, arity=len(decl.params))
+    def _compile_function(self, decl: A.FnDecl,
+                          implicit_self: bool = False) -> FunctionCode:
+        """Fonksiyon (veya sınıf metodu) derle.
+
+        `implicit_self=True` → metot: `self` örtük ilk parametredir, arity
+        = len(params)+1 (CALL_BOUND `[instance]+args` sözleşmesi)."""
+        arity = len(decl.params) + (1 if implicit_self else 0)
+        b = _FnBuilder(decl.name, arity=arity)
         self._builder = b
         self._loops = []
+        self._local_class = {}
+
+        if implicit_self:
+            for p in decl.params:
+                if p.name == "self":
+                    raise CompileError(
+                        "duplicate 'self' parameter: methods bind 'self' "
+                        "implicitly", p)
+            # `self` normal bir yerel slot (MODE_TEMP).
+            b.declare("self", decl)
 
         for p in decl.params:
             if p.default is not None:
@@ -401,7 +549,11 @@ class Compiler:
             if isinstance(p.type_ann, A.TypeRef):
                 raise CompileError(
                     "reference parameters are not supported in the VM prototype", p)
-            b.declare(p.name, p)
+            slot = b.declare(p.name, p)
+            # Sınıf tipi parametre → instance ipucu (push/bound ayrımı).
+            ann = p.type_ann
+            if isinstance(ann, A.TypeName) and ann.name in self._class_index:
+                self._local_class[slot] = ann.name
 
         self._compile_block(decl.body, new_scope=False)
         # Düşen akış: null dön.
@@ -410,6 +562,20 @@ class Compiler:
 
         self._builder = None
         return b.assemble()
+
+    def _compile_method(self, class_name: str, decl: A.FnDecl) -> FunctionCode:
+        """Sınıf metodunu derle (`self` örtük ilk parametre).
+
+        Metot, serbest fonksiyon gibi `FuncInfo` olur; gövdesi derlenirken
+        `self` slotu (0) hazırdır. Arity = len(params)+1 → CALL_BOUND
+        `[instance]+args` ile birebir eşleşir (tree-walker `Function._call`
+        örtük `self` bağlama sözleşmesiyle aynı)."""
+        saved = self._current_class
+        self._current_class = class_name
+        try:
+            return self._compile_function(decl, implicit_self=True)
+        finally:
+            self._current_class = saved
 
     # -- statement'lar -------------------------------------------------------
     def _compile_block(self, block: A.Block, new_scope: bool = True) -> None:
@@ -464,6 +630,10 @@ class Compiler:
                 b.emit("CONST", self._const(TAG_NULL, None), node=node)
             slot = b.declare(node.name, node)
             b.emit("STORE_LOCAL", slot, node=node)
+            # `let x = Foo(...)` → x bir sınıf örneği (instance ipucu).
+            ctor = self._ctor_class_of(node.value)
+            if ctor is not None:
+                self._local_class[slot] = ctor
             return
 
         if isinstance(node, A.ExprStmt):
@@ -525,6 +695,12 @@ class Compiler:
             raise CompileError(
                 "nested function declarations are not supported in the VM prototype",
                 node)
+
+        if isinstance(node, A.ClassDecl):
+            # Sınıf yalnız modül seviyesinde tanımlanabilir.
+            raise CompileError(
+                "class declarations inside functions are not supported in "
+                "the VM prototype", node)
 
         raise CompileError(
             f"{type(node).__name__} is not supported in the VM prototype", node)
@@ -799,6 +975,12 @@ class Compiler:
                 b.emit("LOAD_LOCAL", slot, node=node)
             return
 
+        if isinstance(node, A.MemberExpr):
+            # Üye okuma (çağrı olmayan bağlam): `obj` değerlendir, GET_MEMBER
+            # (alan önce, metot sonra; metot okuması bound üretir).
+            self._compile_member_read(node)
+            return
+
         if isinstance(node, A.FStringExpr):
             # f-string: parçaları soldan sağa birleştir. Literal parça → CONST STR;
             # ifade parçası → expr + CALL_PURE_NATIVE str 1. Parça yoksa "".
@@ -879,13 +1061,18 @@ class Compiler:
                 self._compile_expr(node.value)
                 b.emit("DUP", node=node)
                 b.emit("STORE_LOCAL", slot, node=node)
+                # Yeniden atama → instance ipucu düşer (tip artık belirsiz).
+                self._local_class.pop(slot, None)
                 return
             if isinstance(node.target, A.IndexExpr):
                 self._compile_index_assign(node)
                 return
+            if isinstance(node.target, A.MemberExpr):
+                self._compile_member_assign(node)
+                return
             raise CompileError(
-                "only variable and index assignment are supported in the "
-                "VM prototype", node)
+                "only variable, index and member assignment are supported in "
+                "the VM prototype", node)
 
         if isinstance(node, A.CallExpr):
             self._compile_call(node)
@@ -978,7 +1165,8 @@ class Compiler:
     def _compile_call(self, node: A.CallExpr) -> None:
         b = self._builder
         if isinstance(node.callee, A.MemberExpr):
-            # `obj.push(v)` — prototipteki tek metot çağrısı.
+            # `obj.push(v)` (liste native'i) veya `obj.method(args)`
+            # (sınıf metotu → GET_MEMBER + CALL_BOUND).
             self._compile_member_call(node)
             return
         if not isinstance(node.callee, A.Ident):
@@ -1004,6 +1192,12 @@ class Compiler:
         if b.resolve(name) is not None:
             raise CompileError(
                 f"'{name}' is a variable, not a callable function", node)
+
+        # Sınıf örnekleme: `Foo(args...)` → NEW_INSTANCE + alan varsayılanları
+        # + `init` çağrısı (init yoksa argümanlar değerlendirilip atılır).
+        if name in self._class_index:
+            self._compile_constructor_call(node, name)
+            return
 
         # Borrow argüman kuralı (checker visit_CallExpr ile aynı): yalnız
         # gölgelemesiz allowlist saf native'ler (len/keys/values) &arg
@@ -1047,23 +1241,146 @@ class Compiler:
     def _compile_member_call(self, node: A.CallExpr) -> None:
         """`obj.push(v)` — list.push native'i (CALL_NATIVE, argc=2).
 
-        Diğer her metot adı kapsam dışıdır: `method call '.X' is not
-        supported in the VM prototype`. Argüman sayısı tam 1 olmalı."""
+        `obj.method(args)` — sınıf metotu: `obj` değerlendir, GET_MEMBER
+        (bound üret), argümanları değerlendir, CALL_BOUND argc.
+
+        Alıcı bir sınıf örneği olarak biliniyorsa (statik ipucu) daima bound
+        çağrı yolu kullanılır; aksi hâlde `push` liste native'ine düşer
+        (prototipteki tek liste metot çağrısı)."""
         b = self._builder
         assert isinstance(node.callee, A.MemberExpr)
         member = node.callee.member
-        if member != "push":
-            raise CompileError(
-                f"method call '.{member}' is not supported in the VM "
-                f"prototype", node)
         if node.type_args:
             raise CompileError("call-site type args are not supported in VM",
                                node)
-        if len(node.args) != 1:
-            raise CompileError("push() accepts exactly one argument", node)
-        self._compile_expr(node.callee.obj)      # [obj]
-        self._compile_expr(node.args[0])         # [obj, val]
-        b.emit("CALL_NATIVE", _NATIVE_INDEX["push"], 2, node=node)
+        receiver_class = self._infer_instance_class(node.callee.obj)
+        if receiver_class is None and member == "push":
+            if len(node.args) != 1:
+                raise CompileError("push() accepts exactly one argument", node)
+            self._compile_expr(node.callee.obj)      # [obj]
+            self._compile_expr(node.args[0])         # [obj, val]
+            b.emit("CALL_NATIVE", _NATIVE_INDEX["push"], 2, node=node)
+            return
+        # Bound metot çağrısı: obj; GET_MEMBER; args; CALL_BOUND.
+        self._compile_expr(node.callee.obj)          # [obj]
+        b.emit("GET_MEMBER", self._name_const(member), node=node)  # [bound]
+        for arg in node.args:
+            self._compile_expr(arg)                  # [bound, a1..an]
+        b.emit("CALL_BOUND", 0, len(node.args), node=node)   # [ret]
+
+    # -- sınıf yardımcıları ----------------------------------------------------
+    def _ctor_class_of(self, value: Optional[A.Node]) -> Optional[str]:
+        """Değer bir sınıf örnekleme çağrısı mı? → sınıf adı."""
+        if not isinstance(value, A.CallExpr):
+            return None
+        if not isinstance(value.callee, A.Ident):
+            return None
+        name = value.callee.name
+        if name not in self._class_index:
+            return None
+        if self._builder.resolve(name) is not None:
+            return None
+        return name
+
+    def _infer_instance_class(self, expr: A.Node) -> Optional[str]:
+        """(statik ipucu) expr bir sınıf örneği mi? → sınıf adı.
+
+        Yalnız kanıtlanabilir durumlar: `self` (metot gövdesinde), bir
+        sınıf örneklemesine bağlanmış yerel, sınıf tipi parametre ve alan
+        tipi bildirimi bir sınıfı gösteren üye erişimi."""
+        if isinstance(expr, A.Ident):
+            if expr.name == "self":
+                return self._current_class
+            slot = self._builder.resolve(expr.name)
+            if slot is None:
+                return None
+            return self._local_class.get(slot)
+        if isinstance(expr, A.MemberExpr):
+            owner = self._infer_instance_class(expr.obj)
+            if owner is None:
+                return None
+            decl = self._class_decls.get(owner)
+            if decl is None:
+                return None
+            for f in decl.fields:
+                if f.name == expr.member:
+                    ta = f.type_ann
+                    if isinstance(ta, A.TypeName) and ta.name in self._class_index:
+                        return ta.name
+                    return None
+            return None
+        return None
+
+    def _compile_member_read(self, node: A.MemberExpr) -> None:
+        """`obj.field` → obj; GET_MEMBER (alan → değer, metot → bound)."""
+        b = self._builder
+        self._compile_expr(node.obj)
+        b.emit("GET_MEMBER", self._name_const(node.member), node=node)
+
+    def _compile_member_assign(self, node: A.AssignExpr) -> None:
+        """`obj.field = v` → obj; v; SET_MEMBER.
+
+        Yalnız bildirilmiş alanlar yazılabilir (kilit karar §6c): alıcının
+        sınıfı statik olarak biliniyorsa derleme zamanında reddedilir;
+        bilinmiyorsa runtime reddi (VM) geçerlidir. Atama ifadesi değeri
+        yığında bırakılır (tree-walker `set_attr` dönüşü ile aynı)."""
+        b = self._builder
+        target = node.target
+        assert isinstance(target, A.MemberExpr)
+        cls_name = self._infer_instance_class(target.obj)
+        if cls_name is not None:
+            decl = self._class_decls[cls_name]
+            if target.member not in {f.name for f in decl.fields}:
+                if self._class_has_method(cls_name, target.member):
+                    raise CompileError(
+                        f"cannot assign to method '{target.member}' of class "
+                        f"'{cls_name}'", node)
+                raise CompileError(
+                    f"'{cls_name}' has no field '{target.member}'", node)
+        tmp = b.new_tmp(node)
+        self._compile_expr(node.value)          # [v]
+        b.emit("DUP", node=node)                # [v, v]
+        b.emit("STORE_LOCAL", tmp, node=node)   # [v]
+        self._compile_expr(target.obj)          # [v, obj]
+        b.emit("LOAD_LOCAL", tmp, node=node)    # [v, obj, v]
+        b.emit("SET_MEMBER", self._name_const(target.member), node=node)  # [v]
+
+    def _compile_constructor_call(self, node: A.CallExpr,
+                                  class_name: str) -> None:
+        """`Foo(args...)` → NEW_INSTANCE + varsayılanlar + `init` çağrısı.
+
+        - NEW_INSTANCE `<cls>`; STORE_LOCAL tmp (geçici TEMP slot).
+        - Bildirim sırasındaki alan varsayılanları SET_MEMBER ile yazılır
+          (yalnız basit literal'ler; varsayılanı olmayan alan None kalır).
+        - `init` varsa: bound `init` çağrılır (self + args); init yoksa
+          argümanlar değerlendirilip yan etkileri için atılır (tree-walker
+          semantiği: argümanlar yine de değerlendirilir, göze alınmaz).
+        - Yığında örnek bırakılır."""
+        b = self._builder
+        cls_idx = self._class_index[class_name]
+        cls_decl = self._class_decls[class_name]
+        b.emit("NEW_INSTANCE", self._const(TAG_CLASS_REF, cls_idx), node=node)
+        tmp = b.new_tmp(node)
+        b.emit("STORE_LOCAL", tmp, node=node)
+        for f in cls_decl.fields:
+            if f.default is None:
+                continue
+            b.emit("LOAD_LOCAL", tmp, node=node)          # [obj]
+            self._compile_expr(f.default)                 # [obj, val]
+            b.emit("SET_MEMBER", self._name_const(f.name), node=node)
+        if self._class_init.get(class_name):
+            b.emit("LOAD_LOCAL", tmp, node=node)          # [obj]
+            b.emit("GET_MEMBER", self._name_const("init"), node=node)  # [bnd]
+            for arg in node.args:
+                self._compile_expr(arg)                  # [bnd, a1..an]
+            b.emit("CALL_BOUND", 0, len(node.args), node=node)  # [ret]
+            b.emit("POP", node=node)                     # []
+            b.emit("LOAD_LOCAL", tmp, node=node)         # [obj]
+        else:
+            for arg in node.args:
+                self._compile_expr(arg)                  # [a1..an]
+                b.emit("POP", node=node)                 # []
+            b.emit("LOAD_LOCAL", tmp, node=node)         # [obj]
 
     def _compile_own_move_call(self, node: A.CallExpr, name: str) -> None:
         """`to_gc(x)` / `free(x)` — x @own slot olmalı; OWN_MOVE/OWN_FREE.

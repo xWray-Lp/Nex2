@@ -30,6 +30,7 @@ from pathlib import Path
 
 from lexer import Lexer
 from parser import Parser
+import ast_nodes
 from compiler import compile_program, CompileError
 from bytecode import (
     BytecodeError, VerifyError, Module, FunctionCode, NativeInfo, ClassInfo,
@@ -68,6 +69,38 @@ def section(title: str) -> None:
 
 
 # ─── Yardımcılar ─────────────────────────────────────────────────────────────
+
+TREENODE_SRC = """
+class TreeNode:
+    value: int
+    label: str
+    children: list
+
+    fn init(v: int, s: str):
+        self.value = v
+        self.label = s
+        self.children = []
+
+    fn add_child(c):
+        self.children.push(c)
+
+    fn total() -> int:
+        let t = self.value
+        for c in self.children:
+            t = t + c.total()
+        return t
+
+fn main():
+    let root = TreeNode(10, "root")
+    let left = TreeNode(20, "L")
+    let right = TreeNode(30, "R")
+    root.add_child(left)
+    root.add_child(right)
+    print(str(root.total()))
+    print(str(left.value))
+    print(str(root.label))
+"""
+
 
 def parse(source: str):
     return Parser(Lexer(source.strip() + "\n").tokenize()).parse()
@@ -1879,11 +1912,14 @@ fn main():
     print(str(xs))
 """, ["[1, 2, 3]"])
 
-    expect_compile_error("list metodu (.length) reddedilir", """
+    # Stage 2: üye erişimi GET_MEMBER/SET_MEMBER yoluna geçti; liste gibi
+    # instance olmayan alıcılarda hata artık derleme değil runtime'da
+    # konumludur (tree-walker'da da AttributeError runtime'da).
+    expect_vm_error("list üzerinde (.length) runtime hatası verir", """
 fn main():
     let xs = [1, 2]
     print(xs.length)
-""", "memberexpr is not supported")
+""", "non-instance")
 
     # ── Tree-walker ↔ VM parity ─────────────────────────────────────────
     expect_parity("parity: list literal + indeks yazma", """
@@ -2527,6 +2563,26 @@ fn main():
     print(str(buf[0]))
     print(str(snap[0]))
 """,
+        "class: TreeNode init + self özyineleme": TREENODE_SRC,
+        "class: alan varsayılanı + init'siz örnekleme": """
+class Cfg:
+    delta: int = -5
+    tag: str = "t"
+
+class Plain:
+    v: int
+
+fn bump(x: int) -> int:
+    print("side")
+    return x
+
+fn main():
+    let c = Cfg()
+    print(str(c.delta))
+    print(str(c.tag))
+    let p = Plain(bump(1))
+    print(str(p.v))
+""",
     }
     for name, src in programs.items():
         expect_parity(name, src)
@@ -2868,11 +2924,11 @@ fn main():
     xs.push(1, 2)
 """, "push() accepts exactly one argument")
 
-    expect_compile_error("desteklenmeyen metot çağrısı reddedilir", """
+    expect_vm_error("desteklenmeyen metot çağrısı runtime hatası verir", """
 fn main():
     let xs = [1]
     xs.foo(1)
-""", "method call '.foo' is not supported")
+""", "non-instance")
 
     # push native'i tabloda: impure (CALL_NATIVE), borç argümanı
     # CALL_NATIVE sınırında reddedilir.
@@ -3393,7 +3449,244 @@ fn main():
         run_module(m_borrow); check("SET_MEMBER storing borrow ref", False)
     except VMError as e:
         check("SET_MEMBER storing borrow ref", "borrow" in str(e).lower() and "field" in str(e).lower(), str(e))
+def test_class_vm():
+    section("Class / object VM (stage 2 — compiler lowering)")
 
+    # ── TreeNode: init + self üzerinden özyineleme (for over list) ──────
+    expect_parity("TreeNode: init + self özyineleme (parity)", TREENODE_SRC)
+    expect_output("TreeNode: toplam 60, alan okuma", TREENODE_SRC,
+                  ["60", "20", "root"])
+
+    # Sınıf tablosu: alan sırası bildirim sırası, metotlar (ad, fn).
+    m_tree = compile_source(TREENODE_SRC)
+    check("class table: TreeNode kayıtlı", len(m_tree.classes) == 1,
+          str(m_tree.classes))
+    cls = m_tree.classes[0]
+    field_names = [m_tree.const_value(i) for i in cls.field_name_idxs]
+    check("class table: alan sırası (value, label, children)",
+          field_names == ["value", "label", "children"], str(field_names))
+    method_names = [m_tree.const_value(mn) for mn, _ in cls.methods]
+    check("class table: metot listesi (init, add_child, total)",
+          method_names == ["init", "add_child", "total"], str(method_names))
+    fn_idxs = [int(m_tree.const_value(fi)) for _, fi in cls.methods]
+    check("class table: metotlar ayrı fonksiyon girdileri",
+          len(set(fn_idxs)) == 3
+          and all(0 <= i < len(m_tree.functions) for i in fn_idxs),
+          str(fn_idxs))
+    # `self` örtük ilk parametre: arity = len(params)+1.
+    init_fn = m_tree.functions[fn_idxs[0]]
+    check("metot arity: self örtük (init: 2 param + self)",
+          init_fn.arity == 3, f"arity={init_fn.arity}")
+    total_fn = m_tree.functions[fn_idxs[2]]
+    check("metot arity: self örtük (total: 0 param + self)",
+          total_fn.arity == 1, f"arity={total_fn.arity}")
+
+    # ── Alan varsayılanları: negatif literal dahil ─────────────────────
+    expect_output("alan varsayılanı: negatif literal + temel literal'lar", """
+class Cfg:
+    delta: int = -5
+    ratio: float = -1.5
+    tag: str = "t"
+    on: bool = true
+    nothing: int = null
+
+fn main():
+    let c = Cfg()
+    print(str(c.delta))
+    print(str(c.ratio))
+    print(str(c.tag))
+    print(str(c.on))
+    print(str(c.nothing))
+""", ["-5", "-1.5", "t", "true", "null"])
+    expect_parity("alan varsayılanı: negatif literal (parity)", """
+class Cfg:
+    delta: int = -5
+
+fn main():
+    let c = Cfg()
+    print(str(c.delta))
+""")
+
+    # Varsayılan yoksa alan None (null) kalır.
+    expect_output("varsayılanı olmayan alan null kalır", """
+class Plain:
+    v: int
+
+fn main():
+    let p = Plain()
+    print(str(p.v))
+""", ["null"])
+
+    # ── Metot çağrısı değer döndürür ───────────────────────────────────
+    expect_output("metot çağrısı değer döndürür (self mutasyonu)", """
+class Counter:
+    n: int
+    fn init():
+        self.n = 0
+    fn bump():
+        self.n = self.n + 1
+        return self.n
+    fn get() -> int:
+        return self.n
+
+fn main():
+    let c = Counter()
+    print(str(c.bump()))
+    print(str(c.bump()))
+    print(str(c.get()))
+""", ["1", "2", "2"])
+
+    # ── init yoksa: argümanlar değerlendirilir, göze alınmaz ──────────
+    expect_output("init yokken argümanlar yan etki için değerlendirilir", """
+class Plain:
+    v: int
+
+fn bump(x: int) -> int:
+    print("side")
+    return x
+
+fn main():
+    let p = Plain(bump(1), bump(2))
+    print(str(p.v))
+""", ["side", "side", "null"])
+    expect_parity("init yokken argümanlar atılır (parity)", """
+class Plain:
+    v: int
+
+fn bump(x: int) -> int:
+    print("side")
+    return x
+
+fn main():
+    let p = Plain(bump(1), bump(2))
+    print(str(p.v))
+""")
+
+    # ── Dinamik alan: yalnız bildirilmiş alanlar yazılabilir ───────────
+    expect_compile_error("dinamik alan statik bilinirken CompileError", """
+class Box:
+    v: int
+
+fn main():
+    let b = Box()
+    b.newfield = 1
+""", "has no field 'newfield'")
+    expect_compile_error("metoda atama CompileError", """
+class Box:
+    v: int
+    fn init():
+        self.v = 0
+
+fn main():
+    let b = Box()
+    b.init = 1
+""", "cannot assign to method 'init'")
+    # Alıcının sınıfı statik olarak bilinmiyorsa runtime reddi (VM).
+    expect_vm_error("dinamik alan statik bilinmiyorken runtime reddi", """
+class Box:
+    v: int
+
+fn set_dynamic(o):
+    o.newfield = 1
+
+fn main():
+    let b = Box()
+    set_dynamic(b)
+""", "no field")
+
+    # ── Yanlış hedef: instance olmayan değerde üye işlemi ──────────────
+    expect_vm_error("instance olmayan hedefte üye okuma", """
+fn main():
+    let x = 5
+    print(x.field)
+""", "non-instance")
+    expect_vm_error("instance olmayan hedefte üye yazma", """
+fn main():
+    let x = 5
+    x.field = 1
+""", "non-instance")
+    expect_vm_error("instance olmayan hedefte metot çağrısı", """
+fn main():
+    let x = 5
+    x.foo()
+""", "non-instance")
+
+    # ── Derleme zamanı reddedilen sınıf özellikleri ────────────────────
+    expect_compile_error("__init__ reddedilir (yalnız 'init')", """
+class A:
+    fn __init__(v: int):
+        return v
+""", "__init__ is not supported; use 'init'")
+    expect_compile_error("duplicate self parametresi reddedilir", """
+class A:
+    fn m(self):
+        return 1
+""", "duplicate 'self' parameter")
+    expect_compile_error("kalıtım reddedilir", """
+class Base:
+    v: int
+
+class Derived extends Base:
+    v: int
+""", "inheritance")
+    expect_compile_error("interface uygulaması reddedilir", """
+class A implements I:
+    v: int
+""", "interfaces")
+    expect_compile_error("generic sınıf reddedilir", """
+class A[T]:
+    v: int
+""", "generic classes")
+    expect_compile_error("generic metot reddedilir", """
+class A:
+    fn m[T](x: int) -> int:
+        return x
+""", "generic methods")
+    expect_compile_error("karmaşık alan varsayılanı reddedilir", """
+class A:
+    x: int = 1 + 2
+""", "complex field default expressions are not supported")
+    expect_compile_error("fonksiyon çağrısı alan varsayılanı reddedilir", """
+fn make() -> int:
+    return 1
+
+class A:
+    x: int = make()
+""", "complex field default expressions are not supported")
+    expect_compile_error("liste literalı alan varsayılanı reddedilir", """
+class A:
+    xs: list = [1, 2]
+""", "complex field default expressions are not supported")
+
+    # Sınıf içinde sınıf (metot gövdesi) → CompileError. Parser bunu
+    # üretemiyor; AST elle kurulup derleyici reddi doğrulanır.
+    nested = ast_nodes.Program(stmts=[ast_nodes.FnDecl(
+        name="main", type_params=[], params=[], return_type=None,
+        body=ast_nodes.Block(stmts=[ast_nodes.ClassDecl(
+            name="Inner", type_params=[], base=None, interfaces=[],
+            fields=[], methods=[], line=2, col=5)], line=1, col=1),
+        line=1, col=1)])
+    try:
+        compile_program(nested, "<test>")
+        check("metot gövdesinde sınıf reddedilir", False, "no CompileError")
+    except CompileError as e:
+        check("metot gövdesinde sınıf reddedilir",
+              "class declarations inside functions" in str(e).lower(), str(e))
+    except Exception as e:  # noqa: BLE001
+        check("metot gövdesinde sınıf reddedilir", False,
+              f"wrong error {type(e).__name__}: {e}")
+
+    # ── İleri referans: sınıf tanımdan önce kullanılabilir ────────────
+    expect_output("forward class referansı (tanımdan önce kullanım)", """
+fn main():
+    let n = Node(1)
+    print(str(n.value))
+
+class Node:
+    value: int
+    fn init(v: int):
+        self.value = v
+""", ["1"])
 
 
 def main() -> None:
@@ -3424,6 +3717,7 @@ def main() -> None:
     test_top_level_vm()
     test_metadata()
     test_class_format_vm()
+    test_class_vm()
 
     total = passed + failed
     print(f"\n{BOLD}{'═'*50}")

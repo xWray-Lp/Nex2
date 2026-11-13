@@ -3,16 +3,43 @@
 > Kısa karar notu. Amaç: `examples/tree_own.nex` dogfood'unu (sınıf tabanlı ağaç)
 > VM'de byte-equal parity ile çalıştırmak. Üslup/kapsam için bkz.
 > `NEX_INT_SEMANTICS.md`, `NEX_MEMORY_MODEL.md`; yapı ve durum takibi için
-> `NEX_VM_DESIGN.md` §10–11. Bu belge **tasarım**dır; uygulama, kod ve commit
-> içermez.
+> `NEX_VM_DESIGN.md` §10–11.
 
-## 0. Bağlam (mevcut durum)
+> **Uyar:** Bu belge artık yalnız tasarım notu değildir — §6'daki sorular
+> kullanıcı onayıyla **kilitlendi**, kararlar uygulamaya döndü.
+>
+> **Durum: uygulandı (Stage 1 format ve Stage 2 compiler).**
+> - **Stage 1 (format + runtime):** modül sürümü **2** (60B header, zorunlu
+>   `ClassTable` — natives→slot_modes arası), `CLASS_REF` (0x0A),
+>   `NEW_INSTANCE` (0x37), `CALL_BOUND` (0x38), `GET_MEMBER`/`SET_MEMBER`
+>   VM'de uygulandı; v1 modüller okunmaya devam ediyor.
+> - **Stage 2 (compiler):** `compiler.py` modül seviyesinde `ClassDecl`
+>   kabul ediyor. Metotlar `self` örtük ilk parametreli **gerçek
+>   fonksiyonlar** (arity = len(params)+1 → `CALL_BOUND` `[instance]+args`).
+>   Örnekleme: `NEW_INSTANCE` + bildirim sırasında alan varsayılanları +
+>   `init` çağrısı (`init` yoksa argümanlar değerlendirilip atılır).
+>   Üye okuma/yazma `GET_MEMBER`/`SET_MEMBER`, metot çağrısı `GET_MEMBER` +
+>   `CALL_BOUND`.
+> - **Kilit kararlar (§6):** `init` **tek** kurucudur (`__init__` derleme
+>   hatası); dinamik alan **reddedilir** (statik olarak biliniyorsa
+>   CompileError, bilinmiyorsa runtime); dict-benzeri instance API'si **yok**
+>   (`print(obj)` host repr verir); modül sürümü **2**.
+> - **Doğrulama:** `examples/tree_own.nex` tree/VM **byte-equal** stdout;
+>   `check_vm_parity.py` → 8/8 SUPPORTED (0 known-unsupported).
+> - Ayrıntı ve kalan sınırlar için bkz. `NEX_VM_DESIGN.md` §10 ve
+>   `NEX_BYTECODE_SPEC.md` §6.5–6.6.
+
+## 0. Bağlam (başlangıç durumu)
 
 VM (tamamı yeşil, 381 test, 7/8 örnek byte-equal): ilkel tipler, list/dict,
 `@stack`, `@own`+borrow (A/B), `@raw` (C), top-level `<script>`, `for`,
 `println`/f-string. Desteklenmeyen dogfood: yalnız `examples/tree_own.nex`
 (`class TreeNode` — tree-walker'da birinci sınıf, VM'de yok). Sınıflar
 `NEX_VM_DESIGN.md` kapsam dışı listesinde.
+
+> **Güncel durum (Stage 1 + Stage 2 sonrası):** sınıflar **düştü** —
+> `examples/tree_own.nex` artık **8/8 örnek byte-equal**; test sayısı
+> `test_bytecode.py` için 430 (bkz. `NEX_VM_DESIGN.md` §10).
 
 ## 1. Problem — tree-walker semantiği (referans)
 
@@ -44,7 +71,17 @@ VM (tamamı yeşil, 381 test, 7/8 örnek byte-equal): ilkel tipler, list/dict,
   karmaşık ifadeler v1'de reddedilir (checker/derleyici), tam parity sonraya
   bırakılır (tip-annotated explicit defaults'ın örnekleme-anı semantiği korunur).
 
-## 3. Önerilen kararlar
+### 2.1 Stage 2 sonrası fiilî sınırlar (derleyici)
+
+| Sınır | Davranış |
+|---|---|
+| Sınıf **değer** olarak kullanılamaz | `let f = Foo` → CompileError ("undefined variable"); sınıf yalnız kurucu çağrısı (`Foo(...)`) olarak kullanılır. |
+| Üye compound atama | `self.n += 1` → CompileError (mevcut indeks ataması sınırıyla aynı). |
+| `push` adlı metot | Alıcının sınıfı **statik olarak biliniyorsa** bound çağrı yapılır (metot kazanır); bilinmiyorsa liste native'i (`CALL_NATIVE push`) seçilir — `xs[0].push(x)` gibi örneklerde bu yüzden liste native'i kullanılır. |
+| Atama hedefi | `SET_MEMBER` hedefi **instance** olmalıdır (§3.4a): `d.k = v` (dict) tree-walker'da çalışır, VM'de runtime hatası verir. |
+| `__init__` | Derleme hatası: `"__init__ is not supported; use 'init'"`. |
+
+## 3. Kararlar (kilitlenmiş — §6 onayı)
 
 ### 3.1 Yerleşim (layout)
 - **Karar:** host `NexInstance { klass_index, fields: dict|array }` ve
@@ -59,7 +96,8 @@ VM (tamamı yeşil, 381 test, 7/8 örnek byte-equal): ilkel tipler, list/dict,
 - Yeni sabit havuzu etiketi: **`CLASS_REF = 0x0A`** (const bir `ClassRef` v2'de kullanılır).
 - Ayrılmış `GET_MEMBER 0x35` / `SET_MEMBER 0x36` yeniden kullanılır; operand:
   `u32 member_name_const` (string). Stack etkisi: `GET_MEMBER (obj -> val)`,
-  `SET_MEMBER (obj, val ->)`. **`GET_MEMBER` ve `SET_MEMBER` şu anda `UNIMPLEMENTED_OPCODES` içindedir ve açılacaktır.**
+  `SET_MEMBER (obj, val ->)`. **`GET_MEMBER` ve `SET_MEMBER` Stage 1'de
+  `UNIMPLEMENTED_OPCODES` listesinden çıkarılıp VM'de uygulanmıştır.**
 - `CALL_BOUND u32 argc`: yığın üstü `BoundMethod`, ardından `argc` argüman;
   çağrı protokolü tree-walker ile aynı — `fn(receiver, args...)` (receiver
   otomatik ilk argüman). `CALL`/native yolları mevcut sözleşmesini korur.
@@ -114,8 +152,8 @@ varsayılanı değerlendirme sırası (bildirim sırası), `self` bağlama hatal
 | Öğe | Biçim / kural | Not |
 |---|---|---|
 | `NEW_INSTANCE` | `u32 cls_const` → `Instance` (**0x37**) | const bir `CLASS_REF` (`0x0A`) (v2) olmalı |
-| `GET_MEMBER` (0x35) | `(obj)`, `u32 name_idx` → `val` | alıcı `INSTANCE`; alan→değer, metot→`BoundMethod`; yoksa konumlu hata. **Şu anda `UNIMPLEMENTED_OPCODES` — açılacak.** |
-| `SET_MEMBER` (0x36) | `(obj,val)`, `u32 name_idx` → `()` | alıcı `INSTANCE` (veya izinli `&mut` borrow); OwnValue/borrow saklama yasağı §3.5. **Şu anda `UNIMPLEMENTED_OPCODES` — açılacak.** |
+| `GET_MEMBER` (0x35) | `(obj)`, `u32 name_idx` → `val` | alıcı `INSTANCE`; alan→değer, metot→`BoundMethod`; yoksa konumlu hata. **Uygulandı (Stage 1).** |
+| `SET_MEMBER` (0x36) | `(obj,val)`, `u32 name_idx` → `()` | alıcı `INSTANCE` (veya izinli `&mut` borrow); OwnValue/borrow saklama yasağı §3.5. **Uygulandı (Stage 1).** |
 | `CALL_BOUND` | `(bound, a1..an)`, `u32 argc` → `ret` | alıcı `BOUND_METHOD`; çağrı derinliği sınırı mevcut kuralla |
 | `ClassTable` | `name, fields[], methods[(name,fn_ref)]` | v2, **natives** sonrası **slot_modes** öncesi; **v2'de zorunlu (boş olabilir)** |
 | Verifier | stack yüksekliği, const türü, jump | `NEW_INSTANCE` hedefi sınıf; member const string; `CALL_BOUND` argc uyumu (statik biliniyorsa). **v2'de ek olarak sınıf tablosu doğrulaması (isim indislerinin aralık içinde olması) uygulanır**; v1 kurallarının geri kalanı geçerliliğini korur. |
@@ -124,11 +162,27 @@ varsayılanı değerlendirme sırası (bildirim sırası), `self` bağlama hatal
 
 - **Kabul:** `examples/tree_own.nex` VM backend'inde **byte-equal** stdout
   (tree-walker referans). `NEX_VM_DESIGN.md` §8 differential harness'e dahil.
+  — **Sonuç: sağlandı** (Stage 2 sonrası `check_vm_parity.py` 8/8 SUPPORTED,
+  `tree_own.nex` tree/VM stdout byte-equal).
 - **Test matrisi:** init çağrısı ve argümanlar; **`Class(arg)` init yokken başarılı ve argümanların yan etkileri değerlendirilip atılır** (test matrisi maddesi eklendi); metot çağrısı ve `self`
   özyineleme (`total`); alan mutasyonu (`add_child`); iç içe list alanı
   (`children`); `@own` snapshot ile instance içeriği (değer kopyası/izolasyon);
   alan varsayılanı bildirim sırası; forward class ref (sınıf/kurucu tanımdan
   önce referans — `test_stack` dogfood benzeri düzen).
+  — **Kapsam:** `test_bytecode.py::test_class_vm` (Stage 2) + `test_parity`
+  girdileri; `check_vm_parity.py` `examples/tree_own.nex` pini SUPPORTED.
+
+### Uygulama sonrası bilinen sapmalar (bilinçli)
+
+| Konu | Tree-walker | VM | Not |
+|---|---|---|---|
+| `print(obj)` | `<TreeNode {...}>` (alan dökümü) | `<instance class=0>` (host repr) | kilit karar: dict-benzeri yüzey yok |
+| Dinamik alan (`obj.newfield = x`) | serbest | **reddedilir** (statik biliniyorsa CompileError, bilinmiyorsa runtime) | kilit karar §6(c) |
+| Eksik/b Fazla argüman (metot) | `Missing argument for parameter 'x'` | `function 'X' expects N args, got M` | hata **metni** farklı; ikisi de konumlu runtime hatası |
+| Bilinmeyen üye | `'C' has no attribute 'x'` | `'C' has no member 'x'` | hata **metni** farklı (stage 1 VM metni) |
+| `obj.method(...)` liste alıcıyla | AttributeError (runtime) | `member access on non-instance value` (runtime) | ikisi de runtime hatası |
+| Dict üye ataması (`d.k = v`) | çalışır | runtime hatası (hedef instance olmalı, §3.4a) | tasarım gereği kapsam dışı |
+| Sınıfı değer olarak kullanma (`let f = Foo`) | çalışır | CompileError ("undefined variable 'Foo'") | v1'de sınıf birinci sınıf değil |
 
 ### Enforcement checklist
 Uygulama için aşağıdaki dosyalar muhtemel değişiklik noktalarıdır:
@@ -139,17 +193,29 @@ Uygulama için aşağıdaki dosyalar muhtemel değişiklik noktalarıdır:
 - **`check_vm_parity.py`** — sınıf/üye çağrıları için parity testleri ve hata mesajı eşleştirmesi (init yokken argüman kabulü dahil).
 - **spec docs** — `NEX_VM_DESIGN.md` vb. ile header byte layout (v1 52B / v2 60B), bölüm sırası (natives → ClassTable → slot_modes) ve const tagleri güncellenmeli.
 
-## 6. Açık sorular (kullanıcı onayı gerekir)
+## 6. Açık sorular (kullanıcı onayı gerekir) — **KAPATILDI**
+
+> **Kilit (kullanıcı onayı):** (a) modül sürümü **2** + zorunlu `ClassTable`;
+> (b) **`init` tek kurucudur** — `__init__` derleme hatasıdır
+> (`"__init__ is not supported; use 'init'"`); (c) **dinamik alan reddedilir**
+> (statik biliniyorsa CompileError, bilinmiyorsa runtime);
+> (d) **dict-benzeri instance API'si yok** (`print(obj)` host repr).
+> Aşağıdaki listeler kararın gerekçesiyle birlikte korunur.
 
 - **(a) Sürüm:** modül `version 1→2` ve **zorunlu** `ClassTable` (boş dahi olsa) mı? (öneri: 1→2, net gate; v1 tam geriye uyumlu okunur.)
+  → **KABUL: 1→2.** v1 modülleri 52B layout ile okunmaya devam eder.
 - **(b) İsim:** `init` ve `__init__` ikilisi korunacak mı (her ikisi de kabul,
   tek canonical hangisi)? (öneri: ikisini de tanı, tek iniş noktası.)
+  → **KABUL: yalnız `init`.** `__init__` → CompileError.
 - **(c) Dinamik alan:** `obj.newfield = x` tree-walker'da serbest; v1'de
   **reddet** (bildirilmiş alan şeması) mi, yoksa koru mu? (öneri: reddet —
   statik/VM doğrulanabilirlik.)
+  → **KABUL: reddet.** Yalnız bildirilmiş alanlar yazılabilir.
 - **(d) Dict-benzeri yüzey:** instance üzerinde kullanıcı kodundan `.fields`
   / dict operasyonları (keys/iteration) açık API olacak mı? (öneri: hayır;
   üye erişimi yalnız `.`/GET-SET_MEMBER.)
+  → **KABUL: hayır.**
 
 > Bu sorular kapatılmadan §3 kararları "öneri" statüsündedir; parity hedefi §5
-> değişmez.
+> değişmez. — **Kapanış: sorular cevaplandı, §3 kararları "öneri" değil
+> "kilit" statüsündedir; parity hedefi §5 değişmedi ve sağlandı.**

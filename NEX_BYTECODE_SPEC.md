@@ -242,6 +242,27 @@ alanlarına yazabilir. Borrow modlu bir değer `GET_INDEX` operandı olabilir
 (per-access çözümleme); heap konteynerine **yazılamaz** (runtime `_conv`
 karşılığı).
 
+> **Class Phase D uygulandı** (stage 1 format + stage 2 compiler): modül v2
+> header'ı zorunlu `ClassTable` taşır (natives → `ClassTable` → slot_modes);
+> `ClassInfo { name_idx, field_count, field_name_idx[], methods[(name_idx,
+> func_const_idx)] }`, alan sırası **bildirim sırasıdır**. Derleyici
+> lowering'i:
+> - **Örnekleme** `Foo(args...)`: `NEW_INSTANCE <cls>` → `STORE_LOCAL tmp`
+>   → (bildirim sırasında) `LOAD_LOCAL tmp; CONST <varsayılan>; SET_MEMBER
+>   <alan>` → `init` varsa `LOAD_LOCAL tmp; GET_MEMBER "init"; <args>;
+>   CALL_BOUND argc; POP; LOAD_LOCAL tmp`; `init` yoksa `<args>` değerlendirilip
+>   **atılır** (yan etkiler korunur) → `LOAD_LOCAL tmp`. Yığında örnek kalır.
+> - **Metot fonksiyonu:** `self` **örtük ilk parametre** (arity =
+>   len(params)+1) → `CALL_BOUND` `[instance]+args` ile birebir eşleşir.
+> - **Üye okuma** `obj.f`: `obj` → `GET_MEMBER <ad>`; **üye yazma**
+>   `obj.f = v`: `obj` → `v` → `SET_MEMBER <ad>`; **metot çağrısı**
+>   `obj.m(a)`: `obj` → `GET_MEMBER <ad>` → `<args>` → `CALL_BOUND argc`.
+> - `GET_MEMBER`/`SET_MEMBER` adı **operand** olarak taşır (stack'te değil).
+> - Kapsam dışı (derleme hatası): kalıtım, interface, generic sınıf/metot,
+>   `__init__` (yalnız `init`), karmaşık alan varsayılanı (yalnız basit
+>   literal'ler), dinamik alan (statik biliniyorsa derleme hatası).
+>   Ayrıntı: [`NEX_CLASS_DESIGN.md`](./NEX_CLASS_DESIGN.md).
+
 VM prototipinde henüz yürütülmeyen opcode'lar: `LOAD_GLOBAL`, `STORE_GLOBAL`,
 `NEW_TUPLE`, `BLOCK_ENTER`, `BLOCK_EXIT`.
 
@@ -252,6 +273,11 @@ VM prototipinde henüz yürütülmeyen opcode'lar: `LOAD_GLOBAL`, `STORE_GLOBAL`
 > borrow opcode'ları (0x50–0x52) **Phase B** olarak uygulandı;
 > `RAW_MAKE` (0x45, `@raw` flat-value v1) **Phase C** olarak uygulandı —
 > **@own Phase A + borrow Phase B + @raw Phase C (flat v1) uygulandı.**
+> **Class Phase D uygulandı** (stage 1 format + stage 2 compiler): modül
+> sürümü 2 + zorunlu `ClassTable` bölümü, `NEW_INSTANCE` (0x37),
+> `CALL_BOUND` (0x38) ve `GET_MEMBER`/`SET_MEMBER` (0x35/0x36) uygulandı;
+> ayrıntı ve kilit kararlar için bkz.
+> [`NEX_CLASS_DESIGN.md`](./NEX_CLASS_DESIGN.md).
 > `slot_epochs` nesli ve `frame_id` devrede; `BORROW_END` bayat epoch'ta
 > sayacı düşürmez.
 
@@ -428,6 +454,12 @@ karşılaştırması yapabilsin.
 - `flags` bitleri rezerve; bilinmeyen bit → verifier hatası.
 - Native tablosu `retains_ref` bayrağı **ABI'nin parçası**; bayrak
   değişikliği checker allowlist'iyle birlikte güncellenmeli.
+- **v2 (sınıflandırma, Class Phase D):** header 52B → **60B** (yeni
+  `class_count`/`class_off` alanları), `ClassTable` bölümü **natives →
+  ClassTable → slot_modes** sırasıyla, `CLASS_REF` (0x0A) sabit etiketi.
+  Decoder header sürümüne göre dallanır: **v1 → 52B layout**, **v2 → 60B
+  layout**. v1 modülleri **tam olarak** desteklenmeye devam eder; v2'de
+  `ClassTable` zorunludur (boş olabilir).
 
 ---
 

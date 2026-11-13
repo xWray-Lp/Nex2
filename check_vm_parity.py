@@ -48,9 +48,10 @@ MATRIX = {
     "examples/data_pipeline.nex": ("SUPPORTED", None),
     # examples/buffer_econ.nex: @raw Phase C — tree/VM byte-equal stdout.
     "examples/buffer_econ.nex": ("SUPPORTED", None),
-    # examples/tree_own.nex: classes not supported in VM (ClassDecl).
-    "examples/tree_own.nex": ("KNOWN_VM_UNSUPPORTED",
-                              "ClassDecl is not supported in the VM prototype"),
+    # examples/tree_own.nex: classes landed (stage 1 format + stage 2
+    # compiler) — tree/VM byte-equal stdout (class TreeNode: init, add_child,
+    # self recursion over a list field).
+    "examples/tree_own.nex": ("SUPPORTED", None),
     # test_features.nex: println + f-string + for-range — VM/tree byte-equal.
     "test_features.nex": ("SUPPORTED", None),
 }

@@ -273,12 +273,18 @@ ve gerçek evinin Faz 2 olduğunu netleştirir.
 
 ## 10. Uygulama sırası (iskelet sonrası)
 
-> **Durum notu (stage 1, class/object VM):** bytecode v2 (60B header, zorunlu
-> `ClassTable` natives→slot_modes arası), `CLASS_REF` (0x0A), `NEW_INSTANCE`
-> (0x37), `CALL_BOUND` (0x38), `GET_MEMBER`/`SET_MEMBER` VM'de uygulanmıştır.
-> v1 modüller okunur. Derleyici henüz `ClassDecl` üretmez (stage 2). VM
-> prototipinde yürütülmeyen opcode'lar: `LOAD_GLOBAL`, `STORE_GLOBAL`,
-> `NEW_TUPLE`, `BLOCK_ENTER`, `BLOCK_EXIT`.
+> **Durum notu (stage 1 + stage 2, class/object VM):** bytecode v2 (60B header,
+> zorunlu `ClassTable` natives→slot_modes arası), `CLASS_REF` (0x0A),
+> `NEW_INSTANCE` (0x37), `CALL_BOUND` (0x38), `GET_MEMBER`/`SET_MEMBER` VM'de
+> uygulandı (stage 1). **Stage 2: derleyici `ClassDecl` üretiyor** — metotlar
+> `self` örtük ilk parametreli gerçek fonksiyonlar; örnekleme `NEW_INSTANCE`
+> + alan varsayılanları + `init`; üye okuma/yazma/çağrı `GET_MEMBER` /
+> `SET_MEMBER` / `CALL_BOUND`. Kilit kararlar ve sapmalar için bkz.
+> [`NEX_CLASS_DESIGN.md`](./NEX_CLASS_DESIGN.md) (durum satırı + §5 sapma
+> tablosu). `examples/tree_own.nex` tree/VM **byte-equal**;
+> `check_vm_parity.py` → 8/8 SUPPORTED. v1 modüller okunur. VM prototipinde
+> yürütülmeyen opcode'lar: `LOAD_GLOBAL`, `STORE_GLOBAL`, `NEW_TUPLE`,
+> `BLOCK_ENTER`, `BLOCK_EXIT`.
 
 1. Bu belgeyi opcode tablosu + encoding detayına genişlet (spec).
    **v0.1 yazıldı:** `NEX_BYTECODE_SPEC.md`.
